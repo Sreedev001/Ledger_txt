@@ -1,93 +1,60 @@
-# Ledger — Android build
+# Ledger — Android app (Capacitor + React)
 
-`src/LedgerApp.jsx` is included **unchanged** — nothing in the app's logic
-was touched. Everything else here is packaging: a Vite build setup,
-Tailwind, Capacitor (wraps the built web app in a real Android WebView), and
-a GitHub Actions workflow that builds the APK for you.
+A plain-text expense ledger, wrapped as an installable Android app.
 
-## Option A — build via GitHub Actions (no local Android SDK needed)
+## What's fixed vs. the earlier version
 
-1. Push this whole folder to a new GitHub repo:
+1. **New account** — `window.prompt()` is blocked or unreliable inside most
+   Android WebViews, which is why it silently did nothing before. It's been
+   replaced with an in-app dialog (`Dialog` component in `LedgerApp.jsx`),
+   used for new/rename/delete everywhere.
+2. **Local storage** — all accounts and the active account name are written
+   to `localStorage` on every change and reloaded on launch, so your data
+   survives closing the app. (Backed by the WebView's local storage DB —
+   persists across app restarts, cleared only if you clear app data.)
+3. **Undo / redo** — now a real per-account history stack (coalesced into
+   ~800ms bursts) instead of the old `document.execCommand`, which many
+   WebViews don't support at all.
+4. **Sheets (totals / accounts / menu)** — each one now has an explicit
+   "Close" button (top-right and bottom), and the Android hardware back
+   button closes the open sheet instead of exiting the app — it only exits
+   when nothing is open.
+5. **Three-dot menu** — save/open `.txt`, rename, delete, format guide all
+   route through the same in-app dialogs, so they work identically on
+   desktop, in a browser, and inside the Android WebView.
 
-   ```bash
-   cd ledger-app
-   git init
-   git add .
-   git commit -m "Ledger app"
-   git branch -M main
-   git remote add origin https://github.com/<your-username>/<your-repo>.git
-   git push -u origin main
-   ```
+## Building the APK on GitHub (no local Android Studio needed)
 
-2. On GitHub, open the **Actions** tab of the repo. The "Build Android APK"
-   workflow runs automatically on push (or trigger it manually from there
-   via *Run workflow*).
-3. When it finishes (a few minutes), open the completed run and scroll to
-   **Artifacts** — download `ledger-debug-apk`, unzip it, and you have
-   `app-debug.apk`.
-4. Copy that APK to your phone (or `adb install app-debug.apk`) and install
-   it — you may need to allow "install unknown apps" for whatever app you
-   use to open it.
+1. Push this whole folder to a new GitHub repo.
+2. GitHub Actions (`.github/workflows/android-build.yml`) runs automatically
+   on every push to `main`, and can also be triggered manually from the
+   **Actions** tab (`Run workflow`).
+3. It builds the web app, adds the Android platform via Capacitor, and
+   compiles a debug APK.
+4. Open the finished workflow run → **Artifacts** → download
+   `ledger-debug-apk`. Unzip it, you'll get `app-debug.apk`.
+5. Copy that APK to your phone and install it (you'll need to allow
+   "install unknown apps" for whichever app you use to open it).
 
-This works because GitHub's hosted runners come with the Android SDK
-preinstalled, so `.github/workflows/android-build.yml` can run the full
-`npx cap add android` → `gradlew assembleDebug` pipeline without you needing
-Android Studio or the SDK on your own machine at all.
+This produces a **debug** build, fine for your own phone. For a real
+Play Store release you'd later add a signing key and switch the workflow
+to `assembleRelease` — not needed just to use it yourself.
 
-## Option B — build locally on Ubuntu instead
-
-Only needed if you'd rather not use GitHub Actions.
-
-Prerequisites: Node.js 18+, a JDK (`sudo apt install openjdk-17-jdk`), and
-Android Studio (bundles the SDK): https://developer.android.com/studio
+## Local development (optional)
 
 ```bash
-cd ledger-app
 npm install
-npm run build
-npx cap add android
-npx cap sync android
-npx cap open android     # opens Android Studio — Run, or Build → Build APK(s)
+npm run dev        # live preview in a normal browser
 ```
 
-Command-line only, without Android Studio's GUI (needs `ANDROID_HOME` set):
+## Rebuilding after code changes
 
-```bash
-cd android
-./gradlew assembleDebug
-```
+Any time you edit `src/LedgerApp.jsx`, just commit and push — the GitHub
+Action rebuilds the APK from scratch each time. There's no need to run
+`cap add android` yourself; the workflow does it (or syncs it) automatically.
 
-APK lands at `android/app/build/outputs/apk/debug/app-debug.apk`.
+## App icon / name
 
-## If you change the app later
-
-Edit `src/LedgerApp.jsx`, commit, and push — the Action rebuilds
-automatically. For a local build, repeat `npm run build && npx cap sync android`
-before rebuilding.
-
-## One thing to decide before your first install
-
-`capacitor.config.json` sets `appId: "com.sreedev.ledger"` — Android treats
-this as the app's permanent identity. Fine to leave as-is, but change it
-**before** your first install if you want something different — changing it
-afterward makes Android treat it as a different app, so old on-device data
-doesn't carry over.
-
-## What this does and doesn't change
-
-- The WebView Capacitor uses is a real Android WebView — the same kind your
-  custom Dialog/BottomSheet components were already written for (avoiding
-  `window.prompt`/`confirm`/`alert`, handling the hardware back button via
-  `popstate`).
-- `localStorage` works normally inside the WebView, so accounts persist
-  on-device exactly as before.
-- Nothing about parsing, undo/redo, or any ledger behavior was changed —
-  this is purely the native wrapper + build pipeline.
-
-## Not included (only if you want it later)
-
-- **Release signing** — this workflow builds a debug APK, fine for
-  installing on your own device. A signed release build (for wider
-  distribution) needs a keystore and a couple more workflow steps — say the
-  word if you want that added.
-- **Custom app icon/splash screen** — currently uses Capacitor's defaults.
+Defaults to the Capacitor placeholder icon and the name "Ledger"
+(`capacitor.config.json`). You can customize the icon later with
+`@capacitor/assets` once you're happy with functionality.
