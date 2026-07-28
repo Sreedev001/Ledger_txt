@@ -1,4 +1,4 @@
-import React, { useState, useRef, useMemo, useEffect } from "react";
+import React, { useState, useRef, useMemo, useEffect, useLayoutEffect } from "react";
 import { Undo2, Redo2, Plus, AlignLeft, MoreVertical, X, Download, Upload, Pencil, Trash2, Layers, HelpCircle } from "lucide-react";
 
 /* =========================================================================
@@ -142,14 +142,13 @@ function parseLedger(text) {
   for (const s of summaryLines) {
     summary[s.key] = s;
     const target = computedFor[s.key];
-    if (s.value === null) {
+    // Blank, or stale/wrong — either way, keep it synced automatically.
+    if (s.value === null || Math.abs(s.value - target) > 0.005) {
       autofillTargets.push({ lineIndex: s.lineIndex, value: target });
-    } else if (Math.abs(s.value - target) > 0.005) {
-      summaryMismatches.push({ ...s, computed: target });
     }
   }
   for (const b of blocks) {
-    if (b.totalLineIndex !== null && b.declaredTotal === null) {
+    if (b.totalLineIndex !== null && (b.declaredTotal === null || Math.abs(b.declaredTotal - b.computedSum) > 0.005)) {
       autofillTargets.push({ lineIndex: b.totalLineIndex, value: b.computedSum });
     }
   }
@@ -167,19 +166,46 @@ function parseLedger(text) {
   };
 }
 
-function remapCursor(oldText, newLines, oldCursor) {
-  const oldLines = oldText.split("\n");
-  let acc = 0,
-    lineIdx = 0;
-  for (; lineIdx < oldLines.length; lineIdx++) {
-    if (acc + oldLines[lineIdx].length >= oldCursor) break;
-    acc += oldLines[lineIdx].length + 1;
+// Given absolute cursor offset in `text`, return { lineIdx, col }.
+function lineColFromCursor(text, cursor) {
+  const lines = text.split("\n");
+  let acc = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (acc + lines[i].length >= cursor) return { lineIdx: i, col: cursor - acc };
+    acc += lines[i].length + 1;
   }
-  const col = oldCursor - acc;
-  let newPos = 0;
-  for (let i = 0; i < lineIdx; i++) newPos += (newLines[i]?.length ?? 0) + 1;
-  newPos += Math.min(col, newLines[lineIdx]?.length ?? 0);
-  return newPos;
+  const last = lines.length - 1;
+  return { lineIdx: last, col: lines[last]?.length ?? 0 };
+}
+
+// Given a target { lineIdx, col } and an array of (possibly rewritten) lines,
+// return the absolute cursor offset — recomputed fresh so it's correct even
+// when earlier lines changed length (e.g. an auto-filled Total above it).
+function cursorFromLineCol(lines, lineIdx, col) {
+  let pos = 0;
+  for (let i = 0; i < lineIdx; i++) pos += (lines[i]?.length ?? 0) + 1;
+  return pos + Math.min(col, lines[lineIdx]?.length ?? 0);
+}
+
+// Rewrite "Label - <anything>" or "Label -" to "Label - <value>",
+// preserving indentation and the label text exactly as typed.
+function rewriteAmountLine(line, value) {
+  const m = line.match(/^(\s*)(.+?)\s-\s?(.*)$/);
+  if (!m) return line;
+  const [, indent, label] = m;
+  return `${indent}${label} - ${formatNum(value)}`;
+}
+
+// Scan forward from a line index (within the same block, i.e. until a blank
+// line ends it) to see whether a "Total" line already exists further down.
+function blockAlreadyHasTotal(lines, fromIdx) {
+  for (let i = fromIdx; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (t === "") return false;
+    const m = t.match(BLANK_RE) || t.match(ENTRY_RE);
+    if (m && normLabel(m[1]) === "total") return true;
+  }
+  return false;
 }
 
 /* ========================================================================= */
@@ -201,8 +227,8 @@ Sub outgoing -
 Balance -
 `;
 
-const STORAGE_ACCOUNTS = "ledger_accounts_v1";
-const STORAGE_ACTIVE = "ledger_active_account_v1";
+const STORAGE_ACCOUNTS = "ledger_accounts_v2";
+const STORAGE_ACTIVE = "ledger_active_account_v2";
 
 const AVATAR_COLORS = ["bg-rose-400/90", "bg-amber-400/90", "bg-emerald-400/90", "bg-sky-400/90", "bg-violet-400/90", "bg-teal-400/90"];
 function avatarColor(name) {
@@ -303,9 +329,19 @@ export default function LedgerApp() {
   const [accounts, setAccounts] = useState(() => {
     try {
       const saved = localStorage.getItem(STORAGE_ACCOUNTS);
-      if (saved) return JSON.parse(saved);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        // one-time cleanup: earlier builds saved the sample walkthrough text
+        // as real content instead of just showing it as a placeholder —
+        // strip it out wherever it's still sitting untouched.
+        const cleaned = {};
+        for (const [name, val] of Object.entries(parsed)) {
+          cleaned[name] = val === STARTER_TEXT ? "" : val;
+        }
+        return cleaned;
+      }
     } catch {}
-    return { Sreedev: STARTER_TEXT };
+    return { Sreedev: "" };
   });
   const [activeAccount, setActiveAccount] = useState(() => {
     try {
@@ -346,11 +382,18 @@ export default function LedgerApp() {
     }
   }, [accounts, activeAccount]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (pendingCursor.current !== null && textareaRef.current) {
       const pos = pendingCursor.current;
       pendingCursor.current = null;
-      textareaRef.current.setSelectionRange(pos, pos);
+      const el = textareaRef.current;
+      el.setSelectionRange(pos, pos);
+      // Some Android soft-keyboards/WebViews snap the cursor back to the end
+      // right after a controlled-value update; re-apply on the next frame so
+      // the jump-to-next-line behavior sticks instead of getting overridden.
+      requestAnimationFrame(() => {
+        if (document.activeElement === el) el.setSelectionRange(pos, pos);
+      });
     }
   }, [text]);
 
@@ -401,19 +444,44 @@ export default function LedgerApp() {
     }
     lastPushRef.current[activeAccount] = now;
 
-    const p = parseLedger(raw);
-    let finalText = raw;
-    if (p.autofillTargets.length) {
-      const lines = raw.split("\n");
-      p.autofillTargets.forEach((t) => {
-        lines[t.lineIndex] = lines[t.lineIndex].replace(/-\s*$/, "- " + formatNum(t.value));
-      });
-      finalText = lines.join("\n");
-      pendingCursor.current = remapCursor(raw, lines, cursor);
-    } else {
-      pendingCursor.current = cursor;
+    const { lineIdx: curLineIdx, col: curCol } = lineColFromCursor(raw, cursor);
+
+    // ---- auto-insert a blank "Total -" line right after a freshly created
+    //      section header, so entries can be typed above it while it lives
+    //      below, ready to keep itself in sync ----
+    let workingLines = raw.split("\n");
+    if (
+      workingLines[curLineIdx] !== undefined &&
+      workingLines[curLineIdx].trim() === "" &&
+      curLineIdx > 0 &&
+      MARKER_RE.test(workingLines[curLineIdx - 1].trim()) &&
+      !blockAlreadyHasTotal(workingLines, curLineIdx + 1)
+    ) {
+      workingLines.splice(curLineIdx + 1, 0, "Total -");
     }
-    setAccounts((prev) => ({ ...prev, [activeAccount]: finalText }));
+
+    const p = parseLedger(workingLines.join("\n"));
+    const finalLines = workingLines.slice();
+    p.autofillTargets.forEach((t) => {
+      finalLines[t.lineIndex] = rewriteAmountLine(finalLines[t.lineIndex], t.value);
+    });
+
+    // If the line the cursor is actually sitting on is the one that just got
+    // auto-filled (e.g. they just finished typing "Total -"), hop to the
+    // start of the next line instead of leaving the cursor inside the number.
+    // Edits elsewhere that merely cause a Total/Balance below to recompute
+    // don't move the cursor at all.
+    const jump = p.autofillTargets.some((t) => t.lineIndex === curLineIdx);
+    let cursorPos;
+    if (jump) {
+      if (curLineIdx + 1 >= finalLines.length) finalLines.push("");
+      cursorPos = cursorFromLineCol(finalLines, curLineIdx + 1, 0);
+    } else {
+      cursorPos = cursorFromLineCol(finalLines, curLineIdx, curCol);
+    }
+    pendingCursor.current = cursorPos;
+
+    setAccounts((prev) => ({ ...prev, [activeAccount]: finalLines.join("\n") }));
   }
 
   function runUndo() {
@@ -485,6 +553,17 @@ export default function LedgerApp() {
         closeSheet();
       },
       { danger: true, confirmLabel: "Delete" }
+    );
+  }
+
+  function clearAccount() {
+    askConfirm(
+      `Clear all text in "${activeAccount}"? Save a .txt backup first if you need one.`,
+      () => {
+        setAccounts((prev) => ({ ...prev, [activeAccount]: "" }));
+        closeSheet();
+      },
+      { danger: true, confirmLabel: "Clear" }
     );
   }
 
@@ -613,6 +692,7 @@ export default function LedgerApp() {
           <SheetRow icon={<Upload size={17} />} label="Open .txt" onClick={() => fileInputRef.current.click()} />
           <div className="h-px bg-zinc-800 my-1" />
           <SheetRow icon={<Pencil size={17} />} label="Rename account" onClick={renameAccount} />
+          <SheetRow icon={<Trash2 size={17} />} label="Clear account text" onClick={clearAccount} danger />
           <SheetRow icon={<Trash2 size={17} />} label="Delete account" onClick={deleteAccount} danger />
           <div className="h-px bg-zinc-800 my-1" />
           <SheetRow icon={<HelpCircle size={17} />} label={showHelp ? "Hide format guide" : "Format guide"} onClick={() => setShowHelp((s) => !s)} />
