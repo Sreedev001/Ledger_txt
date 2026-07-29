@@ -1,5 +1,5 @@
 import React, { useState, useRef, useMemo, useEffect } from "react";
-import { Undo2, Redo2, Plus, AlignLeft, MoreVertical, X, Download, Upload, Pencil, Trash2, Layers, HelpCircle } from "lucide-react";
+import { Undo2, Redo2, Plus, AlignLeft, MoreVertical, X, Download, Upload, Pencil, Trash2, Layers, HelpCircle, Type, AlignJustify } from "lucide-react";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -290,16 +290,14 @@ const computeOutgoingUpdates = (accounts) => computeCategoryUpdates(accounts, "p
 
 function buildManagedCategoryLines(title, sign, subsFinal) {
   if (subsFinal.length === 0) return [];
-  const lines = [`(${sign}): ${title}`, ""];
-  subsFinal.forEach((s, idx) => {
+  const lines = [`(${sign}): ${title}`];
+  subsFinal.forEach((s) => {
     lines.push(s.title);
     s.entries.forEach((e) => lines.push(`${e.label} - ${formatNum(e.amount)}`));
     const subTotal = s.entries.reduce((a, e) => a + e.amount, 0);
     lines.push(`${s.title} Total - ${formatNum(subTotal)}`);
-    if (idx < subsFinal.length - 1) lines.push("");
   });
   const total = subsFinal.reduce((a, s) => a + s.entries.reduce((x, e) => x + e.amount, 0), 0);
-  lines.push("");
   lines.push(`${title} Total - ${formatNum(total)}`);
   return lines;
 }
@@ -470,16 +468,13 @@ Bank - 500
 Total -
 
 (-): Expense
-
 Fruits
 Apples - 500
 Bananas - 400
 Fruits Total -
-
 Vegetables
 Onions - 300
 Vegetable Total -
-
 Expense Total -
 
 Sub incoming -
@@ -489,6 +484,12 @@ Balance -
 
 const STORAGE_ACCOUNTS = "ledger_accounts_v2";
 const STORAGE_ACTIVE = "ledger_active_account_v2";
+const STORAGE_FONT_SIZE = "ledger_font_size_v1";
+const STORAGE_LINE_SPACING = "ledger_line_spacing_v1";
+const FONT_SIZE_MIN = 12;
+const FONT_SIZE_MAX = 26;
+const LINE_SPACING_MIN = 1.2;
+const LINE_SPACING_MAX = 2.4;
 
 const AVATAR_COLORS = ["bg-rose-400/90", "bg-amber-400/90", "bg-emerald-400/90", "bg-sky-400/90", "bg-violet-400/90", "bg-teal-400/90"];
 function avatarColor(name) {
@@ -537,6 +538,34 @@ function SheetRow({ icon, label, onClick, danger }) {
       {icon}
       {label}
     </button>
+  );
+}
+
+function Stepper({ icon, label, display, onDecrease, onIncrease, disabledDec, disabledInc }) {
+  return (
+    <div className="flex items-center justify-between px-3 py-2.5 rounded-lg font-mono text-sm text-zinc-200">
+      <span className="flex items-center gap-3">
+        {icon}
+        {label}
+      </span>
+      <div className="flex items-center gap-3">
+        <button
+          onClick={onDecrease}
+          disabled={disabledDec}
+          className="h-7 w-7 rounded-full bg-zinc-800 text-zinc-200 text-base leading-none flex items-center justify-center hover:bg-zinc-700 disabled:opacity-30"
+        >
+          −
+        </button>
+        <span className="w-10 text-center text-zinc-400 text-xs">{display}</span>
+        <button
+          onClick={onIncrease}
+          disabled={disabledInc}
+          className="h-7 w-7 rounded-full bg-zinc-800 text-zinc-200 text-base leading-none flex items-center justify-center hover:bg-zinc-700 disabled:opacity-30"
+        >
+          +
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -604,6 +633,20 @@ export default function LedgerApp() {
   const [showHelp, setShowHelp] = useState(false);
   const [sheet, setSheet] = useState(null); // null | 'accounts' | 'totals' | 'menu'
   const [dialog, setDialog] = useState(null);
+  const [fontSize, setFontSize] = useState(() => {
+    try {
+      const saved = parseFloat(localStorage.getItem(STORAGE_FONT_SIZE));
+      if (!isNaN(saved)) return saved;
+    } catch {}
+    return 15;
+  });
+  const [lineSpacing, setLineSpacing] = useState(() => {
+    try {
+      const saved = parseFloat(localStorage.getItem(STORAGE_LINE_SPACING));
+      if (!isNaN(saved)) return saved;
+    } catch {}
+    return 1.75;
+  });
   const textareaRef = useRef(null);
   const pendingCursor = useRef(null);
   const fileInputRef = useRef(null);
@@ -624,6 +667,16 @@ export default function LedgerApp() {
       localStorage.setItem(STORAGE_ACTIVE, activeAccount);
     } catch {}
   }, [activeAccount]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_FONT_SIZE, String(fontSize));
+    } catch {}
+  }, [fontSize]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_LINE_SPACING, String(lineSpacing));
+    } catch {}
+  }, [lineSpacing]);
   // if the active account was deleted (or storage was edited elsewhere), fall back safely
   useEffect(() => {
     if (!(activeAccount in accounts)) {
@@ -834,6 +887,13 @@ export default function LedgerApp() {
     URL.revokeObjectURL(url);
   }
 
+  function adjustFontSize(delta) {
+    setFontSize((s) => Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, Math.round((s + delta) * 10) / 10)));
+  }
+  function adjustLineSpacing(delta) {
+    setLineSpacing((s) => Math.min(LINE_SPACING_MAX, Math.max(LINE_SPACING_MIN, Math.round((s + delta) * 10) / 10)));
+  }
+
   function openTxt(e) {
     const file = e.target.files[0];
     if (!file) return;
@@ -898,7 +958,8 @@ export default function LedgerApp() {
         onChange={handleChange}
         spellCheck={false}
         placeholder={STARTER_TEXT}
-        className="flex-1 w-full resize-none outline-none px-5 py-4 font-mono text-[15px] leading-7 bg-black text-zinc-100 placeholder-zinc-700 caret-white"
+        style={{ fontSize: `${fontSize}px`, lineHeight: lineSpacing }}
+        className="flex-1 w-full resize-none outline-none px-5 py-4 font-mono bg-black text-zinc-100 placeholder-zinc-700 caret-white"
       />
 
       <input ref={fileInputRef} type="file" accept=".txt" className="hidden" onChange={openTxt} />
@@ -945,6 +1006,25 @@ export default function LedgerApp() {
       {/* menu sheet */}
       <BottomSheet open={sheet === "menu"} onClose={closeSheet} title="Menu">
         <div className="flex flex-col gap-1 mt-1">
+          <Stepper
+            icon={<Type size={17} />}
+            label="Text size"
+            display={`${fontSize}px`}
+            onDecrease={() => adjustFontSize(-1)}
+            onIncrease={() => adjustFontSize(1)}
+            disabledDec={fontSize <= FONT_SIZE_MIN}
+            disabledInc={fontSize >= FONT_SIZE_MAX}
+          />
+          <Stepper
+            icon={<AlignJustify size={17} />}
+            label="Line spacing"
+            display={`${lineSpacing.toFixed(1)}×`}
+            onDecrease={() => adjustLineSpacing(-0.1)}
+            onIncrease={() => adjustLineSpacing(0.1)}
+            disabledDec={lineSpacing <= LINE_SPACING_MIN}
+            disabledInc={lineSpacing >= LINE_SPACING_MAX}
+          />
+          <div className="h-px bg-zinc-800 my-1" />
           <SheetRow icon={<Download size={17} />} label="Save .txt" onClick={downloadTxt} />
           <SheetRow icon={<Upload size={17} />} label="Open .txt" onClick={() => fileInputRef.current.click()} />
           <div className="h-px bg-zinc-800 my-1" />
