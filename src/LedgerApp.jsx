@@ -248,22 +248,32 @@ function parseLedger(text) {
 }
 
 /* =========================================================================
-   PERSONAL OUTGOING -> PERSONAL INCOMING SYNC
+   PERSONAL OUTGOING <-> PERSONAL INCOMING SYNC
    A "(-): Personal Outgoing" category whose subcategory is named after
    another existing account mirrors those entries into that account's
-   "(+): Personal Incoming" category, under a subcategory named after the
-   source account. One-directional only (Incoming never triggers a sync
-   back), so there's no feedback loop.
+   "(+): Personal Incoming" category (and vice versa), under a subcategory
+   named after the counterpart account.
+
+   The two directions are NOT symmetric on purpose:
+     - Outgoing -> Incoming is fully authoritative: it creates, updates, and
+       deletes the mirrored subcategory to exactly match the Outgoing side.
+     - Incoming -> Outgoing only creates/updates; it never deletes. This is
+       what stops the two directions from fighting over ownership and
+       oscillating forever when a relationship is bootstrapped from the
+       receiving side (see runSyncRounds below).
+   Once a relationship's Outgoing side exists, it becomes the authoritative
+   copy going forward — editing/removing it there is what should be trusted;
+   the Incoming mirror will always follow it exactly.
    ========================================================================= */
 
-// { [targetAccountName]: { [sourceAccountName]: [{label, amount}] } }
-function computeIncomingUpdates(accounts) {
+// { [targetAccountName]: { [counterpartAccountName]: [{label, amount}] } }
+function computeCategoryUpdates(accounts, sourceCategoryNorm) {
   const names = Object.keys(accounts);
   const map = {};
   for (const acctName of names) {
     const parsed = parseLedger(accounts[acctName]);
     for (const b of parsed.blocks) {
-      if (normLabel(b.title) !== "personaloutgoing") continue;
+      if (normLabel(b.title) !== sourceCategoryNorm) continue;
       for (const s of b.subs) {
         const targetTrim = s.title.trim();
         const target = names.find((n) => n === targetTrim) || names.find((n) => n.toLowerCase() === targetTrim.toLowerCase());
@@ -275,10 +285,12 @@ function computeIncomingUpdates(accounts) {
   }
   return map;
 }
+const computeIncomingUpdates = (accounts) => computeCategoryUpdates(accounts, "personaloutgoing");
+const computeOutgoingUpdates = (accounts) => computeCategoryUpdates(accounts, "personalincoming");
 
-function buildIncomingBlockLines(subsFinal) {
+function buildManagedCategoryLines(title, sign, subsFinal) {
   if (subsFinal.length === 0) return [];
-  const lines = ["(+): Personal Incoming", ""];
+  const lines = [`(${sign}): ${title}`, ""];
   subsFinal.forEach((s, idx) => {
     lines.push(s.title);
     s.entries.forEach((e) => lines.push(`${e.label} - ${formatNum(e.amount)}`));
@@ -288,28 +300,34 @@ function buildIncomingBlockLines(subsFinal) {
   });
   const total = subsFinal.reduce((a, s) => a + s.entries.reduce((x, e) => x + e.amount, 0), 0);
   lines.push("");
-  lines.push(`Personal Incoming Total - ${formatNum(total)}`);
+  lines.push(`${title} Total - ${formatNum(total)}`);
   return lines;
 }
 
-// Rewrites one account's text so its Personal Incoming category exactly
-// mirrors `desiredBySource`, creating or removing that category as needed,
-// while leaving every other line (including manually-added subcategories
-// not named after an account) untouched.
-function applyIncomingSync(text, accountNames, desiredBySource) {
+// Rewrites one account's text so a managed category (Personal Incoming or
+// Personal Outgoing) reflects `desiredBySource`. With deleteUnlisted=true
+// (the default) any managed subcategory not present in desiredBySource is
+// removed; with deleteUnlisted=false it's left exactly as-is instead.
+function applyManagedCategorySync(text, accountNames, desiredBySource, categoryTitle, sign, deleteUnlisted = true) {
+  const wantedNorm = normLabel(categoryTitle);
   const parsed = parseLedger(text);
-  const incoming = parsed.blocks.find((b) => normLabel(b.title) === "personalincoming");
+  const existing = parsed.blocks.find((b) => normLabel(b.title) === wantedNorm);
 
-  // Safety: if the user already hand-wrote flat entries directly under
-  // Personal Incoming (not organized into subcategories), leave it alone
-  // rather than risk discarding something they typed by hand.
-  if (incoming && incoming.entries.length > 0) return text;
+  // Safety: if the user already hand-wrote flat entries directly under this
+  // category (not organized into subcategories), leave it alone rather than
+  // risk discarding something they typed by hand.
+  if (existing && existing.entries.length > 0) return text;
 
+  const desiredKeysLower = new Set(Object.keys(desiredBySource).map((k) => k.toLowerCase()));
   const preserved = [];
-  if (incoming) {
-    for (const s of incoming.subs) {
-      const isManaged = accountNames.some((n) => n.toLowerCase() === s.title.trim().toLowerCase());
-      if (!isManaged) preserved.push({ title: s.title, entries: s.entries.map((e) => ({ label: e.label, amount: e.amount })) });
+  if (existing) {
+    for (const s of existing.subs) {
+      const title = s.title.trim();
+      const isManaged = accountNames.some((n) => n.toLowerCase() === title.toLowerCase());
+      const inDesired = desiredKeysLower.has(title.toLowerCase());
+      if (!isManaged || (!deleteUnlisted && !inDesired)) {
+        preserved.push({ title: s.title, entries: s.entries.map((e) => ({ label: e.label, amount: e.amount })) });
+      }
     }
   }
 
@@ -317,10 +335,10 @@ function applyIncomingSync(text, accountNames, desiredBySource) {
     .filter((src) => desiredBySource[src].length > 0)
     .sort((a, b) => a.localeCompare(b));
   const subsFinal = [...syncedNames.map((src) => ({ title: src, entries: desiredBySource[src] })), ...preserved];
-  const newBlockLines = buildIncomingBlockLines(subsFinal);
+  const newBlockLines = buildManagedCategoryLines(categoryTitle, sign, subsFinal);
 
   const lines = text.split("\n");
-  const removeSet = new Set(incoming ? incoming.lineIndices : []);
+  const removeSet = new Set(existing ? existing.lineIndices : []);
 
   // Insert right before the first summary line (Sub incoming/outgoing/Balance)
   // if one exists, otherwise at the very end of the document.
@@ -362,6 +380,42 @@ function applyIncomingSync(text, accountNames, desiredBySource) {
     finalText = finalLines.join("\n");
   }
   return finalText;
+}
+
+function applyIncomingSync(text, accountNames, desiredBySource) {
+  return applyManagedCategorySync(text, accountNames, desiredBySource, "Personal Incoming", "+", true);
+}
+function applyOutgoingSync(text, accountNames, desiredBySource) {
+  return applyManagedCategorySync(text, accountNames, desiredBySource, "Personal Outgoing", "-", false);
+}
+
+// Runs both sync directions to a fixed point (bootstrapping a relationship
+// from either side can take a couple of rounds to settle), all within one
+// synchronous pass so nothing is ever visibly half-synced. Accounts equal to
+// `excludeFromWrite` are read for their current data but never rewritten —
+// used to guarantee the account someone is actively typing into is never
+// touched mid-keystroke.
+function runSyncRounds(accounts, excludeFromWrite, maxRounds = 5) {
+  let working = accounts;
+  for (let round = 0; round < maxRounds; round++) {
+    const names = Object.keys(working);
+    const incomingMap = computeIncomingUpdates(working);
+    const outgoingMap = computeOutgoingUpdates(working);
+    let changed = false;
+    const next = { ...working };
+    for (const acct of names) {
+      if (acct === excludeFromWrite) continue;
+      let t = applyIncomingSync(working[acct], names, incomingMap[acct] || {});
+      t = applyOutgoingSync(t, names, outgoingMap[acct] || {});
+      if (t !== working[acct]) {
+        next[acct] = t;
+        changed = true;
+      }
+    }
+    working = next;
+    if (!changed) break;
+  }
+  return working;
 }
 
 // Given absolute cursor offset in `text`, return { lineIdx, col }.
@@ -578,18 +632,14 @@ export default function LedgerApp() {
     }
   }, [accounts, activeAccount]);
 
-  // ---- keep every OTHER account's Personal Incoming synced live as you
-  //      type a Personal Outgoing entry here; never rewrites the account
-  //      that's currently open for editing, so it can't disturb your cursor ----
+  // ---- keep every OTHER account's Personal Incoming/Outgoing synced live as
+  //      you type here; never rewrites the account that's currently open for
+  //      editing, so it can't disturb your cursor ----
   useEffect(() => {
-    const names = Object.keys(accounts);
-    const map = computeIncomingUpdates(accounts);
+    const result = runSyncRounds(accounts, activeAccount);
     const updates = {};
-    for (const target of names) {
-      if (target === activeAccount) continue;
-      const desired = map[target] || {};
-      const newText = applyIncomingSync(accounts[target], names, desired);
-      if (newText !== accounts[target]) updates[target] = newText;
+    for (const k of Object.keys(result)) {
+      if (result[k] !== accounts[k]) updates[k] = result[k];
     }
     if (Object.keys(updates).length) {
       setAccounts((prev) => ({ ...prev, ...updates }));
@@ -599,12 +649,9 @@ export default function LedgerApp() {
 
   // ---- catch the newly-opened account up to date the moment you switch to it ----
   useEffect(() => {
-    const names = Object.keys(accounts);
-    const map = computeIncomingUpdates(accounts);
-    const desired = map[activeAccount] || {};
-    const newText = applyIncomingSync(accounts[activeAccount] ?? "", names, desired);
-    if (accounts[activeAccount] !== undefined && newText !== accounts[activeAccount]) {
-      setAccounts((prev) => ({ ...prev, [activeAccount]: newText }));
+    const result = runSyncRounds(accounts, null);
+    if (accounts[activeAccount] !== undefined && result[activeAccount] !== accounts[activeAccount]) {
+      setAccounts((prev) => ({ ...prev, [activeAccount]: result[activeAccount] }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeAccount]);
@@ -919,9 +966,13 @@ export default function LedgerApp() {
               stale number) and it keeps itself synced automatically as you edit.
               <br />
               A <code>(-): Personal Outgoing</code> category with a subcategory named after another account (e.g.{" "}
-              <code>Ambika</code>) mirrors those entries into that account's <code>(+): Personal Incoming</code> automatically —
-              only if that account exists; unrecognized names are left as plain entries. Delete the entries here and the mirrored
-              copy there is removed too.
+              <code>Ambika</code>) mirrors those entries into that account's <code>(+): Personal Incoming</code> automatically, and
+              it works the other way too — recording a <code>(+): Personal Incoming</code> entry named after another account
+              creates a matching <code>(-): Personal Outgoing</code> entry over there. Only works if that account exists;
+              unrecognized names are left as plain entries.
+              <br />
+              Caveat: once a pair like this exists on both sides, delete it from just one side and it can reappear from the
+              other side's copy. To remove it for good, delete it from both accounts.
             </div>
           )}
         </div>
