@@ -1,4 +1,4 @@
-import React, { useState, useRef, useMemo, useEffect, useLayoutEffect } from "react";
+import React, { useState, useRef, useMemo, useEffect } from "react";
 import { Undo2, Redo2, Plus, AlignLeft, MoreVertical, X, Download, Upload, Pencil, Trash2, Layers, HelpCircle } from "lucide-react";
 
 /* =========================================================================
@@ -28,9 +28,14 @@ function formatNum(n) {
   return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
 }
 
+function isTotalLabel(label) {
+  return normLabel(label).endsWith("total");
+}
+
 function parseLedger(text) {
   const lines = text.split("\n");
 
+  // ---- pass 1: split into blank-line-delimited spans ----
   const blockSpans = [];
   let current = [];
   lines.forEach((line, i) => {
@@ -43,23 +48,10 @@ function parseLedger(text) {
   });
   if (current.length) blockSpans.push(current);
 
+  // ---- pass 2: pull top-level summary lines (Sub incoming/outgoing/Balance)
+  //      out of every span, wherever they appear ----
   const summaryLines = [];
-  const blocks = [];
-  const unparsedLines = [];
-
-  const makeBlock = (sign, title, entries, totalLineIndex, declaredTotal) => {
-    const computedSum = entries.reduce((a, e) => a + e.amount, 0);
-    return {
-      sign,
-      title,
-      entries,
-      computedSum,
-      totalLineIndex,
-      declaredTotal,
-      mismatch: declaredTotal !== null && Math.abs(declaredTotal - computedSum) > 0.005,
-    };
-  };
-
+  const strippedSpans = [];
   for (const span of blockSpans) {
     const normalIdx = [];
     for (const i of span) {
@@ -78,54 +70,138 @@ function parseLedger(text) {
       }
       normalIdx.push(i);
     }
-    if (!normalIdx.length) continue;
+    if (normalIdx.length) strippedSpans.push(normalIdx);
+  }
 
-    const firstRaw = lines[normalIdx[0]].trim();
-    const markerM = firstRaw.match(MARKER_RE);
+  // ---- pass 3: a span that opens with a (+)/(-) marker starts a category;
+  //      any spans that follow *without* their own marker are folded into
+  //      it as subcategory groups, so a blank line between subcategories
+  //      (or not) doesn't matter ----
+  const categoryGroups = [];
+  let openGroup = null;
+  for (const normalIdx of strippedSpans) {
+    const firstTrimmed = lines[normalIdx[0]].trim();
+    const isMarker = MARKER_RE.test(firstTrimmed);
+    if (isMarker || !openGroup) {
+      openGroup = normalIdx.slice();
+      categoryGroups.push(openGroup);
+    } else {
+      openGroup.push(...normalIdx);
+    }
+  }
+
+  // ---- pass 4: parse each category group into a title/sign plus, optionally,
+  //      nested subcategories (label line -> entries -> "<label> Total -") ----
+  const blocks = [];
+  const unparsedLines = [];
+
+  for (const idxList of categoryGroups) {
+    const firstIdx = idxList[0];
+    const firstTrimmed = lines[firstIdx].trim();
+    const markerM = firstTrimmed.match(MARKER_RE);
     const sign = markerM ? markerM[1] : null;
-    const firstStripped = markerM ? markerM[2].trim() : firstRaw;
+    const titleText = markerM ? markerM[2].trim() : firstTrimmed;
+    const contentIdx = idxList.slice(1);
 
-    let title, entryIdx;
-    if (normalIdx.length === 1) {
-      const m = firstStripped.match(ENTRY_RE);
+    // single-line block, e.g. "(+): Previous balance - 500"
+    if (contentIdx.length === 0) {
+      const m = titleText.match(ENTRY_RE);
       if (m) {
-        blocks.push(
-          makeBlock(sign, m[1].trim(), [{ label: m[1].trim(), amount: sumAmounts(m[2]), lineIndex: normalIdx[0] }], null, null)
-        );
+        const amount = sumAmounts(m[2]);
+        blocks.push({
+          sign,
+          title: m[1].trim(),
+          subs: [],
+          entries: [{ label: m[1].trim(), amount, lineIndex: firstIdx }],
+          computedSum: amount,
+          totalLineIndex: null,
+          declaredTotal: null,
+          mismatch: false,
+          lineIndices: idxList,
+        });
         continue;
       }
-      title = firstStripped;
-      entryIdx = [];
-    } else {
-      title = firstStripped;
-      entryIdx = normalIdx.slice(1);
+      blocks.push({
+        sign,
+        title: titleText,
+        subs: [],
+        entries: [],
+        computedSum: 0,
+        totalLineIndex: null,
+        declaredTotal: null,
+        mismatch: false,
+        lineIndices: idxList,
+      });
+      continue;
     }
 
-    const entries = [];
-    let totalLineIndex = null;
-    let declaredTotal = null;
-    for (const i of entryIdx) {
+    let currentSub = null;
+    const subs = [];
+    const direct = { entries: [], totalLineIndex: null, declaredTotal: null };
+    let categoryTotalLineIndex = null;
+    let categoryDeclaredTotal = null;
+
+    for (const i of contentIdx) {
       const trimmed = lines[i].trim();
       const blankM = trimmed.match(BLANK_RE);
       const entryM = trimmed.match(ENTRY_RE);
-      if (blankM && normLabel(blankM[1]) === "total") {
-        totalLineIndex = i;
-        continue;
+      const label = blankM ? blankM[1] : entryM ? entryM[1] : null;
+
+      if (label !== null) {
+        const value = entryM ? sumAmounts(entryM[2]) : null;
+        if (isTotalLabel(label)) {
+          if (currentSub) {
+            currentSub.totalLineIndex = i;
+            currentSub.declaredTotal = value;
+            subs.push(currentSub);
+            currentSub = null;
+          } else if (direct.entries.length > 0 && subs.length === 0 && categoryTotalLineIndex === null) {
+            direct.totalLineIndex = i;
+            direct.declaredTotal = value;
+          } else {
+            categoryTotalLineIndex = i;
+            categoryDeclaredTotal = value;
+          }
+        } else {
+          (currentSub || direct).entries.push({ label: label.trim(), amount: value, lineIndex: i });
+        }
+      } else if (trimmed !== "") {
+        // plain label, no dash at all -> starts a new subcategory
+        if (currentSub) subs.push(currentSub);
+        currentSub = { title: trimmed, entries: [], totalLineIndex: null, declaredTotal: null };
       }
-      if (entryM && normLabel(entryM[1]) === "total") {
-        totalLineIndex = i;
-        declaredTotal = sumAmounts(entryM[2]);
-        continue;
-      }
-      if (entryM) {
-        entries.push({ label: entryM[1].trim(), amount: sumAmounts(entryM[2]), lineIndex: i });
-        continue;
-      }
-      unparsedLines.push(lines[i]);
     }
-    blocks.push(makeBlock(sign, title, entries, totalLineIndex, declaredTotal));
+    if (currentSub) subs.push(currentSub);
+
+    // no subcategories at all -> the one total line found is the category's own total
+    if (subs.length === 0 && direct.totalLineIndex !== null && categoryTotalLineIndex === null) {
+      categoryTotalLineIndex = direct.totalLineIndex;
+      categoryDeclaredTotal = direct.declaredTotal;
+      direct.totalLineIndex = null;
+      direct.declaredTotal = null;
+    }
+
+    subs.forEach((s) => {
+      s.computedSum = s.entries.reduce((a, e) => a + e.amount, 0);
+      s.mismatch = s.declaredTotal !== null && Math.abs(s.declaredTotal - s.computedSum) > 0.005;
+    });
+    direct.computedSum = direct.entries.reduce((a, e) => a + e.amount, 0);
+    const computedSum = subs.reduce((a, s) => a + s.computedSum, 0) + direct.computedSum;
+
+    blocks.push({
+      sign,
+      title: titleText,
+      subs,
+      entries: direct.entries,
+      computedSum,
+      totalLineIndex: categoryTotalLineIndex,
+      declaredTotal: categoryDeclaredTotal,
+      mismatch: categoryDeclaredTotal !== null && Math.abs(categoryDeclaredTotal - computedSum) > 0.005,
+      lineIndices: idxList,
+    });
   }
 
+  // ---- top-level sums ----
   let subIncoming = 0,
     subOutgoing = 0;
   for (const b of blocks) {
@@ -151,6 +227,11 @@ function parseLedger(text) {
     if (b.totalLineIndex !== null && (b.declaredTotal === null || Math.abs(b.declaredTotal - b.computedSum) > 0.005)) {
       autofillTargets.push({ lineIndex: b.totalLineIndex, value: b.computedSum });
     }
+    for (const s of b.subs) {
+      if (s.totalLineIndex !== null && (s.declaredTotal === null || Math.abs(s.declaredTotal - s.computedSum) > 0.005)) {
+        autofillTargets.push({ lineIndex: s.totalLineIndex, value: s.computedSum });
+      }
+    }
   }
 
   return {
@@ -164,6 +245,123 @@ function parseLedger(text) {
     autofillTargets,
     unparsedLines,
   };
+}
+
+/* =========================================================================
+   PERSONAL OUTGOING -> PERSONAL INCOMING SYNC
+   A "(-): Personal Outgoing" category whose subcategory is named after
+   another existing account mirrors those entries into that account's
+   "(+): Personal Incoming" category, under a subcategory named after the
+   source account. One-directional only (Incoming never triggers a sync
+   back), so there's no feedback loop.
+   ========================================================================= */
+
+// { [targetAccountName]: { [sourceAccountName]: [{label, amount}] } }
+function computeIncomingUpdates(accounts) {
+  const names = Object.keys(accounts);
+  const map = {};
+  for (const acctName of names) {
+    const parsed = parseLedger(accounts[acctName]);
+    for (const b of parsed.blocks) {
+      if (normLabel(b.title) !== "personaloutgoing") continue;
+      for (const s of b.subs) {
+        const targetTrim = s.title.trim();
+        const target = names.find((n) => n === targetTrim) || names.find((n) => n.toLowerCase() === targetTrim.toLowerCase());
+        if (!target || target === acctName) continue;
+        if (!map[target]) map[target] = {};
+        map[target][acctName] = s.entries.map((e) => ({ label: e.label, amount: e.amount }));
+      }
+    }
+  }
+  return map;
+}
+
+function buildIncomingBlockLines(subsFinal) {
+  if (subsFinal.length === 0) return [];
+  const lines = ["(+): Personal Incoming", ""];
+  subsFinal.forEach((s, idx) => {
+    lines.push(s.title);
+    s.entries.forEach((e) => lines.push(`${e.label} - ${formatNum(e.amount)}`));
+    const subTotal = s.entries.reduce((a, e) => a + e.amount, 0);
+    lines.push(`${s.title} Total - ${formatNum(subTotal)}`);
+    if (idx < subsFinal.length - 1) lines.push("");
+  });
+  const total = subsFinal.reduce((a, s) => a + s.entries.reduce((x, e) => x + e.amount, 0), 0);
+  lines.push("");
+  lines.push(`Personal Incoming Total - ${formatNum(total)}`);
+  return lines;
+}
+
+// Rewrites one account's text so its Personal Incoming category exactly
+// mirrors `desiredBySource`, creating or removing that category as needed,
+// while leaving every other line (including manually-added subcategories
+// not named after an account) untouched.
+function applyIncomingSync(text, accountNames, desiredBySource) {
+  const parsed = parseLedger(text);
+  const incoming = parsed.blocks.find((b) => normLabel(b.title) === "personalincoming");
+
+  // Safety: if the user already hand-wrote flat entries directly under
+  // Personal Incoming (not organized into subcategories), leave it alone
+  // rather than risk discarding something they typed by hand.
+  if (incoming && incoming.entries.length > 0) return text;
+
+  const preserved = [];
+  if (incoming) {
+    for (const s of incoming.subs) {
+      const isManaged = accountNames.some((n) => n.toLowerCase() === s.title.trim().toLowerCase());
+      if (!isManaged) preserved.push({ title: s.title, entries: s.entries.map((e) => ({ label: e.label, amount: e.amount })) });
+    }
+  }
+
+  const syncedNames = Object.keys(desiredBySource)
+    .filter((src) => desiredBySource[src].length > 0)
+    .sort((a, b) => a.localeCompare(b));
+  const subsFinal = [...syncedNames.map((src) => ({ title: src, entries: desiredBySource[src] })), ...preserved];
+  const newBlockLines = buildIncomingBlockLines(subsFinal);
+
+  const lines = text.split("\n");
+  const removeSet = new Set(incoming ? incoming.lineIndices : []);
+
+  // Insert right before the first summary line (Sub incoming/outgoing/Balance)
+  // if one exists, otherwise at the very end of the document.
+  const summaryIdxs = Object.values(parsed.summary)
+    .filter(Boolean)
+    .map((s) => s.lineIndex)
+    .sort((a, b) => a - b);
+  const anchor = summaryIdxs.length ? summaryIdxs[0] : null;
+
+  const result = [];
+  let inserted = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (anchor !== null && i === anchor && !inserted) {
+      if (newBlockLines.length) {
+        if (result.length && result[result.length - 1].trim() !== "") result.push("");
+        result.push(...newBlockLines);
+        result.push("");
+      }
+      inserted = true;
+    }
+    if (!removeSet.has(i)) result.push(lines[i]);
+  }
+  if (!inserted && newBlockLines.length) {
+    if (result.length && result[result.length - 1].trim() !== "") result.push("");
+    result.push(...newBlockLines);
+  }
+
+  let finalText = result.join("\n").replace(/\n{3,}/g, "\n\n").replace(/^\n+/, "");
+
+  // Re-run the normal parser + autofill so every Total/Sub/Balance line in
+  // the whole account reflects the new numbers immediately, not just the
+  // block we just wrote.
+  const p2 = parseLedger(finalText);
+  if (p2.autofillTargets.length) {
+    const finalLines = finalText.split("\n");
+    p2.autofillTargets.forEach((t) => {
+      finalLines[t.lineIndex] = rewriteAmountLine(finalLines[t.lineIndex], t.value);
+    });
+    finalText = finalLines.join("\n");
+  }
+  return finalText;
 }
 
 // Given absolute cursor offset in `text`, return { lineIdx, col }.
@@ -218,9 +416,17 @@ Bank - 500
 Total -
 
 (-): Expense
-Snacks - 50
-Bus - 30
-Total - 80
+
+Fruits
+Apples - 500
+Bananas - 400
+Fruits Total -
+
+Vegetables
+Onions - 300
+Vegetable Total -
+
+Expense Total -
 
 Sub incoming -
 Sub outgoing -
@@ -329,17 +535,7 @@ export default function LedgerApp() {
   const [accounts, setAccounts] = useState(() => {
     try {
       const saved = localStorage.getItem(STORAGE_ACCOUNTS);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        // one-time cleanup: earlier builds saved the sample walkthrough text
-        // as real content instead of just showing it as a placeholder —
-        // strip it out wherever it's still sitting untouched.
-        const cleaned = {};
-        for (const [name, val] of Object.entries(parsed)) {
-          cleaned[name] = val === STARTER_TEXT ? "" : val;
-        }
-        return cleaned;
-      }
+      if (saved) return JSON.parse(saved);
     } catch {}
     return { Sreedev: "" };
   });
@@ -382,18 +578,42 @@ export default function LedgerApp() {
     }
   }, [accounts, activeAccount]);
 
-  useLayoutEffect(() => {
+  // ---- keep every OTHER account's Personal Incoming synced live as you
+  //      type a Personal Outgoing entry here; never rewrites the account
+  //      that's currently open for editing, so it can't disturb your cursor ----
+  useEffect(() => {
+    const names = Object.keys(accounts);
+    const map = computeIncomingUpdates(accounts);
+    const updates = {};
+    for (const target of names) {
+      if (target === activeAccount) continue;
+      const desired = map[target] || {};
+      const newText = applyIncomingSync(accounts[target], names, desired);
+      if (newText !== accounts[target]) updates[target] = newText;
+    }
+    if (Object.keys(updates).length) {
+      setAccounts((prev) => ({ ...prev, ...updates }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accounts, activeAccount]);
+
+  // ---- catch the newly-opened account up to date the moment you switch to it ----
+  useEffect(() => {
+    const names = Object.keys(accounts);
+    const map = computeIncomingUpdates(accounts);
+    const desired = map[activeAccount] || {};
+    const newText = applyIncomingSync(accounts[activeAccount] ?? "", names, desired);
+    if (accounts[activeAccount] !== undefined && newText !== accounts[activeAccount]) {
+      setAccounts((prev) => ({ ...prev, [activeAccount]: newText }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeAccount]);
+
+  useEffect(() => {
     if (pendingCursor.current !== null && textareaRef.current) {
       const pos = pendingCursor.current;
       pendingCursor.current = null;
-      const el = textareaRef.current;
-      el.setSelectionRange(pos, pos);
-      // Some Android soft-keyboards/WebViews snap the cursor back to the end
-      // right after a controlled-value update; re-apply on the next frame so
-      // the jump-to-next-line behavior sticks instead of getting overridden.
-      requestAnimationFrame(() => {
-        if (document.activeElement === el) el.setSelectionRange(pos, pos);
-      });
+      textareaRef.current.setSelectionRange(pos, pos);
     }
   }, [text]);
 
@@ -446,18 +666,19 @@ export default function LedgerApp() {
 
     const { lineIdx: curLineIdx, col: curCol } = lineColFromCursor(raw, cursor);
 
-    // ---- auto-insert a blank "Total -" line right after a freshly created
-    //      section header, so entries can be typed above it while it lives
-    //      below, ready to keep itself in sync ----
+    // ---- auto-insert a blank Total line right after a freshly created
+    //      section header (category, marked with (+)/(-)) or subcategory
+    //      header (a plain label line with no dash), so entries can be
+    //      typed above it while it lives below, ready to keep itself synced ----
     let workingLines = raw.split("\n");
-    if (
-      workingLines[curLineIdx] !== undefined &&
-      workingLines[curLineIdx].trim() === "" &&
-      curLineIdx > 0 &&
-      MARKER_RE.test(workingLines[curLineIdx - 1].trim()) &&
-      !blockAlreadyHasTotal(workingLines, curLineIdx + 1)
-    ) {
-      workingLines.splice(curLineIdx + 1, 0, "Total -");
+    if (workingLines[curLineIdx] !== undefined && workingLines[curLineIdx].trim() === "" && curLineIdx > 0) {
+      const prevLine = workingLines[curLineIdx - 1].trim();
+      const isCategoryHeader = MARKER_RE.test(prevLine);
+      const isSubHeader = prevLine !== "" && !isCategoryHeader && !BLANK_RE.test(prevLine) && !ENTRY_RE.test(prevLine);
+      if ((isCategoryHeader || isSubHeader) && !blockAlreadyHasTotal(workingLines, curLineIdx + 1)) {
+        const totalLabel = isCategoryHeader ? "Total" : `${prevLine} Total`;
+        workingLines.splice(curLineIdx + 1, 0, `${totalLabel} -`);
+      }
     }
 
     const p = parseLedger(workingLines.join("\n"));
@@ -553,17 +774,6 @@ export default function LedgerApp() {
         closeSheet();
       },
       { danger: true, confirmLabel: "Delete" }
-    );
-  }
-
-  function clearAccount() {
-    askConfirm(
-      `Clear all text in "${activeAccount}"? Save a .txt backup first if you need one.`,
-      () => {
-        setAccounts((prev) => ({ ...prev, [activeAccount]: "" }));
-        closeSheet();
-      },
-      { danger: true, confirmLabel: "Clear" }
     );
   }
 
@@ -692,19 +902,26 @@ export default function LedgerApp() {
           <SheetRow icon={<Upload size={17} />} label="Open .txt" onClick={() => fileInputRef.current.click()} />
           <div className="h-px bg-zinc-800 my-1" />
           <SheetRow icon={<Pencil size={17} />} label="Rename account" onClick={renameAccount} />
-          <SheetRow icon={<Trash2 size={17} />} label="Clear account text" onClick={clearAccount} danger />
           <SheetRow icon={<Trash2 size={17} />} label="Delete account" onClick={deleteAccount} danger />
           <div className="h-px bg-zinc-800 my-1" />
           <SheetRow icon={<HelpCircle size={17} />} label={showHelp ? "Hide format guide" : "Format guide"} onClick={() => setShowHelp((s) => !s)} />
           {showHelp && (
             <div className="mx-3 mb-1 p-3 rounded-lg border border-teal-900 bg-teal-950/40 font-mono text-[11px] leading-relaxed text-teal-200">
-              Mark a line or section <code>(+):</code> for credit, <code>(-):</code> for debit.
+              Mark a category <code>(+):</code> for credit, <code>(-):</code> for debit.
               <br />
               Entries look like <code>Label - amount</code>; chain several with <code>+</code>.
               <br />
-              Leave <code>Total -</code>, <code>Sub incoming -</code>, <code>Sub outgoing -</code>, or <code>Balance -</code> blank and
-              they'll fill in automatically. If you type your own number instead, it's checked against the computed value rather than
-              overwritten.
+              Give a category subcategories by writing a plain label line (no dash) — e.g. <code>Fruits</code> — followed by its
+              entries and a <code>Fruits Total -</code> line. Add as many subcategories as you like, and close the whole category
+              with one more Total line (e.g. <code>Expense Total -</code>). A blank line between subcategories is optional.
+              <br />
+              Leave any Total, <code>Sub incoming -</code>, <code>Sub outgoing -</code>, or <code>Balance -</code> blank (or even a
+              stale number) and it keeps itself synced automatically as you edit.
+              <br />
+              A <code>(-): Personal Outgoing</code> category with a subcategory named after another account (e.g.{" "}
+              <code>Ambika</code>) mirrors those entries into that account's <code>(+): Personal Incoming</code> automatically —
+              only if that account exists; unrecognized names are left as plain entries. Delete the entries here and the mirrored
+              copy there is removed too.
             </div>
           )}
         </div>
@@ -799,6 +1016,19 @@ function SectionTotals({ parsed }) {
                 <span>
                   {formatNum(b.declaredTotal)} {b.mismatch ? "✗" : "✓"}
                 </span>
+              </div>
+            )}
+            {b.subs.length > 0 && (
+              <div className="border-t border-zinc-800 divide-y divide-zinc-800/70">
+                {b.subs.map((s, si) => (
+                  <div key={si} className="px-3 py-1.5 flex items-center justify-between font-mono text-[11px] text-zinc-300">
+                    <span className="pl-2 border-l-2 border-zinc-700">{s.title}</span>
+                    <span className={s.mismatch ? "text-rose-400 font-semibold" : "text-zinc-400"}>
+                      {formatNum(s.computedSum) || "0"}
+                      {s.declaredTotal !== null ? (s.mismatch ? " ✗" : " ✓") : ""}
+                    </span>
+                  </div>
+                ))}
               </div>
             )}
           </div>
