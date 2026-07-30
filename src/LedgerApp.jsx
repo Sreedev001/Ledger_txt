@@ -1,5 +1,5 @@
 import React, { useState, useRef, useMemo, useEffect } from "react";
-import { Undo2, Redo2, Plus, AlignLeft, MoreVertical, X, Download, Upload, Pencil, Trash2, Layers, HelpCircle, Type, AlignJustify } from "lucide-react";
+import { Undo2, Redo2, Plus, AlignLeft, MoreVertical, X, Download, Upload, Pencil, Trash2, Layers, HelpCircle, Type, AlignJustify, Landmark } from "lucide-react";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -202,9 +202,16 @@ function parseLedger(text) {
   }
 
   // ---- top-level sums ----
+  // "Outstanding Loans" is always excluded here regardless of its marker.
+  // It's deliberately written with a "(+):" marker (rather than left bare)
+  // so it always starts its own category group instead of silently folding
+  // into whatever category precedes it as a subcategory (the normal
+  // blank-line-tolerant folding rule would otherwise swallow an unmarked
+  // block that immediately follows "(+): Loan").
   let subIncoming = 0,
     subOutgoing = 0;
   for (const b of blocks) {
+    if (normLabel(b.title) === "outstandingloans") continue;
     if (b.sign === "+") subIncoming += b.computedSum;
     else if (b.sign === "-") subOutgoing += b.computedSum;
   }
@@ -416,6 +423,174 @@ function runSyncRounds(accounts, excludeFromWrite, maxRounds = 5) {
   return working;
 }
 
+/* =========================================================================
+   LOAN / LOAN REPAYMENT / OUTSTANDING LOANS
+   "(+): Loan" and "(-): Loan repayment" are treated as a matched pair,
+   cross-account. Whenever a "Loan repayment" entry (anywhere, in any
+   account) matches an unclaimed "Loan" entry (same person, same amount,
+   anywhere, in any account), the original Loan entry is annotated
+   "(repaid by <account>)" — this is what lets a loan taken in one account
+   be repaid through a different one.
+
+   "Outstanding Loans" is a fully app-managed, unmarked (no (+)/(-)) block
+   per account, listing that account's still-unmatched Loan entries. Being
+   unmarked means it's automatically excluded from Sub incoming/outgoing/
+   Balance by the normal parser — exactly the "report only, not counted"
+   behavior asked for.
+
+   Limitation (v1): only flat entries directly under Loan / Loan repayment
+   are matched — entries organized into subcategories are left alone.
+   ========================================================================= */
+
+const LOAN_ANNOTATION_RE = /\(repaid by ([^)]+)\)\s*$/i;
+
+// Strip any existing "(repaid by ...)" suffix and replace it with a fresh one.
+function annotateRepaidBy(line, accountName) {
+  const stripped = line.replace(LOAN_ANNOTATION_RE, "").replace(/\s+$/, "");
+  return `${stripped} (repaid by ${accountName})`;
+}
+
+function buildOutstandingLoansLines(entries) {
+  if (!entries.length) return [];
+  // The "(+):" marker is required so this block always opens its own
+  // category group (see the note above the subIncoming/subOutgoing loop) —
+  // it's still excluded from totals by title, not by sign.
+  const lines = ["(+): Outstanding Loans"];
+  entries.forEach((e) => lines.push(`${e.label} - ${formatNum(e.amount)}`));
+  const total = entries.reduce((a, e) => a + e.amount, 0);
+  lines.push(`Outstanding Loans Total - ${formatNum(total)}`);
+  return lines;
+}
+
+// Fully replaces the "Outstanding Loans" block in `text` with one built from
+// `outstandingEntries` (app-owned end to end, so always safe to overwrite).
+function applyOutstandingLoansSync(text, outstandingEntries) {
+  const parsed = parseLedger(text);
+  const existing = parsed.blocks.find((b) => normLabel(b.title) === "outstandingloans");
+  const lines = text.split("\n");
+  const removeSet = new Set(existing ? existing.lineIndices : []);
+  const newBlockLines = buildOutstandingLoansLines(outstandingEntries);
+
+  const summaryIdxs = Object.values(parsed.summary)
+    .filter(Boolean)
+    .map((s) => s.lineIndex)
+    .sort((a, b) => a - b);
+  const anchor = summaryIdxs.length ? summaryIdxs[0] : null;
+
+  const result = [];
+  let inserted = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (anchor !== null && i === anchor && !inserted) {
+      if (newBlockLines.length) {
+        if (result.length && result[result.length - 1].trim() !== "") result.push("");
+        result.push(...newBlockLines);
+        result.push("");
+      }
+      inserted = true;
+    }
+    if (!removeSet.has(i)) result.push(lines[i]);
+  }
+  if (!inserted && newBlockLines.length) {
+    if (result.length && result[result.length - 1].trim() !== "") result.push("");
+    result.push(...newBlockLines);
+  }
+
+  return result.join("\n").replace(/\n{3,}/g, "\n\n").replace(/^\n+/, "");
+}
+
+// Reads a Loan entry's raw line to see if it's already annotated as repaid.
+function loanEntryRepaidBy(rawLine) {
+  const m = rawLine.match(LOAN_ANNOTATION_RE);
+  return m ? m[1].trim() : null;
+}
+
+// Computes, for the current state of every account, which Loan entries
+// (anywhere) get newly claimed by a Loan-repayment entry (anywhere).
+// Matching is first-fit by person name + exact amount, scanned in a stable
+// account order — good enough for the common case of one loan per amount.
+function computeLoanMatches(accounts) {
+  const names = Object.keys(accounts);
+  const loanEntries = [];
+  const repaymentEntries = [];
+  for (const acct of names) {
+    const lines = accounts[acct].split("\n");
+    const parsed = parseLedger(accounts[acct]);
+    for (const b of parsed.blocks) {
+      if (b.sign === "+" && normLabel(b.title) === "loan") {
+        for (const e of b.entries) {
+          loanEntries.push({ account: acct, lineIndex: e.lineIndex, label: e.label, amount: e.amount, repaidBy: loanEntryRepaidBy(lines[e.lineIndex]) });
+        }
+      }
+      if (b.sign === "-" && normLabel(b.title) === "loanrepayment") {
+        for (const e of b.entries) {
+          repaymentEntries.push({ account: acct, label: e.label, amount: e.amount });
+        }
+      }
+    }
+  }
+
+  const claimed = new Set();
+  const matchFor = {}; // `${account}:${lineIndex}` -> repaying account name
+  for (const rep of repaymentEntries) {
+    const candidate = loanEntries.find(
+      (le) => le.repaidBy === null && !claimed.has(`${le.account}:${le.lineIndex}`) && normLabel(le.label) === normLabel(rep.label) && Math.abs(le.amount - rep.amount) < 0.005
+    );
+    if (candidate) {
+      claimed.add(`${candidate.account}:${candidate.lineIndex}`);
+      matchFor[`${candidate.account}:${candidate.lineIndex}`] = rep.account;
+    }
+  }
+  return matchFor;
+}
+
+// Applies loan-repayment annotations and refreshes each account's
+// Outstanding Loans block accordingly. Mirrors runSyncRounds' pattern of
+// never rewriting `excludeFromWrite` (the account actively being typed in).
+function runLoanSync(accounts, excludeFromWrite) {
+  const matchFor = computeLoanMatches(accounts);
+  const names = Object.keys(accounts);
+  const next = { ...accounts };
+
+  for (const acct of names) {
+    if (acct === excludeFromWrite) continue;
+    let lines = accounts[acct].split("\n");
+    const parsed = parseLedger(accounts[acct]);
+    const loanBlock = parsed.blocks.find((b) => b.sign === "+" && normLabel(b.title) === "loan");
+
+    if (loanBlock) {
+      for (const e of loanBlock.entries) {
+        const key = `${acct}:${e.lineIndex}`;
+        if (matchFor[key] && loanEntryRepaidBy(lines[e.lineIndex]) === null) {
+          lines[e.lineIndex] = annotateRepaidBy(lines[e.lineIndex], matchFor[key]);
+        }
+      }
+    }
+    let text = lines.join("\n");
+
+    // recompute this account's still-outstanding loan entries post-annotation
+    const reparsed = parseLedger(text);
+    const rlines = text.split("\n");
+    const reloanBlock = reparsed.blocks.find((b) => b.sign === "+" && normLabel(b.title) === "loan");
+    const outstanding = reloanBlock ? reloanBlock.entries.filter((e) => loanEntryRepaidBy(rlines[e.lineIndex]) === null).map((e) => ({ label: e.label, amount: e.amount })) : [];
+    text = applyOutstandingLoansSync(text, outstanding);
+
+    // re-run autofill so every Total/Sub/Balance reflects the change immediately
+    const p2 = parseLedger(text);
+    if (p2.autofillTargets.length) {
+      const fl = text.split("\n");
+      p2.autofillTargets.forEach((t) => {
+        fl[t.lineIndex] = rewriteAmountLine(fl[t.lineIndex], t.value);
+      });
+      text = fl.join("\n");
+    }
+
+    if (text !== accounts[acct]) next[acct] = text;
+  }
+  return next;
+}
+
+/* ========================================================================= */
+
 // Given absolute cursor offset in `text`, return { lineIdx, col }.
 function lineColFromCursor(text, cursor) {
   const lines = text.split("\n");
@@ -456,6 +631,19 @@ function blockAlreadyHasTotal(lines, fromIdx) {
     if (m && normLabel(m[1]) === "total") return true;
   }
   return false;
+}
+
+// If `line` is a Total line whose label is the bare generic word "Total"
+// (i.e. not yet customized to any name — including any name the user typed
+// themselves), rename it to `${newLabel} Total`. Leaves anything else,
+// including a total the user has already renamed to something specific,
+// untouched.
+function renameGenericTotalLabel(line, newLabel) {
+  const m = line.match(/^(\s*)(.+?)(\s-\s?.*)$/);
+  if (!m) return line;
+  const [, indent, label, rest] = m;
+  if (normLabel(label) !== "total") return line;
+  return `${indent}${newLabel} Total${rest}`;
 }
 
 /* ========================================================================= */
@@ -630,6 +818,7 @@ export default function LedgerApp() {
     }
   });
   const [showingAgg, setShowingAgg] = useState(false);
+  const [showingLoans, setShowingLoans] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [sheet, setSheet] = useState(null); // null | 'accounts' | 'totals' | 'menu'
   const [dialog, setDialog] = useState(null);
@@ -709,6 +898,31 @@ export default function LedgerApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeAccount]);
 
+  // ---- loan tracking: match Loan repayment entries (any account) against
+  //      unclaimed Loan entries (any account), annotate, and keep every
+  //      account's Outstanding Loans block current. Never rewrites the
+  //      account currently being typed in. ----
+  useEffect(() => {
+    const result = runLoanSync(accounts, activeAccount);
+    const updates = {};
+    for (const k of Object.keys(result)) {
+      if (result[k] !== accounts[k]) updates[k] = result[k];
+    }
+    if (Object.keys(updates).length) {
+      setAccounts((prev) => ({ ...prev, ...updates }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accounts, activeAccount]);
+
+  // ---- catch the newly-opened account's loan state up the moment you switch to it ----
+  useEffect(() => {
+    const result = runLoanSync(accounts, null);
+    if (accounts[activeAccount] !== undefined && result[activeAccount] !== accounts[activeAccount]) {
+      setAccounts((prev) => ({ ...prev, [activeAccount]: result[activeAccount] }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeAccount]);
+
   useEffect(() => {
     if (pendingCursor.current !== null && textareaRef.current) {
       const pos = pendingCursor.current;
@@ -782,6 +996,20 @@ export default function LedgerApp() {
     }
 
     const p = parseLedger(workingLines.join("\n"));
+
+    // If a subcategory's own closing Total line is still the bare generic
+    // word "Total" (this happens when a header+Enter pre-inserted a plain
+    // "Total -" before the user typed a subcategory name into that spot),
+    // keep it in sync with the subcategory's name instead of leaving it
+    // generically labeled.
+    for (const b of p.blocks) {
+      for (const s of b.subs) {
+        if (s.totalLineIndex !== null) {
+          workingLines[s.totalLineIndex] = renameGenericTotalLabel(workingLines[s.totalLineIndex], s.title);
+        }
+      }
+    }
+
     const finalLines = workingLines.slice();
     p.autofillTargets.forEach((t) => {
       finalLines[t.lineIndex] = rewriteAmountLine(finalLines[t.lineIndex], t.value);
@@ -920,6 +1148,21 @@ export default function LedgerApp() {
     );
   }
 
+  if (showingLoans) {
+    return (
+      <div className="h-screen flex flex-col bg-black text-zinc-100">
+        <div className="flex items-center gap-3 px-4 py-3 bg-[#151517] shrink-0">
+          <button onClick={() => setShowingLoans(false)} className="flex items-center gap-1 -ml-1 px-1 py-1 text-zinc-300 hover:text-white">
+            <X size={20} />
+            <span className="font-mono text-xs">Close</span>
+          </button>
+          <span className="font-mono text-xs uppercase tracking-widest text-zinc-400">Outstanding Loans</span>
+        </div>
+        <LoansView accounts={accounts} />
+      </div>
+    );
+  }
+
   return (
     <div className="h-screen flex flex-col bg-black">
       {/* top bar */}
@@ -995,6 +1238,14 @@ export default function LedgerApp() {
               closeSheet();
             }}
           />
+          <SheetRow
+            icon={<Landmark size={17} />}
+            label="Outstanding loans"
+            onClick={() => {
+              setShowingLoans(true);
+              closeSheet();
+            }}
+          />
         </div>
       </BottomSheet>
 
@@ -1053,6 +1304,15 @@ export default function LedgerApp() {
               <br />
               Caveat: once a pair like this exists on both sides, delete it from just one side and it can reappear from the
               other side's copy. To remove it for good, delete it from both accounts.
+              <br />
+              <br />
+              <strong>Loans:</strong> record a loan as an entry under <code>(+): Loan</code> (e.g. <code>Saneesh - 2000</code>).
+              Record repaying it as an entry with the same name and amount under <code>(-): Loan repayment</code> — in any
+              account, not necessarily the one the loan was taken in. Once matched, the original Loan entry is annotated{" "}
+              <code>(repaid by &lt;account&gt;)</code> automatically, and it drops off <code>Outstanding Loans</code> — a section
+              the app manages entirely on its own, listing that account's still-unpaid loans. Outstanding Loans is never
+              counted toward Sub incoming/outgoing/Balance, no matter what. See Accounts (tap your avatar) → Outstanding
+              loans to view every account's loans, and to combine two or more accounts' loans into one summed view.
             </div>
           )}
         </div>
@@ -1131,10 +1391,16 @@ function SectionTotals({ parsed }) {
               <span
                 className={
                   "text-[9px] uppercase tracking-wide px-2 py-0.5 rounded-full font-mono " +
-                  (b.sign === "+" ? "bg-emerald-950/60 text-emerald-300" : b.sign === "-" ? "bg-rose-950/60 text-rose-300" : "bg-amber-950/60 text-amber-300")
+                  (normLabel(b.title) === "outstandingloans"
+                    ? "bg-sky-950/60 text-sky-300"
+                    : b.sign === "+"
+                    ? "bg-emerald-950/60 text-emerald-300"
+                    : b.sign === "-"
+                    ? "bg-rose-950/60 text-rose-300"
+                    : "bg-amber-950/60 text-amber-300")
                 }
               >
-                {b.sign === "+" ? "credit" : b.sign === "-" ? "debit" : "unmarked"}
+                {normLabel(b.title) === "outstandingloans" ? "report only" : b.sign === "+" ? "credit" : b.sign === "-" ? "debit" : "unmarked"}
               </span>
             </div>
             <div className="px-3 py-1.5 font-mono text-xs flex justify-between text-zinc-400">
@@ -1208,6 +1474,125 @@ function AggregateView({ accounts }) {
           </tr>
         </tbody>
       </table>
+    </div>
+  );
+}
+
+// Reads each account's still-unmatched "(+): Loan" entries — same logic the
+// sync engine uses, kept independent of the auto-managed "Outstanding Loans"
+// block so this view is always accurate even mid-keystroke on another tab.
+function outstandingLoansFor(text) {
+  const parsed = parseLedger(text);
+  const lines = text.split("\n");
+  const block = parsed.blocks.find((b) => b.sign === "+" && normLabel(b.title) === "loan");
+  if (!block) return [];
+  return block.entries.filter((e) => loanEntryRepaidBy(lines[e.lineIndex]) === null).map((e) => ({ label: e.label.trim(), amount: e.amount }));
+}
+
+function LoansView({ accounts }) {
+  const [combined, setCombined] = useState(() => new Set());
+
+  const perAccount = useMemo(() => {
+    return Object.keys(accounts).map((name) => {
+      const outstanding = outstandingLoansFor(accounts[name]);
+      return { name, outstanding, total: outstanding.reduce((a, e) => a + e.amount, 0) };
+    });
+  }, [accounts]);
+
+  function toggle(name) {
+    setCombined((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  }
+
+  const combinedRows = useMemo(() => {
+    if (combined.size < 2) return null;
+    const map = {};
+    for (const acc of perAccount) {
+      if (!combined.has(acc.name)) continue;
+      for (const e of acc.outstanding) {
+        const key = e.label;
+        map[key] = (map[key] || 0) + e.amount;
+      }
+    }
+    return Object.keys(map)
+      .map((k) => ({ label: k, amount: map[k] }))
+      .sort((a, b) => b.amount - a.amount);
+  }, [combined, perAccount]);
+
+  return (
+    <div className="flex-1 overflow-y-auto px-5 py-5">
+      <p className="font-mono text-[11px] text-zinc-500 mb-4 leading-relaxed">
+        Outstanding loans computed live from every account, cross-checked against every "Loan repayment" entry so a loan
+        repaid through a different account still drops off correctly. Tap two or more accounts below to combine their loans
+        into one summed view.
+      </p>
+
+      <div className="flex flex-wrap gap-2 mb-4">
+        {perAccount.map((acc) => (
+          <button
+            key={acc.name}
+            onClick={() => toggle(acc.name)}
+            className={
+              "px-3 py-1.5 rounded-full font-mono text-xs border " +
+              (combined.has(acc.name) ? "bg-teal-700 border-teal-600 text-white" : "border-zinc-700 text-zinc-300")
+            }
+          >
+            {acc.name}
+          </button>
+        ))}
+      </div>
+
+      {combinedRows && (
+        <div className="mb-6">
+          <h2 className="font-mono text-[11px] uppercase tracking-widest text-zinc-500 mb-2">Combined — {[...combined].join(" + ")}</h2>
+          {combinedRows.length === 0 ? (
+            <div className="rounded-lg border border-zinc-800 bg-zinc-800/60 px-3 py-2 font-mono text-[11px] text-zinc-400">No outstanding loans</div>
+          ) : (
+            <table className="w-full border-collapse font-mono text-xs">
+              <tbody>
+                {combinedRows.map((r) => (
+                  <tr key={r.label}>
+                    <td className="border border-zinc-800 text-zinc-200 px-3 py-2">{r.label}</td>
+                    <td className="text-right border border-zinc-800 text-zinc-200 px-3 py-2">{formatNum(r.amount)}</td>
+                  </tr>
+                ))}
+                <tr className="font-bold border-t-2 border-zinc-600">
+                  <td className="border border-zinc-800 text-zinc-100 px-3 py-2">Total</td>
+                  <td className="text-right border border-zinc-800 text-zinc-100 px-3 py-2">{formatNum(combinedRows.reduce((a, r) => a + r.amount, 0))}</td>
+                </tr>
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      <h2 className="font-mono text-[11px] uppercase tracking-widest text-zinc-500 mb-2">By account</h2>
+      <div className="space-y-3">
+        {perAccount.map((acc) => (
+          <div key={acc.name} className="rounded-lg border border-zinc-800 overflow-hidden">
+            <div className="flex items-center justify-between px-3 py-1.5 bg-zinc-800/60 font-mono text-xs">
+              <span className="font-semibold text-zinc-100">{acc.name}</span>
+              <span className="text-zinc-400">{formatNum(acc.total) || "0"}</span>
+            </div>
+            {acc.outstanding.length === 0 ? (
+              <div className="px-3 py-2 font-mono text-[11px] text-zinc-500">No outstanding loans</div>
+            ) : (
+              <div className="divide-y divide-zinc-800/70">
+                {acc.outstanding.map((e, i) => (
+                  <div key={i} className="px-3 py-1.5 flex items-center justify-between font-mono text-[11px] text-zinc-300">
+                    <span>{e.label}</span>
+                    <span>{formatNum(e.amount)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
