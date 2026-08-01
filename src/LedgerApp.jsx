@@ -1113,28 +1113,19 @@ function parseTransactionRow(row) {
   const fullRow = group.extra ? `${line} ${group.extra}` : line;
 
   let amount, balance;
-  let columnType = "unknown";
   if (parsedAmounts.length >= 3) {
     // Separate Debit / Credit columns: many statements print "0.00" in
     // whichever of the two columns doesn't apply instead of leaving it
     // blank, so a row like this carries three numbers -- debit, credit,
     // balance -- not the two (amount, balance) a straight last-two-numbers
     // read assumes. The nonzero one of the first two columns is the real
-    // amount. Which column it sits in is only a GUESS at debit vs credit
-    // (it assumes debit-before-credit column order, which not every bank
-    // follows) -- so it's kept separate from `type` below and only used if
-    // nothing more reliable (an actual Cr/Dr marker in the text) is found.
+    // amount. This is ONLY used to pick which number is the amount --
+    // never to decide debit vs credit, since which column is "debit" and
+    // which is "credit" is just an assumed order, not something the
+    // statement text actually says (see the type-detection comment below).
     const [col1, col2] = parsedAmounts;
     balance = parsedAmounts[parsedAmounts.length - 1].value;
-    if (col1.value > 0) {
-      amount = col1.value;
-      columnType = "debit";
-    } else if (col2.value > 0) {
-      amount = col2.value;
-      columnType = "credit";
-    } else {
-      amount = 0;
-    }
+    amount = col1.value > 0 ? col1.value : col2.value > 0 ? col2.value : 0;
   } else if (parsedAmounts.length === 2) {
     amount = parsedAmounts[0].value;
     balance = parsedAmounts[1].value;
@@ -1143,16 +1134,19 @@ function parseTransactionRow(row) {
     balance = null;
   }
 
-  // Type priority: (1) a Cr/Dr marker glued or bracketed onto one specific
-  // amount -- the most direct evidence; (2) an explicit Cr/Dr or
-  // credited/debited word anywhere in the row's text -- still direct
-  // evidence, just not tied to one amount's exact position (this is what
-  // catches a marker like "DR" sitting mid-narration, e.g.
-  // "UPIAR/.../DR/PAYEE NAME/...", far from the amount digits); (3) the
-  // debit/credit COLUMN GUESS from above, only as a last resort, since it's
-  // an assumption rather than something the statement actually says;
-  // (4) unknown, left for the balance-comparison fallback in
-  // resolveTransactionSigns.
+  // Debit vs credit is decided ONLY by an explicit Cr/Dr marker actually
+  // present in the row's text -- never guessed from column position or
+  // from whether the running balance went up or down. Those are
+  // assumptions the statement itself never states, and guessing wrong
+  // silently sends a transaction to the wrong side of the ledger. If no
+  // marker is found anywhere, `type` stays "unknown" and the review step
+  // requires the user to pick Money In / Money Out by hand.
+  // Priority: (1) a marker glued or bracketed onto one specific amount --
+  // the most direct evidence; (2) an explicit Cr/Dr or credited/debited
+  // word anywhere in the row's text -- still direct evidence, just not
+  // tied to one amount's exact position (this is what catches a marker
+  // like "DR" sitting mid-narration, e.g. "UPIAR/.../DR/PAYEE NAME/...",
+  // far from the amount digits).
   let type = "unknown";
   for (const a of parsedAmounts) {
     if (a.marker) {
@@ -1164,7 +1158,6 @@ function parseTransactionRow(row) {
     if (/\bcr\b|credit(ed)?\b/i.test(fullRow)) type = "credit";
     else if (/\bdr\b|debit(ed)?\b/i.test(fullRow)) type = "debit";
   }
-  if (type === "unknown" && columnType !== "unknown") type = columnType;
   const n = parseNarration(rawNarration);
   const description = n.name || (n.channel !== "Other" ? `${n.channel} transaction` : narrationHead) || "(no description)";
   return {
@@ -1193,21 +1186,15 @@ function parseTransactions(lines) {
   return out;
 }
 
-// Resolves debit-vs-credit for rows where the text gave no explicit Dr/Cr
-// marker, using the running-balance column when present: balance going up
-// = credit, down = debit. Falls back to "debit" (the more common statement
-// row) if there's no balance column to compare against either.
+// Debit/credit direction is decided entirely inside parseTransactionRow
+// from an explicit Cr/Dr marker in the row's text -- this function no
+// longer guesses from the running-balance column. A transaction with no
+// marker anywhere stays "unknown" so the review step's Money In/Money Out
+// toggle asks the user, instead of silently picking a side that might be
+// wrong. (Kept as its own pass, rather than folded into parseTransactionRow,
+// in case a future signal genuinely needs cross-row context.)
 function resolveTransactionSigns(transactions) {
-  let prevBalance = null;
-  return transactions.map((t) => {
-    let type = t.guessedType;
-    if (type === "unknown" && t.balance !== null) {
-      if (prevBalance !== null) type = t.balance >= prevBalance ? "credit" : "debit";
-    }
-    if (type === "unknown") type = "debit";
-    if (t.balance !== null) prevBalance = t.balance;
-    return { ...t, guessedType: type };
-  });
+  return transactions;
 }
 
 // Best-effort statement month guess from a "Period: dd/mm/yyyy to dd/mm/yyyy"
