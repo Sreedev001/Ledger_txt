@@ -848,13 +848,41 @@ const KNOWN_BANK_NAMES = [
   "Chase", "Bank of America", "Wells Fargo", "Citibank", "HSBC",
 ];
 
-// Best-effort bank-name guess: known-name scan first, then fall back to the
-// first substantial line of the document (statements almost always open
-// with a letterhead line).
-function guessBankName(fullText) {
-  for (const name of KNOWN_BANK_NAMES) {
-    if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(fullText)) return name;
+function scanForBankName(text, preferFullNames) {
+  const names = preferFullNames ? [...KNOWN_BANK_NAMES].sort((a, b) => b.length - a.length) : KNOWN_BANK_NAMES;
+  for (const name of names) {
+    if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(text)) return name;
   }
+  return null;
+}
+
+// Best-effort bank-name guess. Searches only the header block -- everything
+// before the transaction table starts -- not the whole document. Short
+// bank-code abbreviations ("HDFC", "SBI", "ICICI"...) show up constantly
+// inside a UPI/NEFT narration as the COUNTERPARTY's bank, not the
+// statement issuer's (e.g. "UPIAR/.../DR/PAYEE/HDFC/vpa@bank" is a Union
+// Bank statement whose payee happens to bank with HDFC). Scanning the whole
+// multi-page document risked matching one of those narration codes deep in
+// the page instead of the actual letterhead, which always sits at the top.
+function guessBankName(fullText) {
+  const lines = fullText.split("\n");
+  let headerEndIdx = lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(DATE_TOKEN_RE);
+    if (m && m.index <= 6) {
+      headerEndIdx = i;
+      break;
+    }
+  }
+  const header = lines.slice(0, headerEndIdx).join("\n");
+  const headerHit = scanForBankName(header);
+  if (headerHit) return headerHit;
+  // Fallback: header extraction can vary by PDF, so if nothing matched
+  // there, scan the whole document -- but prefer full multi-word names
+  // over bare abbreviations, since a full name is far less likely to be a
+  // coincidental narration hit than a 3-4 letter code is.
+  const wholeDocHit = scanForBankName(fullText, true);
+  if (wholeDocHit) return wholeDocHit;
   const firstLine = fullText.split("\n").map((l) => l.trim()).find((l) => l.length >= 4 && /[A-Za-z]/.test(l)) || "";
   const cut = firstLine.search(/\b(statement|period|account|a\/c|from|no\.?|number|\d)/i);
   return (cut > 0 ? firstLine.slice(0, cut) : firstLine).trim() || "Unknown bank";
@@ -1043,16 +1071,19 @@ function parseNarration(text) {
 // being misread as the amount.
 // Detects a Cr/Dr marker sitting right next to one specific amount match --
 // glued directly onto the digits ("500.00Cr"), space-separated
-// ("500.00 Cr"), or bracketed ("(500.00 Cr)" / "500.00(Cr)"). This has to be
-// checked relative to the amount's own position rather than scanned for
-// generically in the row text: a plain /\bcr\b/ regex requires a
-// word/non-word boundary before "c", but a digit and a letter are BOTH word
-// characters, so there is no boundary at all between "0" and "C" in
-// "500.00Cr" -- that glued form silently never matched before.
+// ("500.00 Cr"), or bracketed. The bracketed form in real statements wraps
+// only the marker, immediately after the amount, with an OPENING paren
+// right against the digits -- "23500.00(Dr)" -- not a closing one, so the
+// character class here has to allow "(" right after the amount, not ")".
+// This has to be checked relative to the amount's own position rather than
+// scanned for generically in the row text: a plain /\bcr\b/ regex requires
+// a word/non-word boundary before "c", but a digit and a letter are BOTH
+// word characters, so there is no boundary at all between "0" and "C" in
+// "500.00Cr" -- that glued form silently never matched before either.
 function markerNear(text, start, end) {
-  const after = text.slice(end).match(/^[\s)]{0,3}(cr|dr)\b/i);
+  const after = text.slice(end).match(/^[\s(]{0,3}(cr|dr)\b/i);
   if (after) return after[1].toLowerCase();
-  const before = text.slice(Math.max(0, start - 4), start).match(/(cr|dr)[\s(]{0,3}$/i);
+  const before = text.slice(Math.max(0, start - 4), start).match(/(cr|dr)[\s)]{0,3}$/i);
   if (before) return before[1].toLowerCase();
   return null;
 }
