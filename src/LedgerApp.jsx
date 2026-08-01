@@ -1,11 +1,17 @@
 import React, { useState, useRef, useMemo, useEffect } from "react";
-import { Undo2, Redo2, Plus, AlignLeft, MoreVertical, X, Download, Upload, Pencil, Trash2, Layers, HelpCircle, Type, AlignJustify, Landmark } from "lucide-react";
+import { Undo2, Redo2, Plus, AlignLeft, MoreVertical, X, Download, Upload, Pencil, Trash2, Layers, HelpCircle, Type, AlignJustify, Landmark, ChevronLeft, ChevronRight, CalendarDays, Receipt, FileText, Check, SkipForward, Loader2 } from "lucide-react";
+import * as pdfjsLib from "pdfjs-dist";
+// NOTE: requires "pdfjs-dist" added to package.json dependencies (not part of
+// the previously-generated scaffold — see CONTEXT.md's package list, which
+// needs this one addition for the statement-import feature below).
+import pdfjsWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
    ========================================================================= */
 
-const ENTRY_RE = /^(.+?)\s-\s([0-9]+(?:\.[0-9]+)?(?:\s*\+\s*[0-9]+(?:\.[0-9]+)?)*)\s*(\([^)]*\))?\s*$/;
+const ENTRY_RE = /^(.+?)\s-\s([0-9]+(?:\.[0-9]+)?(?:\s*\+\s*[0-9]+(?:\.[0-9]+)?)*)\s*(\((?:[^()]|\([^()]*\))*\))?\s*$/;
 const BLANK_RE = /^(.+?)\s*-\s*$/;
 const MARKER_RE = /^\(([+-])\)\s*:?\s*(.*)$/;
 const SUMMARY_KEYS = {
@@ -30,6 +36,183 @@ function formatNum(n) {
 
 function isTotalLabel(label) {
   return normLabel(label).endsWith("total");
+}
+
+/* =========================================================================
+   MONTH / YEAR
+   Every account page now lives under a "YYYY-MM" month key. Month keys sort
+   correctly as plain strings, which is why every cross-month loop below
+   just does a lexical .sort() to get chronological order.
+   ========================================================================= */
+
+const MONTHS_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTHS_FULL = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+function monthKeyFromParts(year, monthIdx0) {
+  return `${year}-${pad2(monthIdx0 + 1)}`;
+}
+function monthKeyNow() {
+  const d = new Date();
+  return monthKeyFromParts(d.getFullYear(), d.getMonth());
+}
+function yearOf(monthKey) {
+  return parseInt(monthKey.slice(0, 4), 10);
+}
+function monthIdxOf(monthKey) {
+  return parseInt(monthKey.slice(5, 7), 10) - 1;
+}
+function addMonths(monthKey, delta) {
+  const total = yearOf(monthKey) * 12 + monthIdxOf(monthKey) + delta;
+  return monthKeyFromParts(Math.floor(total / 12), ((total % 12) + 12) % 12);
+}
+function shiftYear(monthKey, deltaYears) {
+  return monthKeyFromParts(yearOf(monthKey) + deltaYears, monthIdxOf(monthKey));
+}
+function monthLabel(monthKey) {
+  if (!monthKey) return "";
+  return `${MONTHS_SHORT[monthIdxOf(monthKey)]} ${yearOf(monthKey)}`;
+}
+
+// Auto-generated first line for a brand-new blank page, e.g. "Ambika account
+// July" — replaces the old greyed-out placeholder-text approach so every
+// fresh page starts with a real, unambiguous line of actual content instead
+// of an example a user could mistake for their own data.
+function starterLine(accountName, monthKey) {
+  return `${accountName} account ${MONTHS_FULL[monthIdxOf(monthKey)]}\n\n`;
+}
+
+// Flattens the nested { account: { month: text } } shape into a single
+// account-name -> text map for one month, filling in "" for any account
+// that has no page in that month yet. Used for the same-month-only Personal
+// Incoming/Outgoing sync, and for the Aggregate report.
+function monthSlice(accounts, month) {
+  const slice = {};
+  for (const acct of Object.keys(accounts)) slice[acct] = accounts[acct]?.[month] ?? "";
+  return slice;
+}
+
+// ---- prep for the planned date-wise (bank-statement-style) report ----
+// Not wired into the UI yet. An entry's label is treated as a day-of-month
+// if it's a bare integer 1-31 (the existing convention some people already
+// use for daily entries, e.g. "1 - 500", "2 - 400" under a Fruits
+// subcategory). Combined with the page's own month key, that's enough to
+// resolve a real calendar date for that entry with no ledger-format change.
+// Entries with a non-numeric label (e.g. "Salary") have no specific day —
+// the statement view will need its own rule for those (most likely: shown
+// as an undated line item for the month, not slotted into a specific day).
+function dayFromLabel(label) {
+  const t = label.trim();
+  if (!/^[0-9]{1,2}$/.test(t)) return null;
+  const n = parseInt(t, 10);
+  return n >= 1 && n <= 31 ? n : null;
+}
+function entryDateISO(monthKey, label) {
+  const day = dayFromLabel(label);
+  return day === null ? null : `${monthKey}-${pad2(day)}`;
+}
+
+/* =========================================================================
+   STATEMENT (bank-statement-style, order-entered, per account/month)
+   Pure functions over an already-parsed page — kept separate from
+   StatementView so they can be exercised in a throwaway-Node simulation the
+   same way the sync/loan engines are.
+
+   "Order entered" is NOT the same as current text position: the user can
+   type a Salary entry, switch to Expense and type something, then come
+   back and add a second Income entry — at that point Income's second entry
+   sits right under Salary in the text, but it was actually typed *after*
+   the Expense entry. To capture the real typing order we need a signature
+   per entry (category + subcategory + label, NOT amount, so correcting an
+   amount later doesn't count as a new entry) and a small persisted map,
+   per page, of "when was this signature first seen" — assigned once and
+   never changed afterwards, however the text gets reshuffled later.
+
+   Caveat (inherent, and worth knowing): a page's very first time being
+   scanned (a page that existed before this feature, or one never opened in
+   the app since), every entry on it looks "new" simultaneously — those all
+   get ordered by current text position as the best available fallback.
+   From that point on, every further edit is tracked precisely.
+   ========================================================================= */
+function entrySignature(category, sub, label) {
+  return `${normLabel(category)}::${normLabel(sub || "")}::${normLabel(label)}`;
+}
+
+// Collects every statement-eligible entry (same exclusions as before:
+// "Previous balance" becomes the opening balance rather than a row,
+// "Outstanding Loans" is report-only) in current text order, each tagged
+// with a content signature disambiguated by occurrence (so two entries
+// that happen to share a category+sub+label don't collide).
+function statementEntryRows(parsed, monthKey) {
+  const pbBlock = parsed.blocks.find((b) => normLabel(b.title) === "previousbalance");
+  const sigCounts = {};
+  const rows = [];
+  for (const b of parsed.blocks) {
+    if (b === pbBlock) continue;
+    if (normLabel(b.title) === "outstandingloans") continue;
+    if (b.sign !== "+" && b.sign !== "-") continue; // unclassified sections carry no direction, skip
+
+    const collect = (subTitle, e) => {
+      const base = entrySignature(b.title, subTitle, e.label);
+      sigCounts[base] = (sigCounts[base] || 0) + 1;
+      rows.push({
+        lineIndex: e.lineIndex,
+        date: entryDateISO(monthKey, e.label),
+        category: b.title,
+        sub: subTitle || null,
+        label: e.label,
+        amount: e.amount,
+        sign: b.sign,
+        sig: `${base}#${sigCounts[base]}`,
+      });
+    };
+    for (const e of b.entries) collect(null, e);
+    for (const s of b.subs) for (const e of s.entries) collect(s.title, e);
+  }
+  rows.sort((a, b) => a.lineIndex - b.lineIndex);
+  return { rows, openingBalance: pbBlock ? pbBlock.computedSum : 0 };
+}
+
+// Advances a page's persisted "order entered" map ({ counter, seq }) to
+// cover every row currently on the page, assigning a fresh sequence number
+// to any signature not seen on this page before. Existing assignments are
+// never touched, so an entry keeps the position it was first typed in even
+// after later edits move it around in the text, correct its amount, or
+// delete-and-retype it identically.
+function advancePageOrder(pageOrder, rows) {
+  let counter = pageOrder?.counter || 0;
+  const seq = { ...(pageOrder?.seq || {}) };
+  let changed = false;
+  for (const r of rows) {
+    if (seq[r.sig] === undefined) {
+      counter += 1;
+      seq[r.sig] = counter;
+      changed = true;
+    }
+  }
+  return { pageOrder: { counter, seq }, changed };
+}
+
+// pageOrder is this page's persisted { counter, seq } (or undefined the
+// first time a page is ever seen). Returns the statement rows sorted by
+// the order each entry was actually typed, the updated pageOrder to
+// persist, and whether anything new was assigned this call (so the caller
+// only needs to write to storage when it actually changed).
+function buildStatement(parsed, monthKey, pageOrder) {
+  const { rows, openingBalance } = statementEntryRows(parsed, monthKey);
+  const { pageOrder: nextOrder, changed: orderChanged } = advancePageOrder(pageOrder, rows);
+  for (const r of rows) r.enteredSeq = nextOrder.seq[r.sig];
+  rows.sort((a, b) => a.enteredSeq - b.enteredSeq || a.lineIndex - b.lineIndex);
+
+  let running = openingBalance;
+  for (const r of rows) {
+    running += r.sign === "+" ? r.amount : -r.amount;
+    r.balance = running;
+  }
+
+  return { openingBalance, rows, closingBalance: running, pageOrder: nextOrder, orderChanged };
 }
 
 function parseLedger(text) {
@@ -425,168 +608,144 @@ function runSyncRounds(accounts, excludeFromWrite, maxRounds = 5) {
 
 /* =========================================================================
    LOAN / LOAN REPAYMENT / OUTSTANDING LOANS
-   "(+): Loan" and "(-): Loan repayment" are treated as a matched pair,
-   cross-account. Whenever a "Loan repayment" entry (anywhere, in any
-   account) matches an unclaimed "Loan" entry (same person, same amount,
-   anywhere, in any account), the original Loan entry is annotated
-   "(repaid by <account>)" — this is what lets a loan taken in one account
-   be repaid through a different one.
+   "(+): Loan" and "(-): Loan repayment" are treated as a matched pool,
+   SAME-ACCOUNT ONLY: a loan taken from an account is always repaid from
+   that same account. (An earlier version allowed repayment from any
+   account — that cross-account matching was removed as it was causing
+   more confusion than it was worth. A loan and its repayment(s) can still
+   span different months, just not different accounts.) Partial and
+   multi-contribution repayment within that one account is still supported.
 
-   "Outstanding Loans" is a fully app-managed, unmarked (no (+)/(-)) block
-   per account, listing that account's still-unmatched Loan entries. Being
-   unmarked means it's automatically excluded from Sub incoming/outgoing/
-   Balance by the normal parser — exactly the "report only, not counted"
-   behavior asked for.
+   Model: `computeLoanAllocations(accounts)` is the single source of truth,
+   and its only job now is to drive the read-only Outstanding Loans report
+   (`LoansView`). For every account, for every person name, it pools ALL
+   "(-): Loan repayment" entries for that name *within that account*
+   (across that account's months, oldest first) and allocates them against
+   that person's "(+): Loan" entries in the same account until either the
+   pool or the loan's remaining balance runs out. Neither side of the
+   ledger text is ever touched by this — a repayment entry stays exactly
+   as typed and keeps counting toward Sub outgoing as normal, and a Loan
+   entry stays exactly as typed too. All the allocation does is decide,
+   for the report, how much of a repayment pool applies to which loan(s).
 
-   Limitation (v1): only flat entries directly under Loan / Loan repayment
-   are matched — entries organized into subcategories are left alone.
+   **Loan tracking lives entirely in the Outstanding Loans report — the app
+   never writes anything about repayment status back into the ledger text**
+   (this used to include a trailing "(repaid)" / "(repaid <amount>)"
+   annotation appended to the "(+): Loan" line itself; that annotation
+   mechanism was removed entirely on 2026-07-31 at the user's request, so
+   loan lines are now just plain hand-typed entries like everything else —
+   see feature #19). "Outstanding Loans" was already report-only before
+   that and remains so: computed live by LoansView (via
+   `computeLoanAllocations`), never written into any account's workbook
+   text.
+
+   A loan or a repayment can be written either as a flat "<name> - <amount>"
+   line directly under the block, or organized as a subcategory (a "<name>"
+   header, one or more amount lines under it, closed with "<name> Total -")
+   — both forms are recognized and treated the same: a subcategory's total
+   counts as that one person's loan (or, for repayment, each line inside it
+   counts as its own contribution chunk, same as a flat entry would).
    ========================================================================= */
 
-const LOAN_ANNOTATION_RE = /\(repaid by ([^)]+)\)\s*$/i;
-
-// Strip any existing "(repaid by ...)" suffix and replace it with a fresh one.
-function annotateRepaidBy(line, accountName) {
-  const stripped = line.replace(LOAN_ANNOTATION_RE, "").replace(/\s+$/, "");
-  return `${stripped} (repaid by ${accountName})`;
-}
-
-function buildOutstandingLoansLines(entries) {
-  if (!entries.length) return [];
-  // The "(+):" marker is required so this block always opens its own
-  // category group (see the note above the subIncoming/subOutgoing loop) —
-  // it's still excluded from totals by title, not by sign.
-  const lines = ["(+): Outstanding Loans"];
-  entries.forEach((e) => lines.push(`${e.label} - ${formatNum(e.amount)}`));
-  const total = entries.reduce((a, e) => a + e.amount, 0);
-  lines.push(`Outstanding Loans Total - ${formatNum(total)}`);
-  return lines;
-}
-
-// Fully replaces the "Outstanding Loans" block in `text` with one built from
-// `outstandingEntries` (app-owned end to end, so always safe to overwrite).
-function applyOutstandingLoansSync(text, outstandingEntries) {
-  const parsed = parseLedger(text);
-  const existing = parsed.blocks.find((b) => normLabel(b.title) === "outstandingloans");
-  const lines = text.split("\n");
-  const removeSet = new Set(existing ? existing.lineIndices : []);
-  const newBlockLines = buildOutstandingLoansLines(outstandingEntries);
-
-  const summaryIdxs = Object.values(parsed.summary)
-    .filter(Boolean)
-    .map((s) => s.lineIndex)
-    .sort((a, b) => a - b);
-  const anchor = summaryIdxs.length ? summaryIdxs[0] : null;
-
-  const result = [];
-  let inserted = false;
-  for (let i = 0; i < lines.length; i++) {
-    if (anchor !== null && i === anchor && !inserted) {
-      if (newBlockLines.length) {
-        if (result.length && result[result.length - 1].trim() !== "") result.push("");
-        result.push(...newBlockLines);
-        result.push("");
-      }
-      inserted = true;
-    }
-    if (!removeSet.has(i)) result.push(lines[i]);
-  }
-  if (!inserted && newBlockLines.length) {
-    if (result.length && result[result.length - 1].trim() !== "") result.push("");
-    result.push(...newBlockLines);
-  }
-
-  return result.join("\n").replace(/\n{3,}/g, "\n\n").replace(/^\n+/, "");
-}
-
-// Reads a Loan entry's raw line to see if it's already annotated as repaid.
-function loanEntryRepaidBy(rawLine) {
-  const m = rawLine.match(LOAN_ANNOTATION_RE);
-  return m ? m[1].trim() : null;
-}
-
-// Computes, for the current state of every account, which Loan entries
-// (anywhere) get newly claimed by a Loan-repayment entry (anywhere).
-// Matching is first-fit by person name + exact amount, scanned in a stable
-// account order — good enough for the common case of one loan per amount.
-function computeLoanMatches(accounts) {
-  const names = Object.keys(accounts);
+// Single source of truth for loan state. For each account independently,
+// pools that account's "(-): Loan repayment" entries by person name —
+// across that account's own months, oldest first, since a loan taken one
+// month can legitimately be repaid the next month, just not from a
+// different account — and allocates it oldest-loan-first against that
+// same account's "(+): Loan" entries for that person. Returns a flat array
+// of loan entries, each annotated with:
+//   - used: [{amount, month}, ...] contributions applied to it (always
+//     from the loan's own account, so no account needs recording here)
+//   - repaidTotal: sum of `used`
+//   - remaining: amount - repaidTotal (never negative)
+//
+// `cutoffMonth`, if given, restricts both loans and repayments to pages
+// dated on or before that month — this is what lets the Outstanding Loans
+// report show a historical snapshot ("as of March") instead of always the
+// full-history live state. Pass null (the default) for the live state used
+// to write annotations, which should always reflect everything ever
+// recorded, regardless of when.
+function computeLoanAllocations(accounts, cutoffMonth = null) {
   const loanEntries = [];
-  const repaymentEntries = [];
-  for (const acct of names) {
-    const lines = accounts[acct].split("\n");
-    const parsed = parseLedger(accounts[acct]);
-    for (const b of parsed.blocks) {
-      if (b.sign === "+" && normLabel(b.title) === "loan") {
-        for (const e of b.entries) {
-          loanEntries.push({ account: acct, lineIndex: e.lineIndex, label: e.label, amount: e.amount, repaidBy: loanEntryRepaidBy(lines[e.lineIndex]) });
+
+  for (const account of Object.keys(accounts)) {
+    const months = Object.keys(accounts[account])
+      .filter((m) => !cutoffMonth || m <= cutoffMonth)
+      .sort();
+
+    // 1. Pool this account's repayment entries by person name, oldest
+    //    month first. Both flat entries directly under the block AND
+    //    entries nested inside a subcategory count — a subcategory groups
+    //    several same-month contributions from/to one person under a
+    //    labeled header instead of listing them as flat "<name> - <amt>"
+    //    lines, but each is still its own contribution chunk. Chunks are
+    //    ordered by their line position in the text so allocation still
+    //    follows the order things were actually typed.
+    const poolByName = {};
+    for (const month of months) {
+      const parsed = parseLedger(accounts[account][month]);
+      for (const b of parsed.blocks) {
+        if (b.sign !== "-" || normLabel(b.title) !== "loanrepayment") continue;
+        const chunks = [...b.entries.map((e) => ({ label: e.label, amount: e.amount, lineIndex: e.lineIndex }))];
+        for (const sub of b.subs) {
+          for (const e of sub.entries) {
+            chunks.push({ label: sub.title, amount: e.amount, lineIndex: e.lineIndex });
+          }
         }
-      }
-      if (b.sign === "-" && normLabel(b.title) === "loanrepayment") {
-        for (const e of b.entries) {
-          repaymentEntries.push({ account: acct, label: e.label, amount: e.amount });
-        }
-      }
-    }
-  }
-
-  const claimed = new Set();
-  const matchFor = {}; // `${account}:${lineIndex}` -> repaying account name
-  for (const rep of repaymentEntries) {
-    const candidate = loanEntries.find(
-      (le) => le.repaidBy === null && !claimed.has(`${le.account}:${le.lineIndex}`) && normLabel(le.label) === normLabel(rep.label) && Math.abs(le.amount - rep.amount) < 0.005
-    );
-    if (candidate) {
-      claimed.add(`${candidate.account}:${candidate.lineIndex}`);
-      matchFor[`${candidate.account}:${candidate.lineIndex}`] = rep.account;
-    }
-  }
-  return matchFor;
-}
-
-// Applies loan-repayment annotations and refreshes each account's
-// Outstanding Loans block accordingly. Mirrors runSyncRounds' pattern of
-// never rewriting `excludeFromWrite` (the account actively being typed in).
-function runLoanSync(accounts, excludeFromWrite) {
-  const matchFor = computeLoanMatches(accounts);
-  const names = Object.keys(accounts);
-  const next = { ...accounts };
-
-  for (const acct of names) {
-    if (acct === excludeFromWrite) continue;
-    let lines = accounts[acct].split("\n");
-    const parsed = parseLedger(accounts[acct]);
-    const loanBlock = parsed.blocks.find((b) => b.sign === "+" && normLabel(b.title) === "loan");
-
-    if (loanBlock) {
-      for (const e of loanBlock.entries) {
-        const key = `${acct}:${e.lineIndex}`;
-        if (matchFor[key] && loanEntryRepaidBy(lines[e.lineIndex]) === null) {
-          lines[e.lineIndex] = annotateRepaidBy(lines[e.lineIndex], matchFor[key]);
+        chunks.sort((a, c) => a.lineIndex - c.lineIndex);
+        for (const c of chunks) {
+          const key = normLabel(c.label);
+          (poolByName[key] || (poolByName[key] = [])).push({ month, remaining: c.amount });
         }
       }
     }
-    let text = lines.join("\n");
 
-    // recompute this account's still-outstanding loan entries post-annotation
-    const reparsed = parseLedger(text);
-    const rlines = text.split("\n");
-    const reloanBlock = reparsed.blocks.find((b) => b.sign === "+" && normLabel(b.title) === "loan");
-    const outstanding = reloanBlock ? reloanBlock.entries.filter((e) => loanEntryRepaidBy(rlines[e.lineIndex]) === null).map((e) => ({ label: e.label, amount: e.amount })) : [];
-    text = applyOutstandingLoansSync(text, outstanding);
-
-    // re-run autofill so every Total/Sub/Balance reflects the change immediately
-    const p2 = parseLedger(text);
-    if (p2.autofillTargets.length) {
-      const fl = text.split("\n");
-      p2.autofillTargets.forEach((t) => {
-        fl[t.lineIndex] = rewriteAmountLine(fl[t.lineIndex], t.value);
-      });
-      text = fl.join("\n");
+    // 2. Collect this account's loan entries in the same stable order,
+    //    then allocate against the pool above. A loan organized as a
+    //    subcategory (person's name as the header, one or more disbursement
+    //    lines inside, closed with "<name> Total -") counts as ONE loan for
+    //    that person, sized at the subcategory's total — same as a flat
+    //    "<name> - <amount>" entry would.
+    const acctLoans = [];
+    for (const month of months) {
+      const parsed = parseLedger(accounts[account][month]);
+      for (const b of parsed.blocks) {
+        if (b.sign !== "+" || normLabel(b.title) !== "loan") continue;
+        const candidates = [...b.entries.map((e) => ({ label: e.label.trim(), amount: e.amount, lineIndex: e.lineIndex }))];
+        for (const sub of b.subs) {
+          const lastEntryIdx = sub.entries.length ? sub.entries[sub.entries.length - 1].lineIndex : null;
+          const lineIndex = sub.totalLineIndex ?? lastEntryIdx;
+          if (lineIndex === null) continue; // subcategory with no entries and no total yet — nothing to track
+          candidates.push({ label: sub.title.trim(), amount: sub.computedSum, lineIndex });
+        }
+        candidates.sort((a, c) => a.lineIndex - c.lineIndex);
+        for (const c of candidates) {
+          acctLoans.push({ account, month, lineIndex: c.lineIndex, label: c.label, amount: c.amount });
+        }
+      }
     }
 
-    if (text !== accounts[acct]) next[acct] = text;
+    for (const le of acctLoans) {
+      const pool = poolByName[normLabel(le.label)] || [];
+      let need = le.amount;
+      const used = [];
+      for (const chunk of pool) {
+        if (need <= 0.005) break;
+        if (chunk.remaining <= 0.005) continue;
+        const take = Math.min(need, chunk.remaining);
+        chunk.remaining -= take;
+        need -= take;
+        used.push({ amount: take, month: chunk.month });
+      }
+      le.used = used;
+      le.repaidTotal = used.reduce((a, u) => a + u.amount, 0);
+      le.remaining = Math.max(0, le.amount - le.repaidTotal);
+    }
+
+    loanEntries.push(...acctLoans);
   }
-  return next;
+
+  return loanEntries;
 }
 
 /* ========================================================================= */
@@ -621,59 +780,364 @@ function rewriteAmountLine(line, value) {
   return `${indent}${label} - ${formatNum(value)}`;
 }
 
-// Scan forward from a line index (within the same block, i.e. until a blank
-// line ends it) to see whether a "Total" line already exists further down.
-function blockAlreadyHasTotal(lines, fromIdx) {
-  for (let i = fromIdx; i < lines.length; i++) {
-    const t = lines[i].trim();
-    if (t === "") return false;
-    const m = t.match(BLANK_RE) || t.match(ENTRY_RE);
-    if (m && normLabel(m[1]) === "total") return true;
-  }
-  return false;
+/* =========================================================================
+   BANK STATEMENT IMPORT
+   Everything here except getPdfLines/openStatementPdf (which need a real
+   PDF.js worker and a real file) is a pure function over plain data, kept
+   separate from the UI component (ImportStatementView, further down) so it
+   can be exercised the same way as the rest of this file's engines: strip
+   the imports/JSX, run it in a throwaway Node module against synthetic
+   "reconstructed PDF line" arrays and synthetic ledger text, before
+   trusting it against a real statement.
+
+   This is a GENERIC, best-effort parser — every bank lays out its PDF rows
+   differently, so nothing here is assumed correct without the per-
+   transaction review step in ImportStatementView; the parsing just gets a
+   reasonable first guess in front of the user to confirm or fix.
+   ========================================================================= */
+
+// Normalizes a transaction description for matching purposes: lowercase,
+// digits/punctuation-insensitive-ish (keeps digits, since e.g. a UPI ref
+// number can be part of what makes two lines "the same" merchant), collapsed
+// whitespace. Used both for the learned category map and for building a
+// dedup signature.
+function normalizeDesc(s) {
+  return (s || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-// If `line` is a Total line whose label is the bare generic word "Total"
-// (i.e. not yet customized to any name — including any name the user typed
-// themselves), rename it to `${newLabel} Total`. Leaves anything else,
-// including a total the user has already renamed to something specific,
-// untouched.
-function renameGenericTotalLabel(line, newLabel) {
-  const m = line.match(/^(\s*)(.+?)(\s-\s?.*)$/);
-  if (!m) return line;
-  const [, indent, label, rest] = m;
-  if (normLabel(label) !== "total") return line;
-  return `${indent}${newLabel} Total${rest}`;
+// A transaction's identity for dedup purposes, deliberately excluding
+// category/label — two statements covering an overlapping date range should
+// recognize the same real-world transaction as "already entered" even if it
+// gets categorized identically both times.
+function txnSignature(dateISO, amount, description) {
+  return `${dateISO || "?"}|${formatNum(amount)}|${normalizeDesc(description)}`;
+}
+
+// Splits parsed statement transactions into ones already recorded for this
+// account (by signature) and fresh ones — this is the mechanism behind "if I
+// generate a statement on the 10th and enter it, regenerating on the 20th
+// shouldn't ask me to re-enter the same rows."
+function dedupeTransactions(candidates, importedSignatures) {
+  const seen = new Set(importedSignatures || []);
+  const fresh = [];
+  const skipped = [];
+  for (const c of candidates) {
+    const sig = txnSignature(c.dateISO, c.amount, c.description);
+    if (seen.has(sig)) skipped.push(c);
+    else fresh.push({ ...c, signature: sig });
+  }
+  return { fresh, skipped };
+}
+
+const KNOWN_BANK_NAMES = [
+  "State Bank of India", "SBI", "HDFC Bank", "HDFC", "ICICI Bank", "ICICI",
+  "Axis Bank", "Kotak Mahindra Bank", "Kotak", "Punjab National Bank", "PNB",
+  "Bank of Baroda", "Canara Bank", "Union Bank of India", "IDFC FIRST Bank",
+  "IndusInd Bank", "Yes Bank", "IDBI Bank", "Federal Bank", "RBL Bank",
+  "Bank of India", "Central Bank of India", "Indian Bank", "UCO Bank",
+  "Chase", "Bank of America", "Wells Fargo", "Citibank", "HSBC",
+];
+
+// Best-effort bank-name guess: known-name scan first, then fall back to the
+// first substantial line of the document (statements almost always open
+// with a letterhead line).
+function guessBankName(fullText) {
+  for (const name of KNOWN_BANK_NAMES) {
+    if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(fullText)) return name;
+  }
+  const firstLine = fullText.split("\n").map((l) => l.trim()).find((l) => l.length >= 4 && /[A-Za-z]/.test(l)) || "";
+  const cut = firstLine.search(/\b(statement|period|account|a\/c|from|no\.?|number|\d)/i);
+  return (cut > 0 ? firstLine.slice(0, cut) : firstLine).trim() || "Unknown bank";
+}
+
+// Best-effort account-tail guess (last 4 digits of an account/card number),
+// used only to disambiguate two statements from the same bank as different
+// real accounts.
+function guessAccountTail(fullText) {
+  const m = fullText.match(/(?:A\/?C|Account)\s*(?:No\.?|Number)?\s*[:\-]?\s*[Xx\*]*\s*(\d{4})\b/i) || fullText.match(/\b[Xx\*]{4,}(\d{4})\b/);
+  return m ? m[1] : "";
+}
+function bankMapKey(bankName, tail) {
+  return `${normalizeDesc(bankName)}::${tail || "?"}`;
+}
+
+const MONTH_NAME_RE = /(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*/i;
+function monthIdxFromName(name) {
+  const m = name.toLowerCase().match(MONTH_NAME_RE);
+  if (!m) return null;
+  const idx = MONTHS_SHORT.findIndex((s) => s.toLowerCase() === m[1]);
+  return idx;
+}
+function twoDigitYearToFour(y) {
+  const n = parseInt(y, 10);
+  if (String(y).length === 4) return n;
+  return n + (n < 70 ? 2000 : 1900);
+}
+
+// Parses one date-like token in dd/mm/yyyy, dd-Mon-yyyy, dd Mon yyyy, or
+// yyyy-mm-dd form into a "YYYY-MM-DD" string. Returns null if unparseable.
+function parseDateToken(tok) {
+  let m = tok.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m) return `${m[1]}-${pad2(parseInt(m[2], 10))}-${pad2(parseInt(m[3], 10))}`;
+  m = tok.match(/^(\d{1,2})[\/\-. ]([A-Za-z]{3,9})[\/\-. ](\d{2,4})$/);
+  if (m) {
+    const mi = monthIdxFromName(m[2]);
+    if (mi === null) return null;
+    return `${twoDigitYearToFour(m[3])}-${pad2(mi + 1)}-${pad2(parseInt(m[1], 10))}`;
+  }
+  m = tok.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$/);
+  if (m) return `${twoDigitYearToFour(m[3])}-${pad2(parseInt(m[2], 10))}-${pad2(parseInt(m[1], 10))}`;
+  return null;
+}
+
+const DATE_TOKEN_RE = /\b(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[\/\-. ][A-Za-z]{3,9}[\/\-. ]\d{2,4}|\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})\b/;
+// Comma-grouped thousands form tried first (more specific), plain-digits
+// form second — matching plain digits first would wrongly cap an
+// unformatted 4+-digit amount like "9550.00" at 3 digits ("955" + "0.00").
+const AMOUNT_TOKEN_RE = /\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?/g;
+
+// Turns one visually-reconstructed statement row into a transaction
+// candidate, or null if the row doesn't look like a transaction at all
+// (headers, footers, disclaimers, etc. — anything with no leading date).
+function parseTransactionRow(raw) {
+  const line = raw.trim();
+  const dateM = line.match(DATE_TOKEN_RE);
+  if (!dateM || dateM.index > 6) return null; // real rows start with the date
+  const dateISO = parseDateToken(dateM[1]);
+  if (!dateISO) return null;
+  const rest = line.slice(dateM.index + dateM[0].length);
+  const amountMatches = [...rest.matchAll(AMOUNT_TOKEN_RE)];
+  if (amountMatches.length === 0) return null;
+  const amounts = amountMatches.map((mm) => parseFloat(mm[0].replace(/,/g, ""))).filter((n) => !isNaN(n));
+  const description = rest.slice(0, amountMatches[0].index).replace(/[|,\-\s]+$/, "").trim();
+  const balance = amounts.length >= 2 ? amounts[amounts.length - 1] : null;
+  const amount = amounts.length >= 2 ? amounts[amounts.length - 2] : amounts[0];
+  let type = "unknown";
+  if (/\bcr\b|credit(ed)?\b/i.test(line)) type = "credit";
+  else if (/\bdr\b|debit(ed)?\b/i.test(line)) type = "debit";
+  return { raw: line, dateISO, description: description || "(no description)", amount, balance, guessedType: type };
+}
+
+// Runs parseTransactionRow over every reconstructed line of the statement
+// and keeps only the rows that parsed as a plausible transaction.
+function parseTransactions(lines) {
+  const out = [];
+  for (const l of lines) {
+    const t = parseTransactionRow(l);
+    if (t) out.push(t);
+  }
+  return out;
+}
+
+// Resolves debit-vs-credit for rows where the text gave no explicit Dr/Cr
+// marker, using the running-balance column when present: balance going up
+// = credit, down = debit. Falls back to "debit" (the more common statement
+// row) if there's no balance column to compare against either.
+function resolveTransactionSigns(transactions) {
+  let prevBalance = null;
+  return transactions.map((t) => {
+    let type = t.guessedType;
+    if (type === "unknown" && t.balance !== null) {
+      if (prevBalance !== null) type = t.balance >= prevBalance ? "credit" : "debit";
+    }
+    if (type === "unknown") type = "debit";
+    if (t.balance !== null) prevBalance = t.balance;
+    return { ...t, guessedType: type };
+  });
+}
+
+// Best-effort statement month guess from a "Period: dd/mm/yyyy to dd/mm/yyyy"
+// style header line, or (fallback) the most common month among the parsed
+// transaction dates themselves.
+function guessStatementMonth(fullText, transactions) {
+  const periodM = fullText.match(/period[^0-9]{0,15}(\d{1,2}[\/\-. ](?:[A-Za-z]{3,9}|\d{1,2})[\/\-. ]\d{2,4})/i);
+  if (periodM) {
+    const iso = parseDateToken(periodM[1]);
+    if (iso) return iso.slice(0, 7);
+  }
+  const counts = {};
+  for (const t of transactions) {
+    if (!t.dateISO) continue;
+    const mk = t.dateISO.slice(0, 7);
+    counts[mk] = (counts[mk] || 0) + 1;
+  }
+  const best = Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0];
+  return best || null;
+}
+
+// The ledger-text label convention (see CONTEXT.md) is a bare day-of-month
+// number for date-driven entries — this keeps imported rows consistent with
+// that convention (and therefore visible correctly in the Statement report).
+function dayLabelFromISO(dateISO) {
+  if (!dateISO) return "";
+  return String(parseInt(dateISO.slice(8, 10), 10));
+}
+
+// Inserts one new entry into ledger `text` under (categoryTitle, sign),
+// optionally nested under subTitle — creating the category and/or
+// subcategory if they don't exist yet, matching the same "insert before the
+// closing Total line, re-run autofill after" pattern used by
+// applyManagedCategorySync above. This is the single write-path statement
+// import uses, so it's also the one most worth Node-simulating before trust.
+function insertLedgerEntry(text, { categoryTitle, sign, subTitle, label, amount }) {
+  const parsed = parseLedger(text);
+  const catNorm = normLabel(categoryTitle);
+  const block = parsed.blocks.find((b) => normLabel(b.title) === catNorm && (b.sign === sign || b.sign === null));
+  const lines = text.split("\n");
+  const amountStr = formatNum(amount);
+  const subTitleTrim = (subTitle || "").trim();
+
+  if (block) {
+    if (subTitleTrim) {
+      const subNorm = normLabel(subTitleTrim);
+      const sub = block.subs.find((s) => normLabel(s.title) === subNorm);
+      if (sub) {
+        const insertAt = sub.totalLineIndex !== null ? sub.totalLineIndex : sub.entries.length ? sub.entries[sub.entries.length - 1].lineIndex + 1 : block.lineIndices[block.lineIndices.length - 1] + 1;
+        lines.splice(insertAt, 0, `${label} - ${amountStr}`);
+      } else {
+        const insertAt = block.totalLineIndex !== null ? block.totalLineIndex : block.lineIndices[block.lineIndices.length - 1] + 1;
+        lines.splice(insertAt, 0, subTitleTrim, `${label} - ${amountStr}`, `${subTitleTrim} Total -`);
+      }
+    } else {
+      const insertAt = block.totalLineIndex !== null ? block.totalLineIndex : block.lineIndices[block.lineIndices.length - 1] + 1;
+      lines.splice(insertAt, 0, `${label} - ${amountStr}`);
+    }
+  } else {
+    const newBlockLines = [`(${sign}): ${categoryTitle}`];
+    if (subTitleTrim) newBlockLines.push(subTitleTrim, `${label} - ${amountStr}`, `${subTitleTrim} Total -`);
+    else newBlockLines.push(`${label} - ${amountStr}`);
+    newBlockLines.push(`${categoryTitle} Total -`);
+
+    const summaryIdxs = Object.values(parsed.summary).filter(Boolean).map((s) => s.lineIndex).sort((a, b) => a - b);
+    const anchor = summaryIdxs.length ? summaryIdxs[0] : lines.length;
+    const needsBlankBefore = anchor > 0 && lines[anchor - 1] !== undefined && lines[anchor - 1].trim() !== "";
+    lines.splice(anchor, 0, ...(needsBlankBefore ? ["", ...newBlockLines, ""] : [...newBlockLines, ""]));
+  }
+
+  let finalText = lines.join("\n").replace(/\n{3,}/g, "\n\n");
+  const p2 = parseLedger(finalText);
+  if (p2.autofillTargets.length) {
+    const finalLines = finalText.split("\n");
+    p2.autofillTargets.forEach((t) => {
+      finalLines[t.lineIndex] = rewriteAmountLine(finalLines[t.lineIndex], t.value);
+    });
+    finalText = finalLines.join("\n");
+  }
+  return finalText;
+}
+
+// Lists the existing category (with sign) and subcategory names already
+// present on a page, for populating the review step's dropdowns.
+function categoryOptionsFor(text) {
+  const parsed = parseLedger(text);
+  return parsed.blocks
+    .filter((b) => b.sign === "+" || b.sign === "-")
+    .map((b) => ({ title: b.title, sign: b.sign, subs: b.subs.map((s) => s.title) }));
+}
+
+// Reconstructs visual text rows from a PDF.js getTextContent() item list by
+// grouping items whose baseline y-coordinate is within a small tolerance,
+// then joining left-to-right by x — this is what turns PDF.js's flat
+// per-glyph-run item list back into the row structure a statement table
+// actually has on the page.
+function reconstructLines(items) {
+  const rows = [];
+  for (const it of items) {
+    const x = it.transform[4];
+    const y = it.transform[5];
+    let row = rows.find((r) => Math.abs(r.y - y) < 2.5);
+    if (!row) {
+      row = { y, parts: [] };
+      rows.push(row);
+    }
+    row.parts.push({ x, str: it.str });
+  }
+  rows.sort((a, b) => b.y - a.y);
+  return rows.map((r) => r.parts.sort((a, b) => a.x - b.x).map((p) => p.str).join(" ").replace(/\s+/g, " ").trim()).filter(Boolean);
+}
+
+async function tryOpenPdf(arrayBuffer, password) {
+  const data = arrayBuffer.slice(0);
+  const task = pdfjsLib.getDocument(password ? { data, password } : { data });
+  return task.promise;
+}
+
+// Tries: no password -> every previously-saved password -> interactively
+// via requestPassword() (called repeatedly on wrong-password until it
+// resolves to a password that works or to null, meaning "user cancelled").
+// Returns { doc, newPassword } where newPassword is only set when the
+// working password came from the interactive prompt (i.e. is worth saving).
+async function openStatementPdf(arrayBuffer, storedPasswords, requestPassword) {
+  try {
+    return { doc: await tryOpenPdf(arrayBuffer), newPassword: null };
+  } catch (err) {
+    if (err?.name !== "PasswordException") throw err;
+  }
+  for (const cand of storedPasswords) {
+    try {
+      return { doc: await tryOpenPdf(arrayBuffer, cand.password), newPassword: null };
+    } catch {}
+  }
+  for (;;) {
+    const pw = await requestPassword();
+    if (pw === null) return null;
+    try {
+      return { doc: await tryOpenPdf(arrayBuffer, pw), newPassword: pw };
+    } catch (err) {
+      if (err?.name !== "PasswordException") throw err;
+      // wrong password — loop, requestPassword should convey that on retry
+    }
+  }
+}
+
+async function getPdfLines(doc) {
+  const allLines = [];
+  const fullTextParts = [];
+  for (let p = 1; p <= doc.numPages; p++) {
+    const page = await doc.getPage(p);
+    const content = await page.getTextContent();
+    const lines = reconstructLines(content.items);
+    allLines.push(...lines);
+    fullTextParts.push(lines.join("\n"));
+  }
+  return { lines: allLines, fullText: fullTextParts.join("\n") };
 }
 
 /* ========================================================================= */
 
-const STARTER_TEXT = `(+): Previous balance - 500
-
-(+): Income
-Salary - 26500
-Bank - 500
-Total -
-
-(-): Expense
-Fruits
-Apples - 500
-Bananas - 400
-Fruits Total -
-Vegetables
-Onions - 300
-Vegetable Total -
-Expense Total -
-
-Sub incoming -
-Sub outgoing -
-Balance -
-`;
-
-const STORAGE_ACCOUNTS = "ledger_accounts_v2";
-const STORAGE_ACTIVE = "ledger_active_account_v2";
+const STORAGE_ACCOUNTS = "ledger_accounts_v3";
+const STORAGE_ACTIVE = "ledger_active_account_v3";
+const STORAGE_ACTIVE_MONTH = "ledger_active_month_v1";
 const STORAGE_FONT_SIZE = "ledger_font_size_v1";
 const STORAGE_LINE_SPACING = "ledger_line_spacing_v1";
+const STORAGE_ENTRY_ORDER = "ledger_entry_order_v1";
+// Bank-statement-import feature (see the STATEMENT IMPORT section below):
+// STORAGE_STMT_PASSWORDS: [{ label, password }] — every PDF password ever
+//   successfully used, tried in order against any newly-uploaded statement
+//   before prompting, so a bank that reuses the same password every month
+//   never needs re-entry.
+// STORAGE_STMT_BANKMAP: { [bankKey]: account } — maps a detected "bank name
+//   + last-4-digits" identity to the ledger account it was last imported
+//   into, so re-uploads of the same real-world account skip the manual
+//   account-picker step.
+// STORAGE_STMT_CATMAP: { [account]: { [normalizedDescription]: {category,
+//   sign, sub} } } — "if a similar transaction is found, auto-update the
+//   sheet": once a description has been categorized once for an account, any
+//   future transaction with the same normalized description is filed the
+//   same way without asking again.
+// STORAGE_STMT_IMPORTED: { [account]: [signature, ...] } — every
+//   date+amount+description signature already written to that account's
+//   ledger from a statement import, so re-generating an overlapping
+//   statement (e.g. the 10th, then the 20th of the same month) never
+//   re-inserts the same entries twice.
+const STORAGE_STMT_PASSWORDS = "ledger_stmt_passwords_v1";
+const STORAGE_STMT_BANKMAP = "ledger_stmt_bankmap_v1";
+const STORAGE_STMT_CATMAP = "ledger_stmt_catmap_v1";
+const STORAGE_STMT_IMPORTED = "ledger_stmt_imported_v1";
 const FONT_SIZE_MIN = 12;
 const FONT_SIZE_MAX = 26;
 const LINE_SPACING_MIN = 1.2;
@@ -687,28 +1151,32 @@ function avatarColor(name) {
 }
 
 /* ---- bottom sheet (has a real close button + backdrop tap + Android back) ---- */
-function BottomSheet({ open, onClose, title, children }) {
+function BottomSheet({ open, onClose, title, children, dismissible = true }) {
   if (!open) return null;
   return (
     <div className="fixed inset-0 z-50 flex flex-col justify-end">
-      <div className="absolute inset-0 bg-black/60" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/60" onClick={dismissible ? onClose : undefined} />
       <div className="relative bg-zinc-900 text-zinc-100 rounded-t-2xl max-h-[78vh] flex flex-col border-t border-zinc-800 shadow-2xl">
         <div className="flex items-center justify-center pt-2 pb-1 shrink-0">
           <div className="h-1 w-9 rounded-full bg-zinc-700" />
         </div>
         <div className="flex items-center justify-between px-4 pb-2 shrink-0">
           <span className="font-mono text-[11px] uppercase tracking-widest text-zinc-500">{title}</span>
-          <button onClick={onClose} className="flex items-center gap-1 px-2 py-1 -mr-2 text-zinc-400 hover:text-zinc-100">
-            <X size={18} />
-            <span className="font-mono text-[11px]">Close</span>
-          </button>
+          {dismissible && (
+            <button onClick={onClose} className="flex items-center gap-1 px-2 py-1 -mr-2 text-zinc-400 hover:text-zinc-100">
+              <X size={18} />
+              <span className="font-mono text-[11px]">Close</span>
+            </button>
+          )}
         </div>
         <div className="overflow-y-auto px-4 pb-4">{children}</div>
-        <div className="px-4 pb-5 pt-1 shrink-0">
-          <button onClick={onClose} className="w-full py-2.5 rounded-lg bg-zinc-800 text-zinc-200 font-mono text-xs hover:bg-zinc-700">
-            Close
-          </button>
-        </div>
+        {dismissible && (
+          <div className="px-4 pb-5 pt-1 shrink-0">
+            <button onClick={onClose} className="w-full py-2.5 rounded-lg bg-zinc-800 text-zinc-200 font-mono text-xs hover:bg-zinc-700">
+              Close
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -803,12 +1271,17 @@ function Dialog({ dialog, setDialog }) {
 }
 
 export default function LedgerApp() {
+  // accounts: { [accountName]: { [monthKey]: ledgerText } }
+  // An account name is a permanent identity (rename/delete/color apply
+  // everywhere); a monthKey ("YYYY-MM") is one page of it. An account
+  // doesn't need a page in every month — that's what lets different months
+  // have different accounts in practice, with no extra bookkeeping.
   const [accounts, setAccounts] = useState(() => {
     try {
       const saved = localStorage.getItem(STORAGE_ACCOUNTS);
       if (saved) return JSON.parse(saved);
     } catch {}
-    return { Sreedev: "" };
+    return { Sreedev: { [monthKeyNow()]: "" } };
   });
   const [activeAccount, setActiveAccount] = useState(() => {
     try {
@@ -817,11 +1290,58 @@ export default function LedgerApp() {
       return Object.keys(accounts)[0];
     }
   });
+  const [activeMonth, setActiveMonth] = useState(() => {
+    try {
+      return localStorage.getItem(STORAGE_ACTIVE_MONTH) || monthKeyNow();
+    } catch {
+      return monthKeyNow();
+    }
+  });
   const [showingAgg, setShowingAgg] = useState(false);
   const [showingLoans, setShowingLoans] = useState(false);
+  const [showingStatement, setShowingStatement] = useState(false);
+  const [showingImport, setShowingImport] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
+  const [stmtPasswords, setStmtPasswords] = useState(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_STMT_PASSWORDS);
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return [];
+  });
+  const [stmtBankMap, setStmtBankMap] = useState(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_STMT_BANKMAP);
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return {};
+  });
+  const [stmtCatMap, setStmtCatMap] = useState(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_STMT_CATMAP);
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return {};
+  });
+  const [stmtImported, setStmtImported] = useState(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_STMT_IMPORTED);
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return {};
+  });
   const [sheet, setSheet] = useState(null); // null | 'accounts' | 'totals' | 'menu'
   const [dialog, setDialog] = useState(null);
+  // { [`${account}::${month}`]: { counter, seq: { [entrySignature]: n } } }
+  // — persisted "order entered" tracking behind the Statement report; see
+  // buildStatement/advancePageOrder above for how it's built up.
+  const [entryOrder, setEntryOrder] = useState(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_ENTRY_ORDER);
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return {};
+  });
   const [fontSize, setFontSize] = useState(() => {
     try {
       const saved = parseFloat(localStorage.getItem(STORAGE_FONT_SIZE));
@@ -839,10 +1359,11 @@ export default function LedgerApp() {
   const textareaRef = useRef(null);
   const pendingCursor = useRef(null);
   const fileInputRef = useRef(null);
-  const historyRef = useRef({}); // { [account]: { past: [], future: [] } }
-  const lastPushRef = useRef({}); // { [account]: timestamp }
+  const historyRef = useRef({}); // { [account::month]: { past: [], future: [] } }
+  const lastPushRef = useRef({}); // { [account::month]: timestamp }
 
-  const text = accounts[activeAccount] ?? "";
+  const pageKey = `${activeAccount}::${activeMonth}`;
+  const text = accounts[activeAccount]?.[activeMonth] ?? "";
   const parsed = useMemo(() => parseLedger(text), [text]);
 
   /* ---- persistence: write-through to localStorage ---- */
@@ -858,6 +1379,11 @@ export default function LedgerApp() {
   }, [activeAccount]);
   useEffect(() => {
     try {
+      localStorage.setItem(STORAGE_ACTIVE_MONTH, activeMonth);
+    } catch {}
+  }, [activeMonth]);
+  useEffect(() => {
+    try {
       localStorage.setItem(STORAGE_FONT_SIZE, String(fontSize));
     } catch {}
   }, [fontSize]);
@@ -866,6 +1392,46 @@ export default function LedgerApp() {
       localStorage.setItem(STORAGE_LINE_SPACING, String(lineSpacing));
     } catch {}
   }, [lineSpacing]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_ENTRY_ORDER, JSON.stringify(entryOrder));
+    } catch {}
+  }, [entryOrder]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_STMT_PASSWORDS, JSON.stringify(stmtPasswords));
+    } catch {}
+  }, [stmtPasswords]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_STMT_BANKMAP, JSON.stringify(stmtBankMap));
+    } catch {}
+  }, [stmtBankMap]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_STMT_CATMAP, JSON.stringify(stmtCatMap));
+    } catch {}
+  }, [stmtCatMap]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_STMT_IMPORTED, JSON.stringify(stmtImported));
+    } catch {}
+  }, [stmtImported]);
+  // Keeps the active page's "order entered" map current on every keystroke
+  // — this is what lets the Statement report reflect real typing order
+  // instead of just current text position, for the page actually being
+  // typed on right now. Depends on `activePageOrder` (this page's own
+  // slice) rather than the whole `entryOrder` object so it doesn't re-run
+  // just because some other page's map changed elsewhere (e.g. from
+  // opening Statement on a different account).
+  const activePageOrder = entryOrder[pageKey];
+  useEffect(() => {
+    const { rows } = statementEntryRows(parsed, activeMonth);
+    const { pageOrder, changed } = advancePageOrder(activePageOrder, rows);
+    if (changed) {
+      setEntryOrder((prev) => ({ ...prev, [pageKey]: pageOrder }));
+    }
+  }, [parsed, activeMonth, pageKey, activePageOrder]);
   // if the active account was deleted (or storage was edited elsewhere), fall back safely
   useEffect(() => {
     if (!(activeAccount in accounts)) {
@@ -874,54 +1440,65 @@ export default function LedgerApp() {
     }
   }, [accounts, activeAccount]);
 
-  // ---- keep every OTHER account's Personal Incoming/Outgoing synced live as
-  //      you type here; never rewrites the account that's currently open for
-  //      editing, so it can't disturb your cursor ----
+  // Landing on a month should always leave you on an account that actually
+  // has something there — not a leftover account from whatever month you
+  // came from (which would show up greyed-out in the Accounts sheet until
+  // you picked a real one). Two cases, checked once per month switch
+  // (tracked via lastCheckedMonthRef, so creating an account or dismissing
+  // the nudge doesn't re-trigger this on its own):
+  //  - at least one account has a page this month: jump to the first one
+  //    (list order) unless the current active account already has a page.
+  //  - zero accounts have a page this month (a genuinely fresh month):
+  //    nudge with "new account" vs "same accounts as last month" instead.
+  const lastCheckedMonthRef = useRef(null);
   useEffect(() => {
-    const result = runSyncRounds(accounts, activeAccount);
+    if (lastCheckedMonthRef.current === activeMonth) return;
+    lastCheckedMonthRef.current = activeMonth;
+    const namesWithPage = Object.keys(accounts).filter((name) => activeMonth in (accounts[name] || {}));
+    if (namesWithPage.length === 0) {
+      if (sheet !== "month-new") openSheet("month-new");
+    } else {
+      if (!namesWithPage.includes(activeAccount)) setActiveAccount(namesWithPage[0]);
+      if (sheet === "month-new") closeMonthNewSheet();
+    }
+  }, [activeMonth, accounts]);
+
+  // ---- keep every OTHER account's Personal Incoming/Outgoing synced live,
+  //      scoped to the currently active month only (these are same-month
+  //      convenience transfers, not the cross-month Loan mechanism below).
+  //      Never rewrites the page currently open for editing. ----
+  useEffect(() => {
+    const slice = monthSlice(accounts, activeMonth);
+    const result = runSyncRounds(slice, activeAccount);
     const updates = {};
     for (const k of Object.keys(result)) {
-      if (result[k] !== accounts[k]) updates[k] = result[k];
+      if (result[k] !== slice[k]) updates[k] = result[k];
     }
     if (Object.keys(updates).length) {
-      setAccounts((prev) => ({ ...prev, ...updates }));
+      setAccounts((prev) => {
+        const next = { ...prev };
+        for (const k of Object.keys(updates)) next[k] = { ...next[k], [activeMonth]: updates[k] };
+        return next;
+      });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [accounts, activeAccount]);
+  }, [accounts, activeAccount, activeMonth]);
 
-  // ---- catch the newly-opened account up to date the moment you switch to it ----
+  // ---- catch the newly-opened page up to date the moment you switch to it ----
   useEffect(() => {
-    const result = runSyncRounds(accounts, null);
-    if (accounts[activeAccount] !== undefined && result[activeAccount] !== accounts[activeAccount]) {
-      setAccounts((prev) => ({ ...prev, [activeAccount]: result[activeAccount] }));
+    const slice = monthSlice(accounts, activeMonth);
+    const result = runSyncRounds(slice, null);
+    if (result[activeAccount] !== undefined && result[activeAccount] !== slice[activeAccount]) {
+      setAccounts((prev) => ({ ...prev, [activeAccount]: { ...prev[activeAccount], [activeMonth]: result[activeAccount] } }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeAccount]);
+  }, [activeAccount, activeMonth]);
 
-  // ---- loan tracking: match Loan repayment entries (any account) against
-  //      unclaimed Loan entries (any account), annotate, and keep every
-  //      account's Outstanding Loans block current. Never rewrites the
-  //      account currently being typed in. ----
-  useEffect(() => {
-    const result = runLoanSync(accounts, activeAccount);
-    const updates = {};
-    for (const k of Object.keys(result)) {
-      if (result[k] !== accounts[k]) updates[k] = result[k];
-    }
-    if (Object.keys(updates).length) {
-      setAccounts((prev) => ({ ...prev, ...updates }));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [accounts, activeAccount]);
-
-  // ---- catch the newly-opened account's loan state up the moment you switch to it ----
-  useEffect(() => {
-    const result = runLoanSync(accounts, null);
-    if (accounts[activeAccount] !== undefined && result[activeAccount] !== accounts[activeAccount]) {
-      setAccounts((prev) => ({ ...prev, [activeAccount]: result[activeAccount] }));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeAccount]);
+  // ---- loan tracking has no text-mutation effect anymore: Loan and Loan
+  //      repayment entries are plain hand-typed lines like everything else.
+  //      computeLoanAllocations() is called live, read-only, by LoansView
+  //      whenever the Outstanding Loans report is open — see that
+  //      component below. ----
 
   useEffect(() => {
     if (pendingCursor.current !== null && textareaRef.current) {
@@ -932,14 +1509,24 @@ export default function LedgerApp() {
   }, [text]);
 
   /* ---- Android hardware back button closes sheets/dialogs instead of exiting ---- */
+  const allowMonthNewCloseRef = useRef(false);
   useEffect(() => {
     function onPop() {
+      if (sheet === "month-new" && !allowMonthNewCloseRef.current) {
+        if (dialog) {
+          // let back cancel the open dialog first, but keep the nudge itself up
+          setDialog(null);
+        }
+        window.history.pushState({ ledgerSheet: "month-new" }, "");
+        return;
+      }
+      allowMonthNewCloseRef.current = false;
       setSheet(null);
       setDialog(null);
     }
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
-  }, []);
+  }, [sheet, dialog]);
 
   function openSheet(name) {
     window.history.pushState({ ledgerSheet: name }, "");
@@ -951,6 +1538,14 @@ export default function LedgerApp() {
     } else {
       setSheet(null);
     }
+  }
+  // The only sanctioned way to close the non-dismissible month-new sheet:
+  // used when the app itself resolves the "fresh month" state (an account
+  // was just created, or the in-sheet month stepper landed on a month that
+  // already has data) — as opposed to the user trying to back/tap out of it.
+  function closeMonthNewSheet() {
+    allowMonthNewCloseRef.current = true;
+    closeSheet();
   }
 
   function askPrompt(message, defaultValue, onSubmit) {
@@ -969,46 +1564,26 @@ export default function LedgerApp() {
     const cursor = e.target.selectionStart;
 
     const now = Date.now();
-    const last = lastPushRef.current[activeAccount] || 0;
+    const last = lastPushRef.current[pageKey] || 0;
     if (now - last > 800) {
-      const h = historyRef.current[activeAccount] || (historyRef.current[activeAccount] = { past: [], future: [] });
+      const h = historyRef.current[pageKey] || (historyRef.current[pageKey] = { past: [], future: [] });
       h.past.push(text);
       if (h.past.length > 200) h.past.shift();
       h.future = [];
     }
-    lastPushRef.current[activeAccount] = now;
+    lastPushRef.current[pageKey] = now;
 
     const { lineIdx: curLineIdx, col: curCol } = lineColFromCursor(raw, cursor);
 
-    // ---- auto-insert a blank Total line right after a freshly created
-    //      section header (category, marked with (+)/(-)) or subcategory
-    //      header (a plain label line with no dash), so entries can be
-    //      typed above it while it lives below, ready to keep itself synced ----
+    // The app's only job here is to keep whatever Total/Sub/Balance lines the
+    // user has typed themselves in sync with the computed sums (see
+    // autofillTargets below) — it no longer auto-inserts placeholder Total
+    // lines or auto-renames labels. The user types the category/subcategory
+    // structure and its closing "<Label> Total -" lines entirely by hand;
+    // the app just fills in (and keeps correcting) the number after the dash.
     let workingLines = raw.split("\n");
-    if (workingLines[curLineIdx] !== undefined && workingLines[curLineIdx].trim() === "" && curLineIdx > 0) {
-      const prevLine = workingLines[curLineIdx - 1].trim();
-      const isCategoryHeader = MARKER_RE.test(prevLine);
-      const isSubHeader = prevLine !== "" && !isCategoryHeader && !BLANK_RE.test(prevLine) && !ENTRY_RE.test(prevLine);
-      if ((isCategoryHeader || isSubHeader) && !blockAlreadyHasTotal(workingLines, curLineIdx + 1)) {
-        const totalLabel = isCategoryHeader ? "Total" : `${prevLine} Total`;
-        workingLines.splice(curLineIdx + 1, 0, `${totalLabel} -`);
-      }
-    }
 
     const p = parseLedger(workingLines.join("\n"));
-
-    // If a subcategory's own closing Total line is still the bare generic
-    // word "Total" (this happens when a header+Enter pre-inserted a plain
-    // "Total -" before the user typed a subcategory name into that spot),
-    // keep it in sync with the subcategory's name instead of leaving it
-    // generically labeled.
-    for (const b of p.blocks) {
-      for (const s of b.subs) {
-        if (s.totalLineIndex !== null) {
-          workingLines[s.totalLineIndex] = renameGenericTotalLabel(workingLines[s.totalLineIndex], s.title);
-        }
-      }
-    }
 
     const finalLines = workingLines.slice();
     p.autofillTargets.forEach((t) => {
@@ -1030,39 +1605,94 @@ export default function LedgerApp() {
     }
     pendingCursor.current = cursorPos;
 
-    setAccounts((prev) => ({ ...prev, [activeAccount]: finalLines.join("\n") }));
+    setAccounts((prev) => ({ ...prev, [activeAccount]: { ...prev[activeAccount], [activeMonth]: finalLines.join("\n") } }));
   }
 
   function runUndo() {
-    const h = historyRef.current[activeAccount];
+    const h = historyRef.current[pageKey];
     if (!h || !h.past.length) return;
     const prev = h.past.pop();
     h.future.push(text);
-    lastPushRef.current[activeAccount] = 0;
-    setAccounts((a) => ({ ...a, [activeAccount]: prev }));
+    lastPushRef.current[pageKey] = 0;
+    setAccounts((a) => ({ ...a, [activeAccount]: { ...a[activeAccount], [activeMonth]: prev } }));
   }
   function runRedo() {
-    const h = historyRef.current[activeAccount];
+    const h = historyRef.current[pageKey];
     if (!h || !h.future.length) return;
     const next = h.future.pop();
     h.past.push(text);
-    lastPushRef.current[activeAccount] = 0;
-    setAccounts((a) => ({ ...a, [activeAccount]: next }));
+    lastPushRef.current[pageKey] = 0;
+    setAccounts((a) => ({ ...a, [activeAccount]: { ...a[activeAccount], [activeMonth]: next } }));
   }
 
   /* ---- account management ---- */
   function addAccount() {
-    askPrompt("New account name (e.g. Ambika, Home, Sree hand):", "", (name) => {
+    askPrompt(`New account for ${monthLabel(activeMonth)} (e.g. Ambika, Home, Sree hand):`, "", (name) => {
       const trimmed = (name || "").trim();
       if (!trimmed) return;
-      if (accounts[trimmed]) {
-        showAlert(`An account named "${trimmed}" already exists.`);
+      const existing = accounts[trimmed];
+      if (existing) {
+        if (existing[activeMonth] !== undefined) {
+          // Truly nothing to create — it already has a page for this exact
+          // month. Just switch to it instead of leaving the user stuck.
+          showAlert(`"${trimmed}" already has a page for ${monthLabel(activeMonth)} — switching to it.`);
+          setActiveAccount(trimmed);
+          setShowingAgg(false);
+          setShowingStatement(false);
+          if (sheet === "month-new") closeMonthNewSheet();
+          return;
+        }
+        // The identity already exists (it has pages in other months) but
+        // not this one yet. The Accounts sheet only lists accounts with a
+        // page in the active month (see feature #12), so an account like
+        // this can be completely invisible there while still existing
+        // globally — the old behavior blocked this with a confusing
+        // "already exists" error and no way forward. Instead, just add
+        // this month's page for it, exactly like switching to it and
+        // typing would.
+        setAccounts((prev) => ({ ...prev, [trimmed]: { ...prev[trimmed], [activeMonth]: starterLine(trimmed, activeMonth) } }));
+        setActiveAccount(trimmed);
+        setShowingAgg(false);
+        setShowingStatement(false);
+        if (sheet === "month-new") closeMonthNewSheet();
         return;
       }
-      setAccounts((prev) => ({ ...prev, [trimmed]: "" }));
+      // New identities start with a page for whichever month you're
+      // currently viewing — you can add pages for other months later just
+      // by switching month and typing. The page opens with a real
+      // auto-generated first line (e.g. "Ambika account July") instead of
+      // blank + placeholder text.
+      setAccounts((prev) => ({ ...prev, [trimmed]: { [activeMonth]: starterLine(trimmed, activeMonth) } }));
       setActiveAccount(trimmed);
       setShowingAgg(false);
+      setShowingStatement(false);
+      // the fresh-month nudge is non-dismissible and has no Close button of
+      // its own, so creating the account from inside it is what closes it
+      if (sheet === "month-new") closeMonthNewSheet();
     });
+  }
+
+  // For a month with zero pages across every account (a "fresh" month),
+  // this copies just the *roster* of accounts that had a page the previous
+  // month into the new month as blank pages — no content is copied, it just
+  // means those accounts show up ready-to-use instead of "no entry this
+  // month". Accounts that already have a page this month are left as-is.
+  function carryOverFromLastMonth() {
+    const prevMonth = addMonths(activeMonth, -1);
+    const namesWithPrevPage = Object.keys(accounts).filter((name) => prevMonth in (accounts[name] || {}));
+    if (namesWithPrevPage.length === 0) return;
+    setAccounts((prev) => {
+      const next = { ...prev };
+      for (const name of namesWithPrevPage) {
+        if (activeMonth in next[name]) continue;
+        next[name] = { ...next[name], [activeMonth]: starterLine(name, activeMonth) };
+      }
+      return next;
+    });
+    if (!namesWithPrevPage.includes(activeAccount)) {
+      setActiveAccount(namesWithPrevPage[0]);
+    }
+    closeMonthNewSheet();
   }
 
   function renameAccount() {
@@ -1073,10 +1703,25 @@ export default function LedgerApp() {
         showAlert(`An account named "${trimmed}" already exists.`);
         return;
       }
+      // Renames the identity — every month's page moves with it.
       setAccounts((prev) => {
         const next = { ...prev };
         next[trimmed] = next[activeAccount];
         delete next[activeAccount];
+        return next;
+      });
+      // The "order entered" tracking is keyed by `${account}::${month}`, so
+      // it needs to move with the identity too, or every page would look
+      // brand-new to the Statement report and re-fall-back to text order.
+      setEntryOrder((prev) => {
+        const next = { ...prev };
+        const prefix = `${activeAccount}::`;
+        for (const key of Object.keys(prev)) {
+          if (key.startsWith(prefix)) {
+            next[`${trimmed}::${key.slice(prefix.length)}`] = prev[key];
+            delete next[key];
+          }
+        }
         return next;
       });
       setActiveAccount(trimmed);
@@ -1084,21 +1729,44 @@ export default function LedgerApp() {
     });
   }
 
+  // Deletes just the currently viewed month's page for this account, not
+  // the whole account identity — its other months' pages are untouched. If
+  // this was the account's only page, the identity itself is removed too
+  // (an account with zero pages isn't meaningful to keep around), same as
+  // "delete account" used to work back when there was only ever one page.
   function deleteAccount() {
-    const names = Object.keys(accounts);
-    if (names.length <= 1) {
+    const monthsForAcct = Object.keys(accounts[activeAccount] || {});
+    const wholeIdentityGoes = monthsForAcct.length <= 1;
+    const remainingIdentities = Object.keys(accounts).length - (wholeIdentityGoes ? 1 : 0);
+    if (remainingIdentities < 1) {
       showAlert("You need at least one account.");
       return;
     }
     askConfirm(
-      `Delete account "${activeAccount}"? Save a .txt backup first if you need one.`,
+      wholeIdentityGoes
+        ? `Delete account "${activeAccount}"? It has no other months, so this removes it entirely. Save a .txt backup first if you need one.`
+        : `Delete "${activeAccount}"'s ${monthLabel(activeMonth)} entries? Its other months are untouched. Save a .txt backup first if you need one.`,
       () => {
         setAccounts((prev) => {
           const next = { ...prev };
-          delete next[activeAccount];
+          const months = { ...next[activeAccount] };
+          delete months[activeMonth];
+          if (Object.keys(months).length === 0) delete next[activeAccount];
+          else next[activeAccount] = months;
           return next;
         });
-        setActiveAccount(names.find((n) => n !== activeAccount));
+        setEntryOrder((prev) => {
+          const next = { ...prev };
+          if (wholeIdentityGoes) {
+            const prefix = `${activeAccount}::`;
+            for (const key of Object.keys(next)) {
+              if (key.startsWith(prefix)) delete next[key];
+            }
+          } else {
+            delete next[`${activeAccount}::${activeMonth}`];
+          }
+          return next;
+        });
         closeSheet();
       },
       { danger: true, confirmLabel: "Delete" }
@@ -1110,7 +1778,7 @@ export default function LedgerApp() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = activeAccount.replace(/\s+/g, "_") + ".txt";
+    a.download = `${activeAccount.replace(/\s+/g, "_")}_${activeMonth}.txt`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -1127,7 +1795,7 @@ export default function LedgerApp() {
     if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
-      setAccounts((prev) => ({ ...prev, [activeAccount]: reader.result }));
+      setAccounts((prev) => ({ ...prev, [activeAccount]: { ...prev[activeAccount], [activeMonth]: reader.result } }));
     };
     reader.readAsText(file);
     e.target.value = "";
@@ -1141,9 +1809,9 @@ export default function LedgerApp() {
             <X size={20} />
             <span className="font-mono text-xs">Close</span>
           </button>
-          <span className="font-mono text-xs uppercase tracking-widest text-zinc-400">Aggregate</span>
+          <span className="font-mono text-xs uppercase tracking-widest text-zinc-400">Aggregate — {monthLabel(activeMonth)}</span>
         </div>
-        <AggregateView accounts={accounts} />
+        <AggregateView accounts={monthSlice(accounts, activeMonth)} />
       </div>
     );
   }
@@ -1158,7 +1826,55 @@ export default function LedgerApp() {
           </button>
           <span className="font-mono text-xs uppercase tracking-widest text-zinc-400">Outstanding Loans</span>
         </div>
-        <LoansView accounts={accounts} />
+        <LoansView accounts={accounts} defaultCutoff={activeMonth} />
+      </div>
+    );
+  }
+
+  if (showingStatement) {
+    return (
+      <div className="h-screen flex flex-col bg-black text-zinc-100">
+        <div className="flex items-center gap-3 px-4 py-3 bg-[#151517] shrink-0">
+          <button onClick={() => setShowingStatement(false)} className="flex items-center gap-1 -ml-1 px-1 py-1 text-zinc-300 hover:text-white">
+            <X size={20} />
+            <span className="font-mono text-xs">Close</span>
+          </button>
+          <span className="font-mono text-xs uppercase tracking-widest text-zinc-400">Statement</span>
+        </div>
+        <StatementView accounts={accounts} defaultAccount={activeAccount} defaultMonth={activeMonth} entryOrder={entryOrder} setEntryOrder={setEntryOrder} />
+      </div>
+    );
+  }
+
+  if (showingImport) {
+    return (
+      <div className="h-screen flex flex-col bg-black text-zinc-100">
+        <div className="flex items-center gap-3 px-4 py-3 bg-[#151517] shrink-0">
+          <button onClick={() => setShowingImport(false)} className="flex items-center gap-1 -ml-1 px-1 py-1 text-zinc-300 hover:text-white">
+            <X size={20} />
+            <span className="font-mono text-xs">Close</span>
+          </button>
+          <span className="font-mono text-xs uppercase tracking-widest text-zinc-400">Import Statement</span>
+        </div>
+        <ImportStatementView
+          accounts={accounts}
+          setAccounts={setAccounts}
+          activeAccount={activeAccount}
+          activeMonth={activeMonth}
+          stmtPasswords={stmtPasswords}
+          setStmtPasswords={setStmtPasswords}
+          stmtBankMap={stmtBankMap}
+          setStmtBankMap={setStmtBankMap}
+          stmtCatMap={stmtCatMap}
+          setStmtCatMap={setStmtCatMap}
+          stmtImported={stmtImported}
+          setStmtImported={setStmtImported}
+          askPrompt={askPrompt}
+          askConfirm={askConfirm}
+          showAlert={showAlert}
+          onClose={() => setShowingImport(false)}
+        />
+        <Dialog dialog={dialog} setDialog={setDialog} />
       </div>
     );
   }
@@ -1167,13 +1883,28 @@ export default function LedgerApp() {
     <div className="h-screen flex flex-col bg-black">
       {/* top bar */}
       <div className="flex items-center justify-between px-3 py-2.5 bg-[#151517] shrink-0">
-        <button
-          onClick={() => openSheet("accounts")}
-          title="Switch account"
-          className={"h-9 w-9 rounded-full flex items-center justify-center font-mono text-sm font-semibold text-zinc-900 " + avatarColor(activeAccount)}
-        >
-          {activeAccount.charAt(0).toUpperCase()}
-        </button>
+        <div className="flex items-center gap-1">
+          <button onClick={() => setActiveMonth((m) => addMonths(m, -1))} title="Previous month" className="p-1.5 text-zinc-500 hover:text-white active:text-white">
+            <ChevronLeft size={18} />
+          </button>
+          <button
+            onClick={() => openSheet("month")}
+            title="Switch month"
+            className="px-3 py-1.5 rounded-md bg-zinc-800 text-zinc-100 font-mono text-sm font-semibold min-w-[86px] text-center"
+          >
+            {monthLabel(activeMonth)}
+          </button>
+          <button onClick={() => setActiveMonth((m) => addMonths(m, 1))} title="Next month" className="p-1.5 text-zinc-500 hover:text-white active:text-white">
+            <ChevronRight size={18} />
+          </button>
+          <button
+            onClick={() => openSheet("accounts")}
+            title="Switch account"
+            className={"px-2.5 py-1.5 rounded-md flex items-center justify-center font-mono text-sm font-bold text-zinc-900 shrink-0 ml-1.5 leading-tight text-center " + avatarColor(activeAccount)}
+          >
+            {activeAccount}
+          </button>
+        </div>
 
         <div className="flex items-center gap-1">
           <button onClick={runUndo} title="Undo" className="p-2 text-zinc-400 hover:text-white active:text-white">
@@ -1181,9 +1912,6 @@ export default function LedgerApp() {
           </button>
           <button onClick={runRedo} title="Redo" className="p-2 text-zinc-400 hover:text-white active:text-white">
             <Redo2 size={19} />
-          </button>
-          <button onClick={addAccount} title="New account" className="p-2 text-zinc-400 hover:text-white active:text-white">
-            <Plus size={19} />
           </button>
           <button onClick={() => openSheet("totals")} title="Totals" className="p-2 text-zinc-400 hover:text-white active:text-white">
             <AlignLeft size={19} />
@@ -1200,7 +1928,6 @@ export default function LedgerApp() {
         value={text}
         onChange={handleChange}
         spellCheck={false}
-        placeholder={STARTER_TEXT}
         style={{ fontSize: `${fontSize}px`, lineHeight: lineSpacing }}
         className="flex-1 w-full resize-none outline-none px-5 py-4 font-mono bg-black text-zinc-100 placeholder-zinc-700 caret-white"
       />
@@ -1210,7 +1937,9 @@ export default function LedgerApp() {
       {/* accounts sheet */}
       <BottomSheet open={sheet === "accounts"} onClose={closeSheet} title="Accounts">
         <div className="flex flex-col gap-1 mt-1">
-          {Object.keys(accounts).map((name) => (
+          {Object.keys(accounts)
+            .filter((name) => accounts[name]?.[activeMonth] !== undefined || name === activeAccount)
+            .map((name) => (
             <button
               key={name}
               onClick={() => {
@@ -1222,17 +1951,24 @@ export default function LedgerApp() {
                 (name === activeAccount ? "bg-zinc-800 text-white" : "text-zinc-300 hover:bg-zinc-800/60")
               }
             >
-              <span className={"h-6 w-6 rounded-full flex items-center justify-center text-[11px] font-semibold text-zinc-900 " + avatarColor(name)}>
-                {name.charAt(0).toUpperCase()}
+              <span
+                className={
+                  "h-12 min-w-[3.25rem] shrink-0 rounded-lg flex items-center justify-center text-center px-1.5 py-1 text-[11px] font-semibold leading-tight break-words text-zinc-900 " +
+                  avatarColor(name)
+                }
+              >
+                {name}
               </span>
-              {name}
+              {accounts[name]?.[activeMonth] === undefined && (
+                <span className="text-[10px] text-zinc-600 font-normal">no entry this month</span>
+              )}
             </button>
           ))}
           <SheetRow icon={<Plus size={17} />} label="New account" onClick={addAccount} />
           <div className="h-px bg-zinc-800 my-1" />
           <SheetRow
             icon={<Layers size={17} />}
-            label="Aggregate — all accounts"
+            label={`Aggregate — ${monthLabel(activeMonth)}`}
             onClick={() => {
               setShowingAgg(true);
               closeSheet();
@@ -1246,17 +1982,108 @@ export default function LedgerApp() {
               closeSheet();
             }}
           />
+          <SheetRow
+            icon={<Receipt size={17} />}
+            label="Statement"
+            onClick={() => {
+              setShowingStatement(true);
+              closeSheet();
+            }}
+          />
+          <SheetRow
+            icon={<FileText size={17} />}
+            label="Import bank statement"
+            onClick={() => {
+              setShowingImport(true);
+              closeSheet();
+            }}
+          />
         </div>
       </BottomSheet>
 
+      {/* new month nudge: no account has a page here yet */}
+      <BottomSheet open={sheet === "month-new"} onClose={closeSheet} title={`New: ${monthLabel(activeMonth)}`} dismissible={false}>
+        <div className="flex items-center justify-center gap-3 mt-1 mb-2">
+          <button onClick={() => setActiveMonth((m) => addMonths(m, -1))} title="Previous month" className="p-2 text-zinc-400 hover:text-white active:text-white">
+            <ChevronLeft size={18} />
+          </button>
+          <span className="px-3 py-1.5 rounded-md bg-zinc-800 text-zinc-100 font-mono text-sm font-semibold min-w-[86px] text-center">
+            {monthLabel(activeMonth)}
+          </span>
+          <button onClick={() => setActiveMonth((m) => addMonths(m, 1))} title="Next month" className="p-2 text-zinc-400 hover:text-white active:text-white">
+            <ChevronRight size={18} />
+          </button>
+        </div>
+        <div className="px-1 pt-1 pb-3 font-mono text-xs text-zinc-500 leading-relaxed">
+          No accounts have anything in {monthLabel(activeMonth)} yet.
+        </div>
+        <div className="flex flex-col gap-1">
+          <SheetRow icon={<Plus size={17} />} label="New account" onClick={addAccount} />
+          {Object.keys(accounts).some((name) => addMonths(activeMonth, -1) in (accounts[name] || {})) && (
+            <SheetRow
+              icon={<CalendarDays size={17} />}
+              label={`Same accounts as ${monthLabel(addMonths(activeMonth, -1))}`}
+              onClick={carryOverFromLastMonth}
+            />
+          )}
+        </div>
+      </BottomSheet>
+
+      {/* month sheet */}
+      <BottomSheet open={sheet === "month"} onClose={closeSheet} title="Month">
+        <div className="flex items-center justify-center gap-5 mt-1 mb-3">
+          <button onClick={() => setActiveMonth((m) => shiftYear(m, -1))} className="p-2 text-zinc-400 hover:text-white active:text-white">
+            <ChevronLeft size={18} />
+          </button>
+          <span className="font-mono text-lg text-zinc-100 min-w-[3.5em] text-center">{yearOf(activeMonth)}</span>
+          <button onClick={() => setActiveMonth((m) => shiftYear(m, 1))} className="p-2 text-zinc-400 hover:text-white active:text-white">
+            <ChevronRight size={18} />
+          </button>
+        </div>
+        <div className="grid grid-cols-4 gap-2 mb-2">
+          {MONTHS_SHORT.map((label, idx) => {
+            const mk = monthKeyFromParts(yearOf(activeMonth), idx);
+            const isActive = mk === activeMonth;
+            const hasData = accounts[activeAccount]?.[mk] !== undefined;
+            return (
+              <button
+                key={mk}
+                onClick={() => {
+                  setActiveMonth(mk);
+                  closeSheet();
+                }}
+                className={
+                  "relative py-2 rounded-lg font-mono text-xs " +
+                  (isActive ? "bg-teal-700 text-white" : "bg-zinc-800/60 text-zinc-300 hover:bg-zinc-800")
+                }
+              >
+                {label}
+                {hasData && !isActive && <span className="absolute top-1 right-1.5 h-1 w-1 rounded-full bg-teal-500" />}
+              </button>
+            );
+          })}
+        </div>
+        <div className="h-px bg-zinc-800 my-1" />
+        <SheetRow
+          icon={<CalendarDays size={17} />}
+          label="Jump to current month"
+          onClick={() => {
+            setActiveMonth(monthKeyNow());
+            closeSheet();
+          }}
+        />
+      </BottomSheet>
+
       {/* totals sheet */}
-      <BottomSheet open={sheet === "totals"} onClose={closeSheet} title={activeAccount}>
+      <BottomSheet open={sheet === "totals"} onClose={closeSheet} title={`${activeAccount} · ${monthLabel(activeMonth)}`}>
         <SectionTotals parsed={parsed} />
       </BottomSheet>
 
       {/* menu sheet */}
       <BottomSheet open={sheet === "menu"} onClose={closeSheet} title="Menu">
         <div className="flex flex-col gap-1 mt-1">
+          <SheetRow icon={<CalendarDays size={17} />} label={`Change month — ${monthLabel(activeMonth)}`} onClick={() => setSheet("month")} />
+          <div className="h-px bg-zinc-800 my-1" />
           <Stepper
             icon={<Type size={17} />}
             label="Text size"
@@ -1280,7 +2107,7 @@ export default function LedgerApp() {
           <SheetRow icon={<Upload size={17} />} label="Open .txt" onClick={() => fileInputRef.current.click()} />
           <div className="h-px bg-zinc-800 my-1" />
           <SheetRow icon={<Pencil size={17} />} label="Rename account" onClick={renameAccount} />
-          <SheetRow icon={<Trash2 size={17} />} label="Delete account" onClick={deleteAccount} danger />
+          <SheetRow icon={<Trash2 size={17} />} label={`Delete ${monthLabel(activeMonth)} entries`} onClick={deleteAccount} danger />
           <div className="h-px bg-zinc-800 my-1" />
           <SheetRow icon={<HelpCircle size={17} />} label={showHelp ? "Hide format guide" : "Format guide"} onClick={() => setShowHelp((s) => !s)} />
           {showHelp && (
@@ -1307,12 +2134,23 @@ export default function LedgerApp() {
               <br />
               <br />
               <strong>Loans:</strong> record a loan as an entry under <code>(+): Loan</code> (e.g. <code>Saneesh - 2000</code>).
-              Record repaying it as an entry with the same name and amount under <code>(-): Loan repayment</code> — in any
-              account, not necessarily the one the loan was taken in. Once matched, the original Loan entry is annotated{" "}
-              <code>(repaid by &lt;account&gt;)</code> automatically, and it drops off <code>Outstanding Loans</code> — a section
-              the app manages entirely on its own, listing that account's still-unpaid loans. Outstanding Loans is never
-              counted toward Sub incoming/outgoing/Balance, no matter what. See Accounts (tap your avatar) → Outstanding
-              loans to view every account's loans, and to combine two or more accounts' loans into one summed view.
+              Record repaying it as an entry with the same name under <code>(-): Loan repayment</code> — in that same account
+              (a loan is always repaid from the account it was taken in), and it doesn't have to be the full amount:
+              repayments can be partial, and split across several entries over several months, and they'll be applied in
+              order against that person's loan(s) automatically. Both entries are left exactly as you typed them — the app
+              never writes anything back onto the Loan line itself. All loan tracking (who still owes what, and the
+              repayment history behind it) lives in the Outstanding Loans report, computed live and never written into
+              your workbook text or counted toward Sub incoming/outgoing/Balance. See Accounts (tap your avatar) →
+              Outstanding loans to view every account's remaining balances and repayment history, and to combine two or
+              more accounts' loans into one summed view.
+              <br />
+              <br />
+              <strong>Months:</strong> every account is now a set of monthly pages — switch months with the ◀ / ▶ arrows
+              or the month pill in the top bar. An account doesn't need a page in every month; a blank one is created the
+              moment you type in it. Personal Incoming/Outgoing only mirrors within the same month. Loans are the
+              exception: a loan and its repayment(s) can be in different months (same account only) and will still
+              match up in the Outstanding Loans report, which always reflects the full history. That report can also be
+              pointed at any month to see a snapshot as of that point in time, instead of always "right now."
             </div>
           )}
         </div>
@@ -1478,26 +2316,27 @@ function AggregateView({ accounts }) {
   );
 }
 
-// Reads each account's still-unmatched "(+): Loan" entries — same logic the
-// sync engine uses, kept independent of the auto-managed "Outstanding Loans"
-// block so this view is always accurate even mid-keystroke on another tab.
-function outstandingLoansFor(text) {
-  const parsed = parseLedger(text);
-  const lines = text.split("\n");
-  const block = parsed.blocks.find((b) => b.sign === "+" && normLabel(b.title) === "loan");
-  if (!block) return [];
-  return block.entries.filter((e) => loanEntryRepaidBy(lines[e.lineIndex]) === null).map((e) => ({ label: e.label.trim(), amount: e.amount }));
-}
-
-function LoansView({ accounts }) {
+function LoansView({ accounts, defaultCutoff }) {
   const [combined, setCombined] = useState(() => new Set());
+  const [cutoff, setCutoff] = useState(defaultCutoff || monthKeyNow());
+
+  // computeLoanAllocations is the sole engine behind loan tracking — this
+  // report is the only place loan/repayment status is ever shown. It's
+  // computed fresh, read-only, from the raw Loan / Loan repayment entries
+  // across every account AND every month, so this view is always accurate
+  // live, even mid-keystroke on whichever page is currently being typed
+  // in. Passing `cutoff` restricts the snapshot to entries dated on or
+  // before that month.
+  const allLoans = useMemo(() => computeLoanAllocations(accounts, cutoff), [accounts, cutoff]);
 
   const perAccount = useMemo(() => {
     return Object.keys(accounts).map((name) => {
-      const outstanding = outstandingLoansFor(accounts[name]);
-      return { name, outstanding, total: outstanding.reduce((a, e) => a + e.amount, 0) };
+      const loans = allLoans.filter((le) => le.account === name);
+      const outstanding = loans.filter((le) => le.remaining > 0.005);
+      const settled = loans.filter((le) => le.remaining <= 0.005 && le.used.length > 0);
+      return { name, outstanding, settled, total: outstanding.reduce((a, le) => a + le.remaining, 0) };
     });
-  }, [accounts]);
+  }, [accounts, allLoans]);
 
   function toggle(name) {
     setCombined((prev) => {
@@ -1513,9 +2352,8 @@ function LoansView({ accounts }) {
     const map = {};
     for (const acc of perAccount) {
       if (!combined.has(acc.name)) continue;
-      for (const e of acc.outstanding) {
-        const key = e.label;
-        map[key] = (map[key] || 0) + e.amount;
+      for (const le of acc.outstanding) {
+        map[le.label] = (map[le.label] || 0) + le.remaining;
       }
     }
     return Object.keys(map)
@@ -1523,13 +2361,28 @@ function LoansView({ accounts }) {
       .sort((a, b) => b.amount - a.amount);
   }, [combined, perAccount]);
 
+  const isLive = cutoff >= monthKeyNow();
+
   return (
     <div className="flex-1 overflow-y-auto px-5 py-5">
-      <p className="font-mono text-[11px] text-zinc-500 mb-4 leading-relaxed">
-        Outstanding loans computed live from every account, cross-checked against every "Loan repayment" entry so a loan
-        repaid through a different account still drops off correctly. Tap two or more accounts below to combine their loans
-        into one summed view.
+      <p className="font-mono text-[11px] text-zinc-500 mb-3 leading-relaxed">
+        Outstanding loans computed live from every account, cross-checked against that same account's "Loan repayment"
+        entries — including partial repayments made in a later month — so remaining balances and repayment history stay
+        accurate. Tap two or more accounts below to combine their loans into one summed view.
       </p>
+
+      <div className="flex items-center justify-center gap-3 mb-4 rounded-lg border border-zinc-800 py-2">
+        <button onClick={() => setCutoff((m) => addMonths(m, -1))} className="p-1 text-zinc-400 hover:text-white">
+          <ChevronLeft size={16} />
+        </button>
+        <span className="font-mono text-xs text-zinc-200 min-w-[7em] text-center">
+          As of {monthLabel(cutoff)}
+          {isLive && <span className="text-teal-500"> (live)</span>}
+        </span>
+        <button onClick={() => setCutoff((m) => addMonths(m, 1))} className="p-1 text-zinc-400 hover:text-white">
+          <ChevronRight size={16} />
+        </button>
+      </div>
 
       <div className="flex flex-wrap gap-2 mb-4">
         {perAccount.map((acc) => (
@@ -1582,10 +2435,35 @@ function LoansView({ accounts }) {
               <div className="px-3 py-2 font-mono text-[11px] text-zinc-500">No outstanding loans</div>
             ) : (
               <div className="divide-y divide-zinc-800/70">
-                {acc.outstanding.map((e, i) => (
-                  <div key={i} className="px-3 py-1.5 flex items-center justify-between font-mono text-[11px] text-zinc-300">
-                    <span>{e.label}</span>
-                    <span>{formatNum(e.amount)}</span>
+                {acc.outstanding.map((le, i) => (
+                  <div key={i} className="px-3 py-1.5 font-mono text-[11px] text-zinc-300">
+                    <div className="flex items-center justify-between">
+                      <span>
+                        {le.label} <span className="text-zinc-600">· {monthLabel(le.month)}</span>
+                      </span>
+                      <span>{formatNum(le.remaining)}</span>
+                    </div>
+                    {le.used.length > 0 && (
+                      <div className="text-zinc-500 mt-0.5">
+                        of {formatNum(le.amount)} — paid {le.used.map((u) => `${formatNum(u.amount)} (${monthLabel(u.month)})`).join(", ")}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+            {acc.settled.length > 0 && (
+              <div className="border-t border-zinc-800 divide-y divide-zinc-800/70">
+                <div className="px-3 py-1 font-mono text-[10px] uppercase tracking-widest text-zinc-600">Repaid</div>
+                {acc.settled.map((le, i) => (
+                  <div key={i} className="px-3 py-1.5 font-mono text-[11px] text-zinc-500">
+                    <div className="flex items-center justify-between">
+                      <span>
+                        {le.label} <span className="text-zinc-700">· {monthLabel(le.month)}</span>
+                      </span>
+                      <span>{formatNum(le.amount)}</span>
+                    </div>
+                    <div className="mt-0.5">paid {le.used.map((u) => `${formatNum(u.amount)} (${monthLabel(u.month)})`).join(", ")}</div>
                   </div>
                 ))}
               </div>
@@ -1593,6 +2471,528 @@ function LoansView({ accounts }) {
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+// Day-of-month cell for the statement table. `iso` is "YYYY-MM-DD" or null
+// (undated line item — see buildStatement).
+function statementDateCell(iso) {
+  return iso ? String(parseInt(iso.slice(-2), 10)) : "—";
+}
+
+function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, setEntryOrder }) {
+  const [account, setAccount] = useState(defaultAccount);
+  const [month, setMonth] = useState(defaultMonth);
+
+  const text = accounts[account]?.[month] ?? "";
+  const parsed = useMemo(() => parseLedger(text), [text]);
+  const pageKey = `${account}::${month}`;
+  const pageOrder = entryOrder[pageKey];
+  const statement = useMemo(() => buildStatement(parsed, month, pageOrder), [parsed, month, pageOrder]);
+
+  // Covers pages the live editor hasn't touched since this feature shipped
+  // (or hasn't been opened at all): the first time Statement is viewed for
+  // such a page, every entry on it looks simultaneously "new" and gets
+  // locked in at its current text order — same fallback the active editor
+  // uses. From then on this page is tracked precisely too.
+  useEffect(() => {
+    if (statement.orderChanged) {
+      setEntryOrder((prev) => ({ ...prev, [pageKey]: statement.pageOrder }));
+    }
+  }, [statement, pageKey, setEntryOrder]);
+
+  return (
+    <div className="flex-1 overflow-y-auto px-5 py-5">
+      <p className="font-mono text-[11px] text-zinc-500 mb-3 leading-relaxed">
+        Every entry for {account} in {monthLabel(month)}, in the order it was actually typed (not just where it sits
+        in the text now), with a running balance. Entries labeled with a bare day number (e.g. "5 - 500") also show
+        that day; everything else is an undated line item.
+      </p>
+
+      <div className="flex flex-wrap gap-2 mb-3">
+        {Object.keys(accounts).map((name) => (
+          <button
+            key={name}
+            onClick={() => setAccount(name)}
+            className={
+              "px-3 py-1.5 rounded-full font-mono text-xs border " +
+              (name === account ? "bg-teal-700 border-teal-600 text-white" : "border-zinc-700 text-zinc-300")
+            }
+          >
+            {name}
+          </button>
+        ))}
+      </div>
+
+      <div className="flex items-center justify-center gap-3 mb-4 rounded-lg border border-zinc-800 py-2">
+        <button onClick={() => setMonth((m) => addMonths(m, -1))} className="p-1 text-zinc-400 hover:text-white">
+          <ChevronLeft size={16} />
+        </button>
+        <span className="font-mono text-xs text-zinc-200 min-w-[7em] text-center">{monthLabel(month)}</span>
+        <button onClick={() => setMonth((m) => addMonths(m, 1))} className="p-1 text-zinc-400 hover:text-white">
+          <ChevronRight size={16} />
+        </button>
+      </div>
+
+      {accounts[account]?.[month] === undefined ? (
+        <div className="rounded-lg border border-zinc-800 bg-zinc-800/60 px-3 py-2 font-mono text-[11px] text-zinc-400">
+          No entry for {account} this month.
+        </div>
+      ) : (
+        <table className="w-full border-collapse font-mono text-xs">
+          <thead>
+            <tr>
+              <th className="text-left border border-zinc-800 bg-zinc-800/60 text-zinc-300 px-2 py-2 w-10">Day</th>
+              <th className="text-left border border-zinc-800 bg-zinc-800/60 text-zinc-300 px-3 py-2">Description</th>
+              <th className="text-right border border-zinc-800 bg-zinc-800/60 text-zinc-300 px-3 py-2">Debit</th>
+              <th className="text-right border border-zinc-800 bg-zinc-800/60 text-zinc-300 px-3 py-2">Credit</th>
+              <th className="text-right border border-zinc-800 bg-zinc-800/60 text-zinc-300 px-3 py-2">Balance</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td className="border border-zinc-800 text-zinc-500 px-2 py-2">—</td>
+              <td className="border border-zinc-800 text-zinc-400 px-3 py-2">Opening balance</td>
+              <td className="text-right border border-zinc-800 text-zinc-600 px-3 py-2"></td>
+              <td className="text-right border border-zinc-800 text-zinc-600 px-3 py-2"></td>
+              <td className="text-right border border-zinc-800 text-zinc-200 px-3 py-2">{formatNum(statement.openingBalance) || "0"}</td>
+            </tr>
+            {statement.rows.map((r, i) => (
+              <tr key={i}>
+                <td className="border border-zinc-800 text-zinc-500 px-2 py-2">{statementDateCell(r.date)}</td>
+                <td className="border border-zinc-800 text-zinc-200 px-3 py-2">
+                  {r.label}
+                  <span className="text-zinc-600"> · {r.sub ? `${r.category} — ${r.sub}` : r.category}</span>
+                </td>
+                <td className="text-right border border-zinc-800 text-rose-300 px-3 py-2">{r.sign === "-" ? formatNum(r.amount) : ""}</td>
+                <td className="text-right border border-zinc-800 text-emerald-300 px-3 py-2">{r.sign === "+" ? formatNum(r.amount) : ""}</td>
+                <td className="text-right border border-zinc-800 text-zinc-200 px-3 py-2">{formatNum(r.balance) || "0"}</td>
+              </tr>
+            ))}
+            <tr className="font-bold border-t-2 border-zinc-600">
+              <td className="border border-zinc-800"></td>
+              <td className="border border-zinc-800 text-zinc-100 px-3 py-2">Closing balance</td>
+              <td className="border border-zinc-800"></td>
+              <td className="border border-zinc-800"></td>
+              <td className="text-right border border-zinc-800 text-zinc-100 px-3 py-2">{formatNum(statement.closingBalance) || "0"}</td>
+            </tr>
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+/* =========================================================================
+   IMPORT STATEMENT VIEW
+   Full-screen wizard: pick PDF -> decrypt (cached/prompted password) ->
+   confirm target account/month -> per-transaction review (auto-applying any
+   description already learned for this account) -> summary. All ledger
+   writes go through insertLedgerEntry; all "don't re-enter this" logic goes
+   through dedupeTransactions + stmtImported. See the STATEMENT IMPORT
+   engine section above for the pure logic this drives.
+   ========================================================================= */
+
+const stmtInputCls = "bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2.5 font-mono text-sm text-zinc-100 w-full";
+const stmtLabelCls = "font-mono text-[10px] text-zinc-500 uppercase tracking-widest mt-1";
+
+function ImportStatementView({
+  accounts,
+  setAccounts,
+  activeAccount,
+  activeMonth,
+  stmtPasswords,
+  setStmtPasswords,
+  stmtBankMap,
+  setStmtBankMap,
+  stmtCatMap,
+  setStmtCatMap,
+  stmtImported,
+  setStmtImported,
+  askPrompt,
+  showAlert,
+  onClose,
+}) {
+  const [step, setStep] = useState("pick"); // pick | opening | account | review | done
+  const [errorMsg, setErrorMsg] = useState("");
+  const fileInputRef = useRef(null);
+
+  const [meta, setMeta] = useState(null);
+  const [targetAccount, setTargetAccount] = useState(activeAccount);
+  const [targetMonth, setTargetMonth] = useState(activeMonth);
+
+  const [queue, setQueue] = useState([]);
+  const [qIndex, setQIndex] = useState(0);
+  const [autoCount, setAutoCount] = useState(0);
+  const [dupCount, setDupCount] = useState(0);
+  const [savedCount, setSavedCount] = useState(0);
+  const [skippedCount, setSkippedCount] = useState(0);
+
+  const [eDate, setEDate] = useState("");
+  const [eDesc, setEDesc] = useState("");
+  const [eAmount, setEAmount] = useState("");
+  const [eType, setEType] = useState("debit");
+  const [eCategory, setECategory] = useState("");
+  const [eSub, setESub] = useState("");
+
+  const passwordAttemptedOnce = useRef(false);
+
+  function requestPassword() {
+    return new Promise((resolve) => {
+      askPrompt(
+        passwordAttemptedOnce.current
+          ? "Wrong password. Try again (leave blank to cancel):"
+          : "This statement is password-protected. Enter the PDF password:",
+        "",
+        (val) => {
+          passwordAttemptedOnce.current = true;
+          resolve(val && val.trim() ? val.trim() : null);
+        }
+      );
+    });
+  }
+
+  async function handleFile(file) {
+    setStep("opening");
+    setErrorMsg("");
+    passwordAttemptedOnce.current = false;
+    try {
+      const buf = await file.arrayBuffer();
+      const opened = await openStatementPdf(buf, stmtPasswords, requestPassword);
+      if (!opened) {
+        setStep("pick");
+        return;
+      }
+      const { doc, newPassword } = opened;
+      const { lines, fullText } = await getPdfLines(doc);
+      const bankName = guessBankName(fullText);
+      const tail = guessAccountTail(fullText);
+      const rawTxns = resolveTransactionSigns(parseTransactions(lines));
+      const detectedMonth = guessStatementMonth(fullText, rawTxns) || activeMonth;
+
+      if (newPassword) {
+        setStmtPasswords((prev) => [...prev, { label: bankName, password: newPassword }]);
+      }
+
+      const bkey = bankMapKey(bankName, tail);
+      const mappedAccount = stmtBankMap[bkey];
+
+      setMeta({ bankName, tail, rawTxns, bkey });
+      setTargetAccount(mappedAccount && accounts[mappedAccount] ? mappedAccount : activeAccount);
+      setTargetMonth(detectedMonth);
+      setStep("account");
+    } catch (err) {
+      setErrorMsg("Couldn't read this PDF — it may not be a supported statement format, or the file may be corrupted.");
+      setStep("pick");
+    }
+  }
+
+  function loadIntoEditor(t) {
+    setEDate(t.dateISO || "");
+    setEDesc(t.description || "");
+    setEAmount(t.amount != null ? String(t.amount) : "");
+    setEType(t.guessedType === "credit" ? "credit" : "debit");
+    setECategory("");
+    setESub("");
+  }
+
+  function startReview() {
+    if (!meta) return;
+    setStmtBankMap((prev) => ({ ...prev, [meta.bkey]: targetAccount }));
+    const pageText = accounts[targetAccount]?.[targetMonth] ?? "";
+    const importedLog = stmtImported[targetAccount] || [];
+    const { fresh, skipped } = dedupeTransactions(meta.rawTxns, importedLog);
+    setDupCount(skipped.length);
+
+    // Auto-apply anything whose description was categorized before for this
+    // account — "if a similar transaction is found, automatically update
+    // the sheet."
+    const catMap = stmtCatMap[targetAccount] || {};
+    const toReview = [];
+    let auto = 0;
+    let workingText = pageText;
+    const newSignatures = [];
+    for (const t of fresh) {
+      const learned = catMap[normalizeDesc(t.description)];
+      if (learned) {
+        workingText = insertLedgerEntry(workingText, {
+          categoryTitle: learned.category,
+          sign: learned.sign,
+          subTitle: learned.sub,
+          label: dayLabelFromISO(t.dateISO) || t.description.slice(0, 20) || "Entry",
+          amount: t.amount,
+        });
+        newSignatures.push(t.signature);
+        auto++;
+      } else {
+        toReview.push(t);
+      }
+    }
+    if (workingText !== pageText) {
+      setAccounts((prev) => ({ ...prev, [targetAccount]: { ...prev[targetAccount], [targetMonth]: workingText } }));
+    }
+    if (newSignatures.length) {
+      setStmtImported((prev) => ({ ...prev, [targetAccount]: [...(prev[targetAccount] || []), ...newSignatures] }));
+    }
+    setAutoCount(auto);
+    setSavedCount(0);
+    setSkippedCount(0);
+    setQueue(toReview);
+    setQIndex(0);
+    if (toReview.length === 0) {
+      setStep("done");
+    } else {
+      loadIntoEditor(toReview[0]);
+      setStep("review");
+    }
+  }
+
+  const pageTextNow = accounts[targetAccount]?.[targetMonth] ?? "";
+  const categoryChoices = useMemo(() => categoryOptionsFor(pageTextNow), [pageTextNow]);
+  const wantedSign = eType === "credit" ? "+" : "-";
+  const matchingCategories = categoryChoices.filter((c) => c.sign === wantedSign);
+  const currentCatSubs = matchingCategories.find((c) => normLabel(c.title) === normLabel(eCategory))?.subs || [];
+
+  function pickNewCategory() {
+    askPrompt("New category name:", "", (name) => {
+      if (name && name.trim()) {
+        setECategory(name.trim());
+        setESub("");
+      }
+    });
+  }
+  function pickNewSub() {
+    askPrompt("New subcategory name:", "", (name) => setESub((name || "").trim()));
+  }
+
+  function advance() {
+    const next = qIndex + 1;
+    if (next >= queue.length) setStep("done");
+    else {
+      setQIndex(next);
+      loadIntoEditor(queue[next]);
+    }
+  }
+
+  function saveCurrentAndAdvance(remember) {
+    if (!eCategory.trim()) {
+      showAlert("Pick or create a category first.");
+      return;
+    }
+    const amt = parseFloat(eAmount);
+    if (isNaN(amt) || amt <= 0) {
+      showAlert("Enter a valid amount.");
+      return;
+    }
+    const t = queue[qIndex];
+    const label = (eDate && dayLabelFromISO(eDate)) || eDesc.slice(0, 20) || "Entry";
+    const newText = insertLedgerEntry(pageTextNow, {
+      categoryTitle: eCategory.trim(),
+      sign: wantedSign,
+      subTitle: eSub.trim(),
+      label,
+      amount: amt,
+    });
+    setAccounts((prev) => ({ ...prev, [targetAccount]: { ...prev[targetAccount], [targetMonth]: newText } }));
+    setStmtImported((prev) => ({ ...prev, [targetAccount]: [...(prev[targetAccount] || []), t.signature] }));
+    if (remember) {
+      setStmtCatMap((prev) => ({
+        ...prev,
+        [targetAccount]: {
+          ...(prev[targetAccount] || {}),
+          [normalizeDesc(t.description)]: { category: eCategory.trim(), sign: wantedSign, sub: eSub.trim() },
+        },
+      }));
+    }
+    setSavedCount((c) => c + 1);
+    advance();
+  }
+
+  function skipCurrent() {
+    setSkippedCount((c) => c + 1);
+    advance();
+  }
+
+  return (
+    <div className="flex-1 overflow-y-auto">
+      {step === "pick" && (
+        <div className="p-4 flex flex-col gap-3">
+          <p className="font-mono text-xs text-zinc-400 leading-relaxed">
+            Upload a bank statement PDF (password-protected is fine). This is a best-effort generic reader — every
+            bank formats statements differently, so you'll confirm or fix each transaction before it's added.
+          </p>
+          {errorMsg && <div className="font-mono text-xs text-rose-400">{errorMsg}</div>}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/pdf"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              e.target.value = "";
+              if (f) handleFile(f);
+            }}
+          />
+          <button
+            onClick={() => fileInputRef.current.click()}
+            className="flex items-center justify-center gap-2 py-3 rounded-lg bg-teal-700 hover:bg-teal-600 font-mono text-sm text-white"
+          >
+            <FileText size={16} /> Choose PDF statement
+          </button>
+        </div>
+      )}
+
+      {step === "opening" && (
+        <div className="flex flex-col items-center justify-center gap-3 text-zinc-400 py-16">
+          <Loader2 className="animate-spin" size={22} />
+          <span className="font-mono text-xs">Opening statement…</span>
+        </div>
+      )}
+
+      {step === "account" && meta && (
+        <div className="p-4 flex flex-col gap-1">
+          <div className="font-mono text-xs text-zinc-400 leading-relaxed mb-2">
+            Detected <span className="text-zinc-200">{meta.bankName}</span>
+            {meta.tail && <> · account ending {meta.tail}</>} · {meta.rawTxns.length} row(s) found.
+          </div>
+          <label className={stmtLabelCls}>Import into account</label>
+          <select value={targetAccount} onChange={(e) => setTargetAccount(e.target.value)} className={stmtInputCls}>
+            {Object.keys(accounts).map((n) => (
+              <option key={n} value={n}>
+                {n}
+              </option>
+            ))}
+          </select>
+          <label className={stmtLabelCls}>Statement month</label>
+          <div className="flex items-center gap-2 py-1">
+            <button onClick={() => setTargetMonth((m) => addMonths(m, -1))} className="p-1.5 text-zinc-400 hover:text-white">
+              <ChevronLeft size={16} />
+            </button>
+            <span className="font-mono text-sm text-zinc-100 w-24 text-center">{monthLabel(targetMonth)}</span>
+            <button onClick={() => setTargetMonth((m) => addMonths(m, 1))} className="p-1.5 text-zinc-400 hover:text-white">
+              <ChevronRight size={16} />
+            </button>
+          </div>
+          <button onClick={startReview} className="mt-4 py-3 rounded-lg bg-teal-700 hover:bg-teal-600 font-mono text-sm text-white">
+            Continue
+          </button>
+        </div>
+      )}
+
+      {step === "review" && queue[qIndex] && (
+        <div className="p-4 flex flex-col gap-1">
+          <div className="font-mono text-[11px] text-zinc-500 mb-1">
+            {qIndex + 1} of {queue.length}
+            {autoCount > 0 && <> · {autoCount} auto-categorized</>}
+            {dupCount > 0 && <> · {dupCount} already entered</>}
+          </div>
+          <div className="font-mono text-[11px] text-zinc-600 truncate mb-2">{queue[qIndex].raw}</div>
+
+          <label className={stmtLabelCls}>Date</label>
+          <input type="date" value={eDate} onChange={(e) => setEDate(e.target.value)} className={stmtInputCls} />
+
+          <label className={stmtLabelCls}>Description</label>
+          <input type="text" value={eDesc} onChange={(e) => setEDesc(e.target.value)} className={stmtInputCls} />
+
+          <label className={stmtLabelCls}>Amount</label>
+          <input type="number" inputMode="decimal" value={eAmount} onChange={(e) => setEAmount(e.target.value)} className={stmtInputCls} />
+
+          <div className="flex gap-2 mt-2">
+            <button
+              onClick={() => {
+                setEType("debit");
+                setECategory("");
+                setESub("");
+              }}
+              className={"flex-1 py-2 rounded-lg font-mono text-xs " + (eType === "debit" ? "bg-rose-800/60 text-rose-200" : "bg-zinc-800 text-zinc-400")}
+            >
+              Money out
+            </button>
+            <button
+              onClick={() => {
+                setEType("credit");
+                setECategory("");
+                setESub("");
+              }}
+              className={"flex-1 py-2 rounded-lg font-mono text-xs " + (eType === "credit" ? "bg-emerald-800/60 text-emerald-200" : "bg-zinc-800 text-zinc-400")}
+            >
+              Money in
+            </button>
+          </div>
+
+          <label className={stmtLabelCls}>Category</label>
+          <select
+            value={eCategory}
+            onChange={(e) => {
+              if (e.target.value === "__new__") pickNewCategory();
+              else {
+                setECategory(e.target.value);
+                setESub("");
+              }
+            }}
+            className={stmtInputCls}
+          >
+            <option value="">Select…</option>
+            {matchingCategories.map((c) => (
+              <option key={c.title} value={c.title}>
+                {c.title}
+              </option>
+            ))}
+            {eCategory && !matchingCategories.some((c) => normLabel(c.title) === normLabel(eCategory)) && (
+              <option value={eCategory}>{eCategory} (new)</option>
+            )}
+            <option value="__new__">+ New category…</option>
+          </select>
+
+          <label className={stmtLabelCls}>Subcategory (optional)</label>
+          <select
+            value={eSub}
+            onChange={(e) => {
+              if (e.target.value === "__new__") pickNewSub();
+              else setESub(e.target.value);
+            }}
+            className={stmtInputCls}
+          >
+            <option value="">None</option>
+            {currentCatSubs.map((s) => (
+              <option key={s} value={s}>
+                {s}
+              </option>
+            ))}
+            {eSub && !currentCatSubs.includes(eSub) && <option value={eSub}>{eSub} (new)</option>}
+            <option value="__new__">+ New subcategory…</option>
+          </select>
+
+          <div className="flex gap-2 mt-4">
+            <button onClick={skipCurrent} className="flex-1 py-3 rounded-lg bg-zinc-800 hover:bg-zinc-700 font-mono text-sm text-zinc-300 flex items-center justify-center gap-1.5">
+              <SkipForward size={15} /> Skip
+            </button>
+            <button
+              onClick={() => saveCurrentAndAdvance(false)}
+              className="flex-1 py-3 rounded-lg bg-teal-700 hover:bg-teal-600 font-mono text-sm text-white flex items-center justify-center gap-1.5"
+            >
+              <Check size={15} /> Save
+            </button>
+          </div>
+          <button onClick={() => saveCurrentAndAdvance(true)} className="mt-2 font-mono text-[11px] text-zinc-500 underline text-center">
+            Save &amp; auto-apply to future matches of this description
+          </button>
+        </div>
+      )}
+
+      {step === "done" && (
+        <div className="p-4 flex flex-col gap-2 items-center text-center py-16">
+          <Check size={28} className="text-teal-500" />
+          <div className="font-mono text-sm text-zinc-100">Import complete</div>
+          <div className="font-mono text-xs text-zinc-400 max-w-xs leading-relaxed">
+            {savedCount + autoCount} entered ({autoCount} auto-categorized, {savedCount} reviewed) · {dupCount} already entered before, skipped · {skippedCount} skipped by you.
+          </div>
+          <button onClick={onClose} className="mt-4 py-2.5 px-6 rounded-lg bg-teal-700 hover:bg-teal-600 font-mono text-sm text-white">
+            Done
+          </button>
+        </div>
+      )}
     </div>
   );
 }
