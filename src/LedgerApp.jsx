@@ -911,7 +911,7 @@ const AMOUNT_TOKEN_RE = /\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?/g;
 // pattern first lets a reference number sitting *inside* the narration text
 // be told apart from the actual amount, instead of being mistaken for it
 // and truncating the description right before the payee's name.
-const DECIMAL_AMOUNT_RE = /\d{1,3}(?:,\d{3})+\.\d{1,2}\b|\d+\.\d{1,2}\b/g;
+const DECIMAL_AMOUNT_RE = /\d{1,3}(?:,\d{3})+\.\d{1,2}(?!\d)|\d+\.\d{1,2}(?!\d)/g;
 
 // A statement's narration/remarks column often wraps onto extra visual rows
 // below the date+amount row (reconstructLines gives us one flat line per
@@ -1041,6 +1041,22 @@ function parseNarration(text) {
 // line — continuation lines never contain either, and folding them in
 // before this point would risk a stray RRN or pincode from a wrapped line
 // being misread as the amount.
+// Detects a Cr/Dr marker sitting right next to one specific amount match --
+// glued directly onto the digits ("500.00Cr"), space-separated
+// ("500.00 Cr"), or bracketed ("(500.00 Cr)" / "500.00(Cr)"). This has to be
+// checked relative to the amount's own position rather than scanned for
+// generically in the row text: a plain /\bcr\b/ regex requires a
+// word/non-word boundary before "c", but a digit and a letter are BOTH word
+// characters, so there is no boundary at all between "0" and "C" in
+// "500.00Cr" -- that glued form silently never matched before.
+function markerNear(text, start, end) {
+  const after = text.slice(end).match(/^[\s)]{0,3}(cr|dr)\b/i);
+  if (after) return after[1].toLowerCase();
+  const before = text.slice(Math.max(0, start - 4), start).match(/(cr|dr)[\s(]{0,3}$/i);
+  if (before) return before[1].toLowerCase();
+  return null;
+}
+
 function parseTransactionRow(row) {
   const group = typeof row === "string" ? { head: row, extra: "" } : row;
   const line = group.head.trim();
@@ -1052,15 +1068,72 @@ function parseTransactionRow(row) {
   let amountMatches = [...rest.matchAll(DECIMAL_AMOUNT_RE)];
   if (amountMatches.length === 0) amountMatches = [...rest.matchAll(AMOUNT_TOKEN_RE)];
   if (amountMatches.length === 0) return null;
-  const amounts = amountMatches.map((mm) => parseFloat(mm[0].replace(/,/g, ""))).filter((n) => !isNaN(n));
+  const parsedAmounts = amountMatches
+    .map((mm) => ({
+      value: parseFloat(mm[0].replace(/,/g, "")),
+      start: mm.index,
+      end: mm.index + mm[0].length,
+      marker: markerNear(rest, mm.index, mm.index + mm[0].length),
+    }))
+    .filter((a) => !isNaN(a.value));
+  if (parsedAmounts.length === 0) return null;
   const narrationHead = rest.slice(0, amountMatches[0].index).replace(/[|,\-\s]+$/, "").trim();
   const rawNarration = [narrationHead, group.extra].filter(Boolean).join(" ").trim();
-  const balance = amounts.length >= 2 ? amounts[amounts.length - 1] : null;
-  const amount = amounts.length >= 2 ? amounts[amounts.length - 2] : amounts[0];
   const fullRow = group.extra ? `${line} ${group.extra}` : line;
+
+  let amount, balance;
+  let columnType = "unknown";
+  if (parsedAmounts.length >= 3) {
+    // Separate Debit / Credit columns: many statements print "0.00" in
+    // whichever of the two columns doesn't apply instead of leaving it
+    // blank, so a row like this carries three numbers -- debit, credit,
+    // balance -- not the two (amount, balance) a straight last-two-numbers
+    // read assumes. The nonzero one of the first two columns is the real
+    // amount. Which column it sits in is only a GUESS at debit vs credit
+    // (it assumes debit-before-credit column order, which not every bank
+    // follows) -- so it's kept separate from `type` below and only used if
+    // nothing more reliable (an actual Cr/Dr marker in the text) is found.
+    const [col1, col2] = parsedAmounts;
+    balance = parsedAmounts[parsedAmounts.length - 1].value;
+    if (col1.value > 0) {
+      amount = col1.value;
+      columnType = "debit";
+    } else if (col2.value > 0) {
+      amount = col2.value;
+      columnType = "credit";
+    } else {
+      amount = 0;
+    }
+  } else if (parsedAmounts.length === 2) {
+    amount = parsedAmounts[0].value;
+    balance = parsedAmounts[1].value;
+  } else {
+    amount = parsedAmounts[0].value;
+    balance = null;
+  }
+
+  // Type priority: (1) a Cr/Dr marker glued or bracketed onto one specific
+  // amount -- the most direct evidence; (2) an explicit Cr/Dr or
+  // credited/debited word anywhere in the row's text -- still direct
+  // evidence, just not tied to one amount's exact position (this is what
+  // catches a marker like "DR" sitting mid-narration, e.g.
+  // "UPIAR/.../DR/PAYEE NAME/...", far from the amount digits); (3) the
+  // debit/credit COLUMN GUESS from above, only as a last resort, since it's
+  // an assumption rather than something the statement actually says;
+  // (4) unknown, left for the balance-comparison fallback in
+  // resolveTransactionSigns.
   let type = "unknown";
-  if (/\bcr\b|credit(ed)?\b/i.test(fullRow)) type = "credit";
-  else if (/\bdr\b|debit(ed)?\b/i.test(fullRow)) type = "debit";
+  for (const a of parsedAmounts) {
+    if (a.marker) {
+      type = a.marker === "cr" ? "credit" : "debit";
+      break;
+    }
+  }
+  if (type === "unknown") {
+    if (/\bcr\b|credit(ed)?\b/i.test(fullRow)) type = "credit";
+    else if (/\bdr\b|debit(ed)?\b/i.test(fullRow)) type = "debit";
+  }
+  if (type === "unknown" && columnType !== "unknown") type = columnType;
   const n = parseNarration(rawNarration);
   const description = n.name || (n.channel !== "Other" ? `${n.channel} transaction` : narrationHead) || "(no description)";
   return {
