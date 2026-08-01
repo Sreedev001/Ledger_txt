@@ -1057,13 +1057,14 @@ function parseTransactionRow(row) {
   const rawNarration = [narrationHead, group.extra].filter(Boolean).join(" ").trim();
   const balance = amounts.length >= 2 ? amounts[amounts.length - 1] : null;
   const amount = amounts.length >= 2 ? amounts[amounts.length - 2] : amounts[0];
+  const fullRow = group.extra ? `${line} ${group.extra}` : line;
   let type = "unknown";
-  if (/\bcr\b|credit(ed)?\b/i.test(line)) type = "credit";
-  else if (/\bdr\b|debit(ed)?\b/i.test(line)) type = "debit";
+  if (/\bcr\b|credit(ed)?\b/i.test(fullRow)) type = "credit";
+  else if (/\bdr\b|debit(ed)?\b/i.test(fullRow)) type = "debit";
   const n = parseNarration(rawNarration);
   const description = n.name || (n.channel !== "Other" ? `${n.channel} transaction` : narrationHead) || "(no description)";
   return {
-    raw: group.extra ? `${line} ${group.extra}` : line,
+    raw: fullRow,
     dateISO,
     description,
     channel: n.channel,
