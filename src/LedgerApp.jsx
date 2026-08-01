@@ -813,7 +813,13 @@ function normalizeDesc(s) {
 // category/label — two statements covering an overlapping date range should
 // recognize the same real-world transaction as "already entered" even if it
 // gets categorized identically both times.
-function txnSignature(dateISO, amount, description) {
+function txnSignature(dateISO, amount, description, refNumber) {
+  // A UPI/IMPS RRN or NEFT/RTGS UTR uniquely identifies the real-world
+  // transaction regardless of how the description gets cleaned up or
+  // re-worded on re-parse, so it's the preferred key when we have one.
+  // Falls back to the old date+amount+description key for rows with no
+  // extractable reference (cash, cheque, generic bank fees, etc.).
+  if (refNumber) return `ref:${refNumber}`;
   return `${dateISO || "?"}|${formatNum(amount)}|${normalizeDesc(description)}`;
 }
 
@@ -826,7 +832,7 @@ function dedupeTransactions(candidates, importedSignatures) {
   const fresh = [];
   const skipped = [];
   for (const c of candidates) {
-    const sig = txnSignature(c.dateISO, c.amount, c.description);
+    const sig = txnSignature(c.dateISO, c.amount, c.description, c.refNumber);
     if (seen.has(sig)) skipped.push(c);
     else fresh.push({ ...c, signature: sig });
   }
@@ -899,35 +905,184 @@ const DATE_TOKEN_RE = /\b(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[\/\-. ][A-Za-z]{3,9}[\/\
 // form second — matching plain digits first would wrongly cap an
 // unformatted 4+-digit amount like "9550.00" at 3 digits ("955" + "0.00").
 const AMOUNT_TOKEN_RE = /\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?/g;
+// Same shape, but the decimal (paise) part is mandatory. Real amount/balance
+// columns are formatted with two decimals; a UPI RRN, NEFT/RTGS UTR, or
+// account number embedded in the narration never has one — so trying this
+// pattern first lets a reference number sitting *inside* the narration text
+// be told apart from the actual amount, instead of being mistaken for it
+// and truncating the description right before the payee's name.
+const DECIMAL_AMOUNT_RE = /\d{1,3}(?:,\d{3})+\.\d{1,2}\b|\d+\.\d{1,2}\b/g;
 
-// Turns one visually-reconstructed statement row into a transaction
-// candidate, or null if the row doesn't look like a transaction at all
-// (headers, footers, disclaimers, etc. — anything with no leading date).
-function parseTransactionRow(raw) {
-  const line = raw.trim();
+// A statement's narration/remarks column often wraps onto extra visual rows
+// below the date+amount row (reconstructLines gives us one flat line per
+// y-band, so a wrapped narration becomes several separate lines with no
+// date or amount of their own). Left alone, those wrapped lines were being
+// silently dropped, which is why the raw UPI reference/RRN — the one token
+// that reliably lands on the *first* line — was ending up as the whole
+// "description" instead of the payee name that follows it.
+//
+// This groups every non-date line onto the most recent date-line as extra
+// narration text, stopping at the next date-line or at obvious non-table
+// boilerplate (page footers, IFSC/branch blurbs, etc.), and capped at a few
+// lines so a page's trailing disclaimer paragraph can't get vacuumed in.
+const STATEMENT_BOUNDARY_RE = /^\s*(page \d|statement of|generated on|this is a computer|ifsc|micr|branch|nomination|customer id|toll[- ]free|for any query|note\s*:|disclaimer|terms? (and|&) conditions)/i;
+function groupStatementLines(lines) {
+  const groups = [];
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    const dateM = line.match(DATE_TOKEN_RE);
+    if (dateM && dateM.index <= 6) {
+      groups.push({ head: line, cont: [] });
+      continue;
+    }
+    const g = groups[groups.length - 1];
+    if (g && g.cont.length < 5 && !STATEMENT_BOUNDARY_RE.test(line)) g.cont.push(line);
+  }
+  return groups.map((g) => ({ head: g.head, extra: g.cont.join(" ") }));
+}
+
+// Common Indian bank IFSC prefixes, used only to recognize "this token is a
+// bank code, not part of the payee's name" while cleaning up a narration.
+const BANK_CODE_RE = /\b(SBIN|HDFC|ICIC|UTIB|PUNB|IOBA|SIBL|CNRB|BARB|IDIB|KKBK|YESB|INDB|IBKL|UBIN|MAHB|ANDB|CBIN|ORBC|AXIS|IDFB|RATN|FDRL|PSIB|SCBL|BKID|VIJB|DBSS|HSBC|CITI|KVBL|TMBL|SIBL|DLXB)\b/g;
+// Channel/direction/boilerplate tokens that show up inside UPI (NPCI-
+// standardized) and other rail narrations but aren't part of anyone's name.
+const NARRATION_STOPWORD_RE = /\b(UPI[A-Z]{0,4}|NEFT|RTGS|IMPS|NACH|TRTR|POS|ATM|ECOM|WDL|CHQ|CHEQUE|INT|DEP|TFR|CR|DR|CREDIT|DEBIT|AT|TO|FROM|REF|TXN|TRANSACTION|PVT|LTD)\b/gi;
+
+// Best-effort transaction channel, from the most specific rail mentioned in
+// the narration. Order matters: UPI/IMPS/NEFT/RTGS/NACH are checked before
+// the generic "TRTR/transfer" catch-all, since a UPI credit's narration
+// commonly also happens to contain a generic transfer marker.
+function detectChannel(text) {
+  if (/\bupi[a-z]{0,4}\b/i.test(text)) return "UPI"; // covers bank-specific prefixes like UPIAB (Union Bank)
+  if (/\bimps\b/i.test(text)) return "IMPS";
+  if (/\bneft\b/i.test(text)) return "NEFT";
+  if (/\brtgs\b/i.test(text)) return "RTGS";
+  if (/\bnach\b/i.test(text)) return "NACH";
+  if (/\batm\b|\bwdl\b|cash\s*wdl/i.test(text)) return "ATM";
+  if (/\becom\b/i.test(text)) return "Card (online)";
+  if (/\bpos\b/i.test(text)) return "Card (POS)";
+  if (/\bch(q|eque)\b/i.test(text)) return "Cheque";
+  if (/\bint\.?\b|\binterest\b/i.test(text)) return "Interest";
+  if (/\btrtr\b|\btfr\b|\btransfer\b/i.test(text)) return "Transfer";
+  return "Other";
+}
+
+// UPI/IMPS RRNs are a bare 10-12 digit run; NEFT/RTGS UTRs are a bank-code
+// prefix followed by digits. Tried in that order since it's the more
+// common case in a personal statement.
+function extractRefNumber(text) {
+  const m = text.match(/\b\d{10,12}\b/);
+  if (m) return m[0];
+  const m2 = text.match(/\b[A-Z]{4}\d{10,18}\b/);
+  return m2 ? m2[0] : null;
+}
+
+// A genuine HH:MM(:SS) timestamp, if the bank includes one in the
+// narration — deliberately requires a colon so a pincode or account-number
+// fragment (all digits, no colon) can never be mistaken for a time.
+function extractTime(text) {
+  const m = text.match(/\b([01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?\b/);
+  return m ? m[0] : null;
+}
+
+function titleCaseWords(s) {
+  return s.replace(/\S+/g, (w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
+}
+
+// Fallback name source when nothing else survives cleanup: derive a name
+// from the VPA's username portion (before "@"), e.g. "aromal002-1@ok" ->
+// "Aromal".
+function nameFromVpa(vpa) {
+  const user = (vpa.split("@")[0] || "").replace(/[._-]+/g, " ").replace(/\d+/g, " ").replace(/\s+/g, " ").trim();
+  return user ? titleCaseWords(user) : "";
+}
+
+// Strips every recognized non-name token (channel/direction keywords, bank
+// codes, VPA, RRN/UTR/account-number-length digit runs, slashes) out of a
+// narration and returns whatever's left as a best-effort payee/remitter
+// name — this is the piece that turns "UPI/CR/645752269489/AROMAL A/SIBL/
+// aromal002-1@ok" into "Aromal A" instead of the raw reference number.
+function extractCounterpartyName(text) {
+  const vpaMatch = text.match(/[\w.\-]+@[\w]+/);
+  let cleaned = text
+    .replace(NARRATION_STOPWORD_RE, " ")
+    .replace(BANK_CODE_RE, " ")
+    .replace(/[\w.\-]+@[\w]+/g, " ") // strip VPA
+    .replace(/\b[A-Za-z]{2,6}\d{4,}\b/g, " ") // strip bank-code+digits UTR tokens, e.g. SBIN0001234
+    .replace(/\b\d{5,}\b/g, " ") // strip RRN/UTR/account-number/pincode-length runs
+    .replace(/[\/|\-]+/g, " ") // slash/pipe/hyphen are field delimiters, not part of a name
+    .replace(/\s+/g, " ")
+    .trim();
+  cleaned = cleaned.replace(/\d+/g, "").replace(/\s+/g, " ").trim(); // drop remaining stray short digits
+  if (cleaned && /[A-Za-z]/.test(cleaned)) {
+    const words = cleaned.split(" ").filter(Boolean).slice(0, 3);
+    if (words.length) return titleCaseWords(words.join(" "));
+  }
+  return vpaMatch ? nameFromVpa(vpaMatch[0]) : "";
+}
+
+// Turns a raw narration string into a clean, human-readable summary: which
+// rail it went over, who the counterparty looks like, and the reference
+// number / time if the statement includes them. Best-effort by nature (see
+// section header) — this is what feeds the review step, not what gets
+// trusted blindly.
+function parseNarration(text) {
+  const t = (text || "").trim();
+  if (!t) return { channel: "Other", name: "", refNumber: null, time: null };
+  return { channel: detectChannel(t), name: extractCounterpartyName(t), refNumber: extractRefNumber(t), time: extractTime(t) };
+}
+
+// Turns one visually-reconstructed statement row (already grouped with any
+// wrapped narration continuation lines via groupStatementLines) into a
+// transaction candidate, or null if the row doesn't look like a transaction
+// at all (headers, footers, disclaimers, etc. — anything with no leading
+// date). The date and amount are read only from the row's first physical
+// line — continuation lines never contain either, and folding them in
+// before this point would risk a stray RRN or pincode from a wrapped line
+// being misread as the amount.
+function parseTransactionRow(row) {
+  const group = typeof row === "string" ? { head: row, extra: "" } : row;
+  const line = group.head.trim();
   const dateM = line.match(DATE_TOKEN_RE);
   if (!dateM || dateM.index > 6) return null; // real rows start with the date
   const dateISO = parseDateToken(dateM[1]);
   if (!dateISO) return null;
   const rest = line.slice(dateM.index + dateM[0].length);
-  const amountMatches = [...rest.matchAll(AMOUNT_TOKEN_RE)];
+  let amountMatches = [...rest.matchAll(DECIMAL_AMOUNT_RE)];
+  if (amountMatches.length === 0) amountMatches = [...rest.matchAll(AMOUNT_TOKEN_RE)];
   if (amountMatches.length === 0) return null;
   const amounts = amountMatches.map((mm) => parseFloat(mm[0].replace(/,/g, ""))).filter((n) => !isNaN(n));
-  const description = rest.slice(0, amountMatches[0].index).replace(/[|,\-\s]+$/, "").trim();
+  const narrationHead = rest.slice(0, amountMatches[0].index).replace(/[|,\-\s]+$/, "").trim();
+  const rawNarration = [narrationHead, group.extra].filter(Boolean).join(" ").trim();
   const balance = amounts.length >= 2 ? amounts[amounts.length - 1] : null;
   const amount = amounts.length >= 2 ? amounts[amounts.length - 2] : amounts[0];
   let type = "unknown";
   if (/\bcr\b|credit(ed)?\b/i.test(line)) type = "credit";
   else if (/\bdr\b|debit(ed)?\b/i.test(line)) type = "debit";
-  return { raw: line, dateISO, description: description || "(no description)", amount, balance, guessedType: type };
+  const n = parseNarration(rawNarration);
+  const description = n.name || (n.channel !== "Other" ? `${n.channel} transaction` : narrationHead) || "(no description)";
+  return {
+    raw: group.extra ? `${line} ${group.extra}` : line,
+    dateISO,
+    description,
+    channel: n.channel,
+    refNumber: n.refNumber,
+    time: n.time,
+    rawNarration,
+    amount,
+    balance,
+    guessedType: type,
+  };
 }
 
-// Runs parseTransactionRow over every reconstructed line of the statement
-// and keeps only the rows that parsed as a plausible transaction.
+// Groups the reconstructed PDF lines (joining wrapped narration onto its
+// row) and runs parseTransactionRow over each group, keeping only the ones
+// that parsed as a plausible transaction.
 function parseTransactions(lines) {
   const out = [];
-  for (const l of lines) {
-    const t = parseTransactionRow(l);
+  for (const g of groupStatementLines(lines)) {
+    const t = parseTransactionRow(g);
     if (t) out.push(t);
   }
   return out;
@@ -2887,6 +3042,13 @@ function ImportStatementView({
             {autoCount > 0 && <> · {autoCount} auto-categorized</>}
             {dupCount > 0 && <> · {dupCount} already entered</>}
           </div>
+          {(queue[qIndex].channel || queue[qIndex].time || queue[qIndex].refNumber) && (
+            <div className="font-mono text-[10px] text-teal-500 mb-1 flex flex-wrap gap-x-2">
+              {queue[qIndex].channel && <span>{queue[qIndex].channel}</span>}
+              {queue[qIndex].time && <span>· {queue[qIndex].time}</span>}
+              {queue[qIndex].refNumber && <span>· ref {queue[qIndex].refNumber}</span>}
+            </div>
+          )}
           <div className="font-mono text-[11px] text-zinc-600 truncate mb-2">{queue[qIndex].raw}</div>
 
           <label className={stmtLabelCls}>Date</label>
