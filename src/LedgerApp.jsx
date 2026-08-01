@@ -972,7 +972,11 @@ function groupStatementLines(lines) {
 
 // Common Indian bank IFSC prefixes, used only to recognize "this token is a
 // bank code, not part of the payee's name" while cleaning up a narration.
-const BANK_CODE_RE = /\b(SBIN|HDFC|ICIC|UTIB|PUNB|IOBA|SIBL|CNRB|BARB|IDIB|KKBK|YESB|INDB|IBKL|UBIN|MAHB|ANDB|CBIN|ORBC|AXIS|IDFB|RATN|FDRL|PSIB|SCBL|BKID|VIJB|DBSS|HSBC|CITI|KVBL|TMBL|SIBL|DLXB)\b/g;
+// Kept as a plain list (not just baked into the regex) so extractRemark
+// below can reuse it in its own non-global regex without sharing
+// BANK_CODE_RE's lastIndex state.
+const BANK_CODE_LIST = "SBIN|HDFC|ICIC|UTIB|PUNB|IOBA|SIBL|CNRB|BARB|IDIB|KKBK|YESB|INDB|IBKL|UBIN|MAHB|ANDB|CBIN|ORBC|AXIS|IDFB|RATN|FDRL|PSIB|SCBL|BKID|VIJB|DBSS|HSBC|CITI|KVBL|TMBL|SIBL|DLXB";
+const BANK_CODE_RE = new RegExp(`\\b(${BANK_CODE_LIST})\\b`, "g");
 // Channel/direction/boilerplate tokens that show up inside UPI (NPCI-
 // standardized) and other rail narrations but aren't part of anyone's name.
 const NARRATION_STOPWORD_RE = /\b(UPI[A-Z]{0,4}|NEFT|RTGS|IMPS|NACH|TRTR|POS|ATM|ECOM|WDL|CHQ|CHEQUE|INT|DEP|TFR|CR|DR|CREDIT|DEBIT|AT|TO|FROM|REF|TXN|TRANSACTION|PVT|LTD)\b/gi;
@@ -1050,15 +1054,49 @@ function extractCounterpartyName(text) {
   return vpaMatch ? nameFromVpa(vpaMatch[0]) : "";
 }
 
+// A UPI payment can carry an optional payer-typed note (the "Add a note" /
+// "remark" field in apps like GPay/PhonePe). Per NPCI's UPI narration
+// standard this rides as the LAST slash-delimited field:
+// Product/RRN/CR|DR/Name/BankIFSC/VPA-or-account/Remarks — field order and
+// count vary a little by bank, but the remark, when present, is reliably
+// whatever's left after the last recognized code/name field. UPI-only:
+// NEFT/IMPS/RTGS narrations don't carry a comparable user-entered field, so
+// there's nothing to extract there and false-positives (e.g. a trailing
+// branch code) would be more likely than a real remark.
+// Deliberately conservative: only returned when the trailing field is
+// genuine free text — not a VPA, bank code, bare digit run, or one of the
+// same channel/direction stopwords parseNarration's other fields already
+// account for — since guessing wrong here would show the user a fake note.
+const REMARK_STOPWORD_RE = /^(upi[a-z]{0,4}|neft|rtgs|imps|nach|trtr|pos|atm|ecom|wdl|chq|cheque|int|dep|tfr|cr|dr|credit|debit|ref|txn|transaction|pvt|ltd)$/i;
+const BARE_BANK_CODE_RE = new RegExp(`^(${BANK_CODE_LIST})$`, "i");
+function extractRemark(text, channel) {
+  if (channel !== "UPI") return null;
+  const parts = text.split("/").map((p) => p.trim()).filter(Boolean);
+  if (parts.length < 5) return null; // too few fields for a genuine trailing remark to exist
+  const last = parts[parts.length - 1];
+  if (!last || !/[A-Za-z]/.test(last)) return null; // pure digits/punctuation, not a remark
+  if (/[\w.\-]+@[\w]+/.test(last)) return null; // a VPA, not a remark
+  if (BARE_BANK_CODE_RE.test(last.replace(/\s+/g, ""))) return null;
+  if (/^[A-Za-z]{2,6}\d{4,}$/.test(last.replace(/\s+/g, ""))) return null; // bank-code+digits UTR token
+  if (REMARK_STOPWORD_RE.test(last.trim())) return null;
+  return last.replace(/\s+/g, " ").trim();
+}
+
 // Turns a raw narration string into a clean, human-readable summary: which
-// rail it went over, who the counterparty looks like, and the reference
-// number / time if the statement includes them. Best-effort by nature (see
-// section header) — this is what feeds the review step, not what gets
-// trusted blindly.
+// rail it went over, who the counterparty looks like, the reference
+// number / time if the statement includes them, and the payer's remark if
+// present. Best-effort by nature (see section header) — this is what feeds
+// the review step, not what gets trusted blindly.
 function parseNarration(text) {
   const t = (text || "").trim();
-  if (!t) return { channel: "Other", name: "", refNumber: null, time: null };
-  return { channel: detectChannel(t), name: extractCounterpartyName(t), refNumber: extractRefNumber(t), time: extractTime(t) };
+  if (!t) return { channel: "Other", name: "", refNumber: null, time: null, remark: null };
+  const channel = detectChannel(t);
+  const remark = extractRemark(t, channel);
+  // Exclude the trailing remark field from the text handed to name
+  // extraction — otherwise free-text remark words (e.g. "For lunch") bleed
+  // into the counterparty name the same way an unstripped bank code would.
+  const nameSource = remark && t.endsWith(remark) ? t.slice(0, t.length - remark.length) : t;
+  return { channel, name: extractCounterpartyName(nameSource), refNumber: extractRefNumber(t), time: extractTime(t), remark };
 }
 
 // Turns one visually-reconstructed statement row (already grouped with any
@@ -1167,6 +1205,7 @@ function parseTransactionRow(row) {
     channel: n.channel,
     refNumber: n.refNumber,
     time: n.time,
+    remark: n.remark,
     rawNarration,
     amount,
     balance,
@@ -1195,6 +1234,63 @@ function parseTransactions(lines) {
 // in case a future signal genuinely needs cross-row context.)
 function resolveTransactionSigns(transactions) {
   return transactions;
+}
+
+// Best-effort account holder / statement addressee name. Searches only the
+// header block — everything before the transaction table starts, same
+// boundary guessBankName uses — so a counterparty's name sitting inside a
+// narration row can never be mistaken for the statement owner's own name.
+// Tries an explicit label first ("Name:", "Account Holder:", "Customer
+// Name:"), then a "Mr./Mrs./Shri <name>" style salutation line, since not
+// every bank's PDF layout uses a labelled field.
+function guessAccountHolderName(fullText) {
+  const lines = fullText.split("\n").map((l) => l.trim()).filter(Boolean);
+  let headerEndIdx = lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(DATE_TOKEN_RE);
+    if (m && m.index <= 6) {
+      headerEndIdx = i;
+      break;
+    }
+  }
+  const header = lines.slice(0, headerEndIdx);
+  for (const line of header) {
+    const m = line.match(/(?:account\s*holder(?:'?s)?\s*name|holder\s*name|customer\s*name|name)\s*[:\-]\s*(.+)/i);
+    if (m) {
+      const val = m[1].replace(/\s{2,}/g, " ").trim();
+      if (val && /[A-Za-z]/.test(val) && val.length <= 60) return titleCaseWords(val);
+    }
+  }
+  for (const line of header) {
+    const m = line.match(/^(?:mr|mrs|ms|miss|shri|smt|m\/s)\.?\s+([A-Za-z][A-Za-z .]{2,50})$/i);
+    if (m) return titleCaseWords(m[1].trim());
+  }
+  return "";
+}
+
+// Statement period, read directly off the FIRST and LAST transaction rows
+// (in the order they appear in the extracted PDF text), per the user's own
+// request — more direct evidence of what the statement actually covers than
+// a "Period:" header line, which not every bank prints. Guards against a
+// statement that lists newest-first by sorting the two endpoints, so
+// startISO/endISO always come out chronological regardless of print order.
+// Also returns every monthKey the period spans (usually one, but a
+// mid-cycle statement can straddle two), capped at 24 to guard against a
+// parsing fluke producing a wild date range.
+function guessStatementPeriod(transactions) {
+  const dated = transactions.filter((t) => t.dateISO);
+  if (!dated.length) return null;
+  const first = dated[0].dateISO;
+  const last = dated[dated.length - 1].dateISO;
+  const [startISO, endISO] = first <= last ? [first, last] : [last, first];
+  const monthKeys = [];
+  let cur = startISO.slice(0, 7);
+  const endKey = endISO.slice(0, 7);
+  while (cur <= endKey && monthKeys.length < 24) {
+    monthKeys.push(cur);
+    cur = addMonths(cur, 1);
+  }
+  return { startISO, endISO, monthKeys };
 }
 
 // Best-effort statement month guess from a "Period: dd/mm/yyyy to dd/mm/yyyy"
@@ -2916,7 +3012,9 @@ function ImportStatementView({
       const bankName = guessBankName(fullText);
       const tail = guessAccountTail(fullText);
       const rawTxns = resolveTransactionSigns(parseTransactions(lines));
-      const detectedMonth = guessStatementMonth(fullText, rawTxns) || activeMonth;
+      const holderName = guessAccountHolderName(fullText);
+      const period = guessStatementPeriod(rawTxns);
+      const detectedMonth = period?.monthKeys?.[0] || guessStatementMonth(fullText, rawTxns) || activeMonth;
 
       if (newPassword) {
         setStmtPasswords((prev) => [...prev, { label: bankName, password: newPassword }]);
@@ -2925,7 +3023,7 @@ function ImportStatementView({
       const bkey = bankMapKey(bankName, tail);
       const mappedAccount = stmtBankMap[bkey];
 
-      setMeta({ bankName, tail, rawTxns, bkey });
+      setMeta({ bankName, tail, rawTxns, bkey, holderName, period });
       setTargetAccount(mappedAccount && accounts[mappedAccount] ? mappedAccount : activeAccount);
       setTargetMonth(detectedMonth);
       setStep("account");
@@ -2993,6 +3091,33 @@ function ImportStatementView({
       loadIntoEditor(toReview[0]);
       setStep("review");
     }
+  }
+
+  // Every month the detected statement period spans (falls back to just the
+  // currently-selected target month if no period could be detected at all,
+  // e.g. a statement with no parseable transaction dates).
+  const periodMonthKeys = meta?.period?.monthKeys?.length ? meta.period.monthKeys : meta ? [targetMonth] : [];
+  // True when the currently-selected account has no existing page for one
+  // or more of those months — i.e. this looks like a period nothing's been
+  // created for yet, per the user's request to surface that rather than
+  // silently importing into whatever account happened to be active.
+  const accountMissingForPeriod = meta && periodMonthKeys.some((mk) => accounts[targetAccount]?.[mk] === undefined);
+
+  function createAccountForImport() {
+    askPrompt("New account name (e.g. Ambika, Home, Sree hand):", "", (name) => {
+      const trimmed = (name || "").trim();
+      if (!trimmed) return;
+      const monthKeys = periodMonthKeys.length ? periodMonthKeys : [targetMonth];
+      setAccounts((prev) => {
+        const pages = { ...(prev[trimmed] || {}) };
+        for (const mk of monthKeys) {
+          if (pages[mk] === undefined) pages[mk] = starterLine(trimmed, mk);
+        }
+        return { ...prev, [trimmed]: pages };
+      });
+      setTargetAccount(trimmed);
+      setTargetMonth(monthKeys[0]);
+    });
   }
 
   const pageTextNow = accounts[targetAccount]?.[targetMonth] ?? "";
@@ -3099,10 +3224,31 @@ function ImportStatementView({
 
       {step === "account" && meta && (
         <div className="p-4 flex flex-col gap-1">
-          <div className="font-mono text-xs text-zinc-400 leading-relaxed mb-2">
+          <div className="font-mono text-xs text-zinc-400 leading-relaxed mb-1">
             Detected <span className="text-zinc-200">{meta.bankName}</span>
             {meta.tail && <> · account ending {meta.tail}</>} · {meta.rawTxns.length} row(s) found.
           </div>
+          {meta.holderName && (
+            <div className="font-mono text-xs text-zinc-400 leading-relaxed mb-1">
+              Statement holder: <span className="text-zinc-200">{meta.holderName}</span>
+            </div>
+          )}
+          {meta.period && (
+            <div className="font-mono text-xs text-zinc-400 leading-relaxed mb-2">
+              Period: <span className="text-zinc-200">{meta.period.startISO}</span> to <span className="text-zinc-200">{meta.period.endISO}</span>
+            </div>
+          )}
+          {accountMissingForPeriod && (
+            <div className="mb-2 p-2.5 rounded-lg bg-amber-900/30 border border-amber-800/50">
+              <div className="font-mono text-[11px] text-amber-300 leading-relaxed">
+                "{targetAccount}" doesn't have a page yet for {periodMonthKeys.map(monthLabel).join(", ")} — one will
+                be created automatically when you continue, or you can import into a different/new account instead.
+              </div>
+              <button onClick={createAccountForImport} className="mt-1.5 font-mono text-[11px] text-amber-200 underline">
+                + Create a new account for this statement
+              </button>
+            </div>
+          )}
           <label className={stmtLabelCls}>Import into account</label>
           <select value={targetAccount} onChange={(e) => setTargetAccount(e.target.value)} className={stmtInputCls}>
             {Object.keys(accounts).map((n) => (
@@ -3139,6 +3285,11 @@ function ImportStatementView({
               {queue[qIndex].channel && <span>{queue[qIndex].channel}</span>}
               {queue[qIndex].time && <span>· {queue[qIndex].time}</span>}
               {queue[qIndex].refNumber && <span>· ref {queue[qIndex].refNumber}</span>}
+            </div>
+          )}
+          {queue[qIndex].remark && (
+            <div className="font-mono text-[10px] text-amber-300 mb-1 truncate">
+              Remark: <span className="text-amber-100">{queue[qIndex].remark}</span>
             </div>
           )}
           <div className="font-mono text-[11px] text-zinc-600 truncate mb-2">{queue[qIndex].raw}</div>
