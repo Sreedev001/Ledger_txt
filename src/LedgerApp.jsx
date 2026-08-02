@@ -7,6 +7,12 @@ import * as pdfjsLib from "pdfjs-dist";
 import pdfjsWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
 
+// App version, shown in the Menu sheet (see the "menu" BottomSheet further
+// down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
+// "Version" line — on every successful change from now on, per the user's
+// request, so the two always agree on what's currently shipped.
+const APP_VERSION = "1.0.0";
+
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
    ========================================================================= */
@@ -2620,6 +2626,7 @@ export default function LedgerApp() {
               pointed at any month to see a snapshot as of that point in time, instead of always "right now."
             </div>
           )}
+          <div className="mt-2 pb-1 text-center font-mono text-[10px] text-zinc-600">LedgerApp v{APP_VERSION}</div>
         </div>
       </BottomSheet>
 
