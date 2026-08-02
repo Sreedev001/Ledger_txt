@@ -899,6 +899,25 @@ function bankMapKey(bankName, tail) {
   return `${normalizeDesc(bankName)}::${tail || "?"}`;
 }
 
+// Finds an existing ledger account whose name matches the detected
+// statement holder name (e.g. account "Ambika" against holder "Ambika M").
+// Used to prefer a fresh, direct signal (this statement's own header) over
+// a remembered bank+account-tail mapping, which could be stale or simply
+// wrong if an earlier statement for the same bank account was ever imported
+// into the wrong ledger account by mistake.
+function findAccountMatchingHolder(accounts, holderName) {
+  if (!holderName) return null;
+  const h = normalizeDesc(holderName);
+  if (!h) return null;
+  const hTokens = h.split(" ").filter(Boolean);
+  for (const name of Object.keys(accounts)) {
+    const a = normalizeDesc(name);
+    if (!a) continue;
+    if (a === h || hTokens.includes(a) || h.startsWith(a + " ")) return name;
+  }
+  return null;
+}
+
 const MONTH_NAME_RE = /(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*/i;
 function monthIdxFromName(name) {
   const m = name.toLowerCase().match(MONTH_NAME_RE);
@@ -1036,14 +1055,27 @@ function nameFromVpa(vpa) {
 // name — this is the piece that turns "UPI/CR/645752269489/AROMAL A/SIBL/
 // aromal002-1@ok" into "Aromal A" instead of the raw reference number.
 function extractCounterpartyName(text) {
-  const vpaMatch = text.match(/[\w.\-]+@[\w]+/);
-  let cleaned = text
+  // NEFT/RTGS/IMPS narrations from many banks (SBI included) delimit
+  // fields with "*" instead of "/": e.g.
+  // "NEFT*RBIS0GOKLEP*RBISH00687251050*Director of Tre 0099509044300 AT
+  // 70104 ELAPPARA". Only the LAST field carries the actual sender/payee
+  // name — the sender's IFSC-like code and UTR reference before it are
+  // bank-generated and don't match our known-bank-code or standard-UTR-shape
+  // regexes (they're not the neat "SBIN0001234" shape those expect), so
+  // without narrowing to this last field first they'd leak straight into
+  // the "cleaned" name untouched, asterisks and all — e.g.
+  // "*rbisgoklep* *director Of" instead of "Director Of Tre".
+  const starParts = text.split("*").map((p) => p.trim()).filter(Boolean);
+  const source = starParts.length >= 3 ? starParts[starParts.length - 1] : text;
+
+  const vpaMatch = source.match(/[\w.\-]+@[\w]+/);
+  let cleaned = source
     .replace(NARRATION_STOPWORD_RE, " ")
     .replace(BANK_CODE_RE, " ")
     .replace(/[\w.\-]+@[\w]+/g, " ") // strip VPA
     .replace(/\b[A-Za-z]{2,6}\d{4,}\b/g, " ") // strip bank-code+digits UTR tokens, e.g. SBIN0001234
     .replace(/\b\d{5,}\b/g, " ") // strip RRN/UTR/account-number/pincode-length runs
-    .replace(/[\/|\-]+/g, " ") // slash/pipe/hyphen are field delimiters, not part of a name
+    .replace(/[\/|\-*]+/g, " ") // slash/pipe/hyphen/asterisk are field delimiters, not part of a name
     .replace(/\s+/g, " ")
     .trim();
   cleaned = cleaned.replace(/\d+/g, "").replace(/\s+/g, " ").trim(); // drop remaining stray short digits
@@ -1196,6 +1228,16 @@ function parseTransactionRow(row) {
     if (/\bcr\b|credit(ed)?\b/i.test(fullRow)) type = "credit";
     else if (/\bdr\b|debit(ed)?\b/i.test(fullRow)) type = "debit";
   }
+  // Some banks (SBI here) print no Cr/Dr word at all on certain rows,
+  // instead prefixing the narration itself with "DEP" (deposit, i.e. money
+  // coming in) or "WDL" (withdrawal, i.e. money going out) -- e.g. "DEP TFR
+  // NEFT*...". Still an explicit word the statement itself states, same
+  // tier of evidence as the Cr/Dr check above, just bank-specific
+  // terminology -- not a guess from column position or balance direction.
+  if (type === "unknown") {
+    if (/\bDEP\b/i.test(narrationHead)) type = "credit";
+    else if (/\bWDL\b/i.test(narrationHead)) type = "debit";
+  }
   const n = parseNarration(rawNarration);
   const description = n.name || (n.channel !== "Other" ? `${n.channel} transaction` : narrationHead) || "(no description)";
   return {
@@ -1243,6 +1285,20 @@ function resolveTransactionSigns(transactions) {
 // Tries an explicit label first ("Name:", "Account Holder:", "Customer
 // Name:"), then a "Mr./Mrs./Shri <name>" style salutation line, since not
 // every bank's PDF layout uses a labelled field.
+// A two-column statement header (name on the left, bank name on the right,
+// same visual row) gets flattened by reconstructLines into ONE line, e.g.
+// "Miss. AMBIKA M State Bank of India" — column position/spacing is lost at
+// that point, so a salutation regex anchored to end-of-line never matches.
+// Strips a recognized bank name (and everything after it) off the end of a
+// line first, so the salutation match below sees just "Miss. AMBIKA M".
+function stripTrailingBankName(line) {
+  const sorted = [...KNOWN_BANK_NAMES].sort((a, b) => b.length - a.length);
+  for (const name of sorted) {
+    const re = new RegExp(`\\s+${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b.*$`, "i");
+    if (re.test(line)) return line.replace(re, "").trim();
+  }
+  return line;
+}
 function guessAccountHolderName(fullText) {
   const lines = fullText.split("\n").map((l) => l.trim()).filter(Boolean);
   let headerEndIdx = lines.length;
@@ -1254,14 +1310,16 @@ function guessAccountHolderName(fullText) {
     }
   }
   const header = lines.slice(0, headerEndIdx);
-  for (const line of header) {
+  for (const rawLine of header) {
+    const line = stripTrailingBankName(rawLine);
     const m = line.match(/(?:account\s*holder(?:'?s)?\s*name|holder\s*name|customer\s*name|name)\s*[:\-]\s*(.+)/i);
     if (m) {
       const val = m[1].replace(/\s{2,}/g, " ").trim();
       if (val && /[A-Za-z]/.test(val) && val.length <= 60) return titleCaseWords(val);
     }
   }
-  for (const line of header) {
+  for (const rawLine of header) {
+    const line = stripTrailingBankName(rawLine);
     const m = line.match(/^(?:mr|mrs|ms|miss|shri|smt|m\/s)\.?\s+([A-Za-z][A-Za-z .]{2,50})$/i);
     if (m) return titleCaseWords(m[1].trim());
   }
@@ -2954,6 +3012,7 @@ function ImportStatementView({
   stmtImported,
   setStmtImported,
   askPrompt,
+  askConfirm,
   showAlert,
   onClose,
 }) {
@@ -2971,6 +3030,11 @@ function ImportStatementView({
   const [dupCount, setDupCount] = useState(0);
   const [savedCount, setSavedCount] = useState(0);
   const [skippedCount, setSkippedCount] = useState(0);
+  // Undo trail for the review step — one entry per Save/Skip action taken
+  // during this review session, so an accidental Save (or Skip) can be
+  // reverted and the entry re-edited or removed. Only covers manually
+  // reviewed items, not the ones auto-applied before review started.
+  const [history, setHistory] = useState([]);
 
   const [eDate, setEDate] = useState("");
   const [eDesc, setEDesc] = useState("");
@@ -3022,9 +3086,25 @@ function ImportStatementView({
 
       const bkey = bankMapKey(bankName, tail);
       const mappedAccount = stmtBankMap[bkey];
+      // Fresh evidence from THIS statement's own header outranks a
+      // remembered bank-tail mapping, which could have been set by an
+      // earlier statement that got imported into the wrong account.
+      const holderMatch = findAccountMatchingHolder(accounts, holderName);
+      // When the holder name itself couldn't be detected at all, there's no
+      // real evidence for ANY account — don't fall back to a remembered
+      // mapping or whatever account happened to be active, since either
+      // could silently be wrong. Leave it unselected and make the user
+      // choose explicitly (see the "account" step below).
+      const defaultAccount = !holderName
+        ? ""
+        : holderMatch && accounts[holderMatch]
+        ? holderMatch
+        : mappedAccount && accounts[mappedAccount]
+        ? mappedAccount
+        : activeAccount;
 
       setMeta({ bankName, tail, rawTxns, bkey, holderName, period });
-      setTargetAccount(mappedAccount && accounts[mappedAccount] ? mappedAccount : activeAccount);
+      setTargetAccount(defaultAccount);
       setTargetMonth(detectedMonth);
       setStep("account");
     } catch (err) {
@@ -3043,7 +3123,7 @@ function ImportStatementView({
   }
 
   function startReview() {
-    if (!meta) return;
+    if (!meta || !targetAccount) return;
     setStmtBankMap((prev) => ({ ...prev, [meta.bkey]: targetAccount }));
     const pageText = accounts[targetAccount]?.[targetMonth] ?? "";
     const importedLog = stmtImported[targetAccount] || [];
@@ -3101,7 +3181,7 @@ function ImportStatementView({
   // or more of those months — i.e. this looks like a period nothing's been
   // created for yet, per the user's request to surface that rather than
   // silently importing into whatever account happened to be active.
-  const accountMissingForPeriod = meta && periodMonthKeys.some((mk) => accounts[targetAccount]?.[mk] === undefined);
+  const accountMissingForPeriod = meta && targetAccount && periodMonthKeys.some((mk) => accounts[targetAccount]?.[mk] === undefined);
 
   function createAccountForImport() {
     askPrompt("New account name (e.g. Ambika, Home, Sree hand):", "", (name) => {
@@ -3118,6 +3198,23 @@ function ImportStatementView({
       setTargetAccount(trimmed);
       setTargetMonth(monthKeys[0]);
     });
+  }
+
+  // The account/month were successfully detected (or chosen), but no page
+  // exists there yet — rather than startReview silently creating one, make
+  // the user confirm it explicitly first, same principle as not picking a
+  // default account when the holder name itself couldn't be detected.
+  function handleContinueClick() {
+    if (!targetAccount) return;
+    if (accountMissingForPeriod) {
+      askConfirm(
+        `"${targetAccount}" has no page yet for ${periodMonthKeys.map(monthLabel).join(", ")}. Create it and continue?`,
+        () => startReview(),
+        { confirmLabel: "Create & continue" }
+      );
+    } else {
+      startReview();
+    }
   }
 
   const pageTextNow = accounts[targetAccount]?.[targetMonth] ?? "";
@@ -3159,7 +3256,8 @@ function ImportStatementView({
     }
     const t = queue[qIndex];
     const label = (eDate && dayLabelFromISO(eDate)) || eDesc.slice(0, 20) || "Entry";
-    const newText = insertLedgerEntry(pageTextNow, {
+    const prevPageText = pageTextNow;
+    const newText = insertLedgerEntry(prevPageText, {
       categoryTitle: eCategory.trim(),
       sign: wantedSign,
       subTitle: eSub.trim(),
@@ -3178,12 +3276,43 @@ function ImportStatementView({
       }));
     }
     setSavedCount((c) => c + 1);
+    setHistory((h) => [
+      ...h,
+      { qIndex, action: "saved", prevPageText, signature: t.signature, eDate, eDesc, eAmount, eType, eCategory, eSub },
+    ]);
     advance();
   }
 
   function skipCurrent() {
     setSkippedCount((c) => c + 1);
+    setHistory((h) => [...h, { qIndex, action: "skipped", eDate, eDesc, eAmount, eType, eCategory, eSub }]);
     advance();
+  }
+
+  // Reverts the most recent Save or Skip and reloads that transaction back
+  // into the editor — covers both "accidentally entered" (undo a Save,
+  // fix it, save again) and "delete an entry" (undo a Save, then Skip it
+  // instead) without needing a separate edit/delete UI for already-written
+  // ledger lines.
+  function goBack() {
+    if (history.length === 0) return;
+    const last = history[history.length - 1];
+    setHistory((h) => h.slice(0, -1));
+    if (last.action === "saved") {
+      setAccounts((prev) => ({ ...prev, [targetAccount]: { ...prev[targetAccount], [targetMonth]: last.prevPageText } }));
+      setStmtImported((prev) => ({ ...prev, [targetAccount]: (prev[targetAccount] || []).slice(0, -1) }));
+      setSavedCount((c) => c - 1);
+    } else {
+      setSkippedCount((c) => c - 1);
+    }
+    setQIndex(last.qIndex);
+    setEDate(last.eDate);
+    setEDesc(last.eDesc);
+    setEAmount(last.eAmount);
+    setEType(last.eType);
+    setECategory(last.eCategory);
+    setESub(last.eSub);
+    setStep("review");
   }
 
   return (
@@ -3228,9 +3357,13 @@ function ImportStatementView({
             Detected <span className="text-zinc-200">{meta.bankName}</span>
             {meta.tail && <> · account ending {meta.tail}</>} · {meta.rawTxns.length} row(s) found.
           </div>
-          {meta.holderName && (
+          {meta.holderName ? (
             <div className="font-mono text-xs text-zinc-400 leading-relaxed mb-1">
               Statement holder: <span className="text-zinc-200">{meta.holderName}</span>
+            </div>
+          ) : (
+            <div className="font-mono text-xs text-amber-300 leading-relaxed mb-1">
+              Couldn't detect whose statement this is — please select or create the account below.
             </div>
           )}
           {meta.period && (
@@ -3241,8 +3374,9 @@ function ImportStatementView({
           {accountMissingForPeriod && (
             <div className="mb-2 p-2.5 rounded-lg bg-amber-900/30 border border-amber-800/50">
               <div className="font-mono text-[11px] text-amber-300 leading-relaxed">
-                "{targetAccount}" doesn't have a page yet for {periodMonthKeys.map(monthLabel).join(", ")} — one will
-                be created automatically when you continue, or you can import into a different/new account instead.
+                "{targetAccount}" doesn't have a page yet for {periodMonthKeys.map(monthLabel).join(", ")} — you'll be
+                asked to confirm creating it when you continue, or you can import into a different/new account
+                instead.
               </div>
               <button onClick={createAccountForImport} className="mt-1.5 font-mono text-[11px] text-amber-200 underline">
                 + Create a new account for this statement
@@ -3251,12 +3385,22 @@ function ImportStatementView({
           )}
           <label className={stmtLabelCls}>Import into account</label>
           <select value={targetAccount} onChange={(e) => setTargetAccount(e.target.value)} className={stmtInputCls}>
+            {!targetAccount && (
+              <option value="" disabled>
+                Select an account…
+              </option>
+            )}
             {Object.keys(accounts).map((n) => (
               <option key={n} value={n}>
                 {n}
               </option>
             ))}
           </select>
+          {!targetAccount && (
+            <button onClick={createAccountForImport} className="mt-1.5 self-start font-mono text-[11px] text-amber-300 underline">
+              + Create a new account for this statement
+            </button>
+          )}
           <label className={stmtLabelCls}>Statement month</label>
           <div className="flex items-center gap-2 py-1">
             <button onClick={() => setTargetMonth((m) => addMonths(m, -1))} className="p-1.5 text-zinc-400 hover:text-white">
@@ -3267,8 +3411,12 @@ function ImportStatementView({
               <ChevronRight size={16} />
             </button>
           </div>
-          <button onClick={startReview} className="mt-4 py-3 rounded-lg bg-teal-700 hover:bg-teal-600 font-mono text-sm text-white">
-            Continue
+          <button
+            onClick={handleContinueClick}
+            disabled={!targetAccount}
+            className="mt-4 py-3 rounded-lg bg-teal-700 hover:bg-teal-600 disabled:bg-zinc-800 disabled:text-zinc-600 font-mono text-sm text-white"
+          >
+            {targetAccount ? "Continue" : "Select an account to continue"}
           </button>
         </div>
       )}
@@ -3290,6 +3438,11 @@ function ImportStatementView({
           {queue[qIndex].remark && (
             <div className="font-mono text-[10px] text-amber-300 mb-1 truncate">
               Remark: <span className="text-amber-100">{queue[qIndex].remark}</span>
+            </div>
+          )}
+          {queue[qIndex].guessedType === "unknown" && (
+            <div className="font-mono text-[10px] text-amber-300 mb-1">
+              ⚠ Couldn't tell money in vs money out from this row — please check before saving.
             </div>
           )}
           <div className="font-mono text-[11px] text-zinc-600 truncate mb-2">{queue[qIndex].raw}</div>
@@ -3370,6 +3523,14 @@ function ImportStatementView({
           </select>
 
           <div className="flex gap-2 mt-4">
+            <button
+              onClick={goBack}
+              disabled={history.length === 0}
+              title="Undo the last Save/Skip and reload it here to fix or drop it"
+              className="py-3 px-3 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-30 font-mono text-sm text-zinc-300 flex items-center justify-center"
+            >
+              <ChevronLeft size={15} />
+            </button>
             <button onClick={skipCurrent} className="flex-1 py-3 rounded-lg bg-zinc-800 hover:bg-zinc-700 font-mono text-sm text-zinc-300 flex items-center justify-center gap-1.5">
               <SkipForward size={15} /> Skip
             </button>
@@ -3396,6 +3557,11 @@ function ImportStatementView({
           <button onClick={onClose} className="mt-4 py-2.5 px-6 rounded-lg bg-teal-700 hover:bg-teal-600 font-mono text-sm text-white">
             Done
           </button>
+          {history.length > 0 && (
+            <button onClick={goBack} className="font-mono text-[11px] text-zinc-500 underline text-center">
+              ← Back to fix the last entry
+            </button>
+          )}
         </div>
       )}
     </div>
