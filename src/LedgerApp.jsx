@@ -1,5 +1,5 @@
 import React, { useState, useRef, useMemo, useEffect } from "react";
-import { Undo2, Redo2, Plus, AlignLeft, MoreVertical, X, Download, Upload, Pencil, Trash2, Layers, HelpCircle, Type, AlignJustify, Landmark, ChevronLeft, ChevronRight, CalendarDays, Receipt, FileText, Check, SkipForward, Loader2 } from "lucide-react";
+import { Undo2, Redo2, Plus, AlignLeft, MoreVertical, X, Download, Upload, Pencil, Trash2, Layers, HelpCircle, Type, AlignJustify, Landmark, ChevronLeft, ChevronRight, CalendarDays, Receipt, FileText, Check, SkipForward, Loader2, Paperclip } from "lucide-react";
 import * as pdfjsLib from "pdfjs-dist";
 // NOTE: requires "pdfjs-dist" added to package.json dependencies (not part of
 // the previously-generated scaffold — see CONTEXT.md's package list, which
@@ -11,7 +11,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.2.0";
+const APP_VERSION = "1.3.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -1975,8 +1975,12 @@ export default function LedgerApp() {
     } catch {}
     return {};
   });
-  const [sheet, setSheet] = useState(null); // null | 'accounts' | 'totals' | 'menu'
+  const [sheet, setSheet] = useState(null); // null | 'accounts' | 'totals' | 'menu' | 'attachments'
   const [dialog, setDialog] = useState(null);
+  // Mirrors the live count from AttachmentsSheetBody for the currently open
+  // account+month, purely to show/hide the small badge on the top-bar
+  // paperclip button without a second separate IndexedDB read here.
+  const [attachCount, setAttachCount] = useState(0);
   // { [`${account}::${month}`]: { counter, seq: { [entrySignature]: n } } }
   // — persisted "order entered" tracking behind the Statement report; see
   // buildStatement/advancePageOrder above for how it's built up.
@@ -2009,6 +2013,25 @@ export default function LedgerApp() {
 
   const pageKey = `${activeAccount}::${activeMonth}`;
   const text = accounts[activeAccount]?.[activeMonth] ?? "";
+
+  // Keeps the top-bar paperclip badge accurate even before the attachments
+  // sheet has ever been opened (its body only mounts while the sheet is
+  // open, so it alone can't populate this on first load). Re-checks on
+  // every account/month switch, and after the import wizard closes (a
+  // fresh import may have just attached something to this very page).
+  useEffect(() => {
+    let cancelled = false;
+    listStatementAttachments(activeAccount, activeMonth)
+      .then((rows) => {
+        if (!cancelled) setAttachCount(rows.length);
+      })
+      .catch(() => {
+        if (!cancelled) setAttachCount(0);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeAccount, activeMonth, showingImport]);
   const parsed = useMemo(() => parseLedger(text), [text]);
 
   /* ---- persistence: write-through to localStorage ---- */
@@ -2568,6 +2591,14 @@ export default function LedgerApp() {
           <button onClick={runRedo} title="Redo" className="p-2 text-zinc-400 hover:text-white active:text-white">
             <Redo2 size={19} />
           </button>
+          <button onClick={() => openSheet("attachments")} title="Attached statements" className="relative p-2 text-zinc-400 hover:text-white active:text-white">
+            <Paperclip size={19} />
+            {attachCount > 0 && (
+              <span className="absolute top-0.5 right-0.5 min-w-[13px] h-[13px] px-[3px] rounded-full bg-teal-600 text-white text-[9px] font-mono leading-[13px] text-center">
+                {attachCount}
+              </span>
+            )}
+          </button>
           <button onClick={() => openSheet("totals")} title="Totals" className="p-2 text-zinc-400 hover:text-white active:text-white">
             <AlignLeft size={19} />
           </button>
@@ -2732,6 +2763,13 @@ export default function LedgerApp() {
       {/* totals sheet */}
       <BottomSheet open={sheet === "totals"} onClose={closeSheet} title={`${activeAccount} · ${monthLabel(activeMonth)}`}>
         <SectionTotals parsed={parsed} />
+      </BottomSheet>
+
+      {/* attachments sheet — quick access to reopen a statement PDF already
+          attached to the account+month currently open, without leaving the
+          main editor or touching the file picker again */}
+      <BottomSheet open={sheet === "attachments"} onClose={closeSheet} title={`Statements · ${activeAccount} · ${monthLabel(activeMonth)}`}>
+        <AttachmentsSheetBody account={activeAccount} month={activeMonth} onCountChange={setAttachCount} />
       </BottomSheet>
 
       {/* menu sheet */}
@@ -3137,12 +3175,14 @@ function statementDateCell(iso) {
   return iso ? String(parseInt(iso.slice(-2), 10)) : "—";
 }
 
-// Lists whatever PDFs have been attached to this exact account+month page
-// (see the STATEMENT PDF ATTACHMENTS section above) with a way to open or
-// remove each one. Renders nothing while loading and nothing once loaded
-// if the page has no attachments, so it never adds visual clutter to
-// months that were typed by hand with no statement import involved.
-function StatementAttachments({ account, month }) {
+// Shared logic behind every place that lists a page's attached PDFs: the
+// Statement report's inline list, and the top-bar quick-access sheet
+// (added right after this feature originally shipped, so the currently
+// open page's statements can be reopened in one tap without navigating
+// into the Statement report at all). `onCountChange`, if given, is called
+// every time the loaded count changes, purely so a caller (the top-bar
+// badge) can mirror it without its own separate IndexedDB read.
+function useStatementAttachments(account, month, onCountChange) {
   const [items, setItems] = useState(null); // null = still loading this page
   const [busyId, setBusyId] = useState(null);
 
@@ -3151,20 +3191,29 @@ function StatementAttachments({ account, month }) {
     setItems(null);
     listStatementAttachments(account, month)
       .then((rows) => {
-        if (!cancelled) setItems(rows);
+        if (!cancelled) {
+          setItems(rows);
+          if (onCountChange) onCountChange(rows.length);
+        }
       })
       .catch(() => {
-        if (!cancelled) setItems([]);
+        if (!cancelled) {
+          setItems([]);
+          if (onCountChange) onCountChange(0);
+        }
       });
     return () => {
       cancelled = true;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [account, month]);
 
   function openAttachment(rec) {
     // Blob URL, not a filesystem path — the PDF lives only in IndexedDB,
     // so this is generated fresh each time and revoked shortly after,
-    // rather than pointing at anywhere on disk.
+    // rather than pointing at anywhere on disk. This is the "reopen
+    // without reopening/reuploading the original file" path: the bytes
+    // never left IndexedDB, so there's nothing to re-pick from the OS.
     const url = URL.createObjectURL(rec.blob);
     window.open(url, "_blank");
     setTimeout(() => URL.revokeObjectURL(url), 60000);
@@ -3174,11 +3223,27 @@ function StatementAttachments({ account, month }) {
     setBusyId(rec.id);
     try {
       await deleteStatementAttachment(rec.id);
-      setItems((prev) => prev.filter((x) => x.id !== rec.id));
+      setItems((prev) => {
+        const next = (prev || []).filter((x) => x.id !== rec.id);
+        if (onCountChange) onCountChange(next.length);
+        return next;
+      });
     } finally {
       setBusyId(null);
     }
   }
+
+  return { items, busyId, openAttachment, removeAttachment };
+}
+
+// Lists whatever PDFs have been attached to this exact account+month page
+// with a way to open or remove each one. Renders nothing while loading and
+// nothing once loaded if the page has no attachments, so it never adds
+// visual clutter to months that were typed by hand with no statement
+// import involved. (Embedded in the Statement report; see
+// AttachmentsSheetBody below for the always-visible top-bar version.)
+function StatementAttachments({ account, month }) {
+  const { items, busyId, openAttachment, removeAttachment } = useStatementAttachments(account, month);
 
   if (!items || items.length === 0) return null;
 
@@ -3203,6 +3268,55 @@ function StatementAttachments({ account, month }) {
             className="p-1.5 text-zinc-600 hover:text-rose-400 disabled:opacity-40 shrink-0"
           >
             <Trash2 size={14} />
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Top-bar quick-access sheet body: same data/actions as StatementAttachments
+// above, but for the page currently open in the main editor (not the
+// Statement report's independently-selectable account/month), and always
+// shows *something* — including an empty state — since a bottom sheet the
+// user explicitly opened shouldn't just render blank. Reports its live
+// count up to the parent via onCountChange, which drives the small badge
+// on the top-bar paperclip button.
+function AttachmentsSheetBody({ account, month, onCountChange }) {
+  const { items, busyId, openAttachment, removeAttachment } = useStatementAttachments(account, month, onCountChange);
+
+  if (!items) {
+    return <div className="px-1 py-6 text-center font-mono text-xs text-zinc-500">Loading…</div>;
+  }
+
+  if (items.length === 0) {
+    return (
+      <div className="px-1 py-6 text-center font-mono text-xs text-zinc-500 leading-relaxed">
+        No statements attached to {account} · {monthLabel(month)} yet.
+        <br />
+        Importing a bank statement PDF for this month will save a copy here automatically.
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-1 mt-1">
+      {items.map((rec) => (
+        <div key={rec.id} className="flex items-center gap-2 px-1 py-2 rounded-lg hover:bg-zinc-800/60">
+          <FileText size={16} className="text-zinc-500 shrink-0" />
+          <button onClick={() => openAttachment(rec)} className="flex-1 min-w-0 text-left">
+            <div className="font-mono text-sm text-zinc-100 truncate">{rec.filename}</div>
+            <div className="font-mono text-[11px] text-zinc-500 truncate">
+              {[rec.bankName, rec.periodLabel, new Date(rec.importedAt).toLocaleDateString()].filter(Boolean).join(" · ")}
+            </div>
+          </button>
+          <button
+            onClick={() => removeAttachment(rec)}
+            disabled={busyId === rec.id}
+            title="Remove this attached PDF"
+            className="p-2 text-zinc-600 hover:text-rose-400 disabled:opacity-40 shrink-0"
+          >
+            <Trash2 size={16} />
           </button>
         </div>
       ))}
