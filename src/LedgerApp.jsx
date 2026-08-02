@@ -11,7 +11,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.0.2";
+const APP_VERSION = "1.2.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -1588,6 +1588,170 @@ async function getPdfLines(doc) {
   return { lines: allLines, fullText: fullTextParts.join("\n") };
 }
 
+/* =========================================================================
+   STATEMENT PDF ATTACHMENTS
+   Once an import wizard run knows its target account + month, the original
+   uploaded PDF itself (not just the transactions parsed out of it) is saved
+   against that specific account+month page, so the user never has to
+   re-upload it to look at it again. Deliberately NOT keyed to the file's
+   original location/path on the phone — that source file (Downloads,
+   WhatsApp media, wherever it came from) can be moved or deleted by the
+   user or the OS at any time after upload, so the app keeps its own copy
+   of the actual bytes instead of a reference to somewhere else.
+   Storage engine: IndexedDB, not localStorage. A PDF is binary and every
+   bank statement can be a few hundred KB to a couple MB — localStorage's
+   ~5-10MB *total, per-origin, string-only* quota would fill up after a
+   handful of statements (worse once base64-encoded, ~33% larger again just
+   to fit it into a string). IndexedDB has no such practical ceiling and
+   stores Blobs/Files natively, so the already-in-hand `File` object from
+   the upload `<input>` is written straight in — no base64 round-trip.
+   Multiple PDFs can exist on the very same account+month page (e.g. a
+   mid-month statement and a later full-month statement covering an
+   overlapping period) — each import gets its own row; nothing is ever
+   overwritten by a later one, mirroring how `dedupeTransactions` already
+   treats overlapping statements as additive, not replacing.
+   ========================================================================= */
+
+const ATTACH_DB_NAME = "ledger_attachments_v1";
+const ATTACH_STORE = "pdfs";
+
+function attachPageKey(account, month) {
+  return `${account}::${month}`;
+}
+
+function openAttachDb() {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === "undefined") {
+      reject(new Error("IndexedDB not available in this environment"));
+      return;
+    }
+    const req = indexedDB.open(ATTACH_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(ATTACH_STORE)) {
+        const store = db.createObjectStore(ATTACH_STORE, { keyPath: "id" });
+        store.createIndex("byPage", "pageKey", { unique: false });
+        store.createIndex("byAccount", "account", { unique: false });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function runAttachTx(db, mode, fn) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(ATTACH_STORE, mode);
+    const result = fn(tx.objectStore(ATTACH_STORE));
+    tx.oncomplete = () => resolve(result);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// Saves one PDF against a specific account+month page. `blob` can be the
+// `File` straight off the upload input (a File already IS a Blob) — no
+// conversion needed. Returns the new record's id.
+async function saveStatementAttachment({ account, month, filename, bankName, periodLabel, blob }) {
+  const db = await openAttachDb();
+  try {
+    const id = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const record = {
+      id,
+      pageKey: attachPageKey(account, month),
+      account,
+      month,
+      filename,
+      bankName: bankName || "",
+      periodLabel: periodLabel || "",
+      size: blob.size,
+      importedAt: new Date().toISOString(),
+      blob,
+    };
+    await runAttachTx(db, "readwrite", (store) => store.put(record));
+    return id;
+  } finally {
+    db.close();
+  }
+}
+
+async function listStatementAttachments(account, month) {
+  const db = await openAttachDb();
+  try {
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(ATTACH_STORE, "readonly");
+      const req = tx.objectStore(ATTACH_STORE).index("byPage").getAll(attachPageKey(account, month));
+      req.onsuccess = () => resolve((req.result || []).sort((a, b) => (a.importedAt < b.importedAt ? -1 : 1)));
+      req.onerror = () => reject(req.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function deleteStatementAttachment(id) {
+  const db = await openAttachDb();
+  try {
+    await runAttachTx(db, "readwrite", (store) => store.delete(id));
+  } finally {
+    db.close();
+  }
+}
+
+// Used when a month's page (or a whole account identity) is deleted, so
+// attachments never pile up as orphans nobody can reach or clean up again.
+async function deleteAttachmentsForPage(account, month) {
+  const db = await openAttachDb();
+  try {
+    const rows = await new Promise((resolve, reject) => {
+      const tx = db.transaction(ATTACH_STORE, "readonly");
+      const req = tx.objectStore(ATTACH_STORE).index("byPage").getAllKeys(attachPageKey(account, month));
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+    await runAttachTx(db, "readwrite", (store) => rows.forEach((k) => store.delete(k)));
+  } finally {
+    db.close();
+  }
+}
+
+async function deleteAttachmentsForAccount(account) {
+  const db = await openAttachDb();
+  try {
+    const rows = await new Promise((resolve, reject) => {
+      const tx = db.transaction(ATTACH_STORE, "readonly");
+      const req = tx.objectStore(ATTACH_STORE).index("byAccount").getAllKeys(account);
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+    await runAttachTx(db, "readwrite", (store) => rows.forEach((k) => store.delete(k)));
+  } finally {
+    db.close();
+  }
+}
+
+// Keeps attachments attached to the identity when an account is renamed —
+// otherwise every existing attachment's `account`/`pageKey` would silently
+// point at a name that no longer exists and become unreachable.
+async function renameAttachmentsAccount(oldName, newName) {
+  const db = await openAttachDb();
+  try {
+    const rows = await new Promise((resolve, reject) => {
+      const tx = db.transaction(ATTACH_STORE, "readonly");
+      const req = tx.objectStore(ATTACH_STORE).index("byAccount").getAll(oldName);
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+    await runAttachTx(db, "readwrite", (store) => {
+      rows.forEach((r) => {
+        store.delete(r.id);
+        store.put({ ...r, account: newName, pageKey: attachPageKey(newName, r.month) });
+      });
+    });
+  } finally {
+    db.close();
+  }
+}
+
 /* ========================================================================= */
 
 const STORAGE_ACCOUNTS = "ledger_accounts_v3";
@@ -2205,6 +2369,10 @@ export default function LedgerApp() {
         }
         return next;
       });
+      // Attachments are keyed by account name too, so they need to move
+      // with the identity the same way entryOrder does above — otherwise
+      // they'd silently point at a name that no longer exists.
+      renameAttachmentsAccount(activeAccount, trimmed).catch(() => {});
       setActiveAccount(trimmed);
       closeSheet();
     });
@@ -2248,6 +2416,12 @@ export default function LedgerApp() {
           }
           return next;
         });
+        // Any PDFs attached to the page(s) being removed would otherwise be
+        // orphaned in IndexedDB — unreachable from the UI, just quietly
+        // taking up space forever. Fire-and-forget: the ledger deletion
+        // above already happened and must not wait on/be blocked by this.
+        if (wholeIdentityGoes) deleteAttachmentsForAccount(activeAccount).catch(() => {});
+        else deleteAttachmentsForPage(activeAccount, activeMonth).catch(() => {});
         closeSheet();
       },
       { danger: true, confirmLabel: "Delete" }
@@ -2963,6 +3137,79 @@ function statementDateCell(iso) {
   return iso ? String(parseInt(iso.slice(-2), 10)) : "—";
 }
 
+// Lists whatever PDFs have been attached to this exact account+month page
+// (see the STATEMENT PDF ATTACHMENTS section above) with a way to open or
+// remove each one. Renders nothing while loading and nothing once loaded
+// if the page has no attachments, so it never adds visual clutter to
+// months that were typed by hand with no statement import involved.
+function StatementAttachments({ account, month }) {
+  const [items, setItems] = useState(null); // null = still loading this page
+  const [busyId, setBusyId] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setItems(null);
+    listStatementAttachments(account, month)
+      .then((rows) => {
+        if (!cancelled) setItems(rows);
+      })
+      .catch(() => {
+        if (!cancelled) setItems([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [account, month]);
+
+  function openAttachment(rec) {
+    // Blob URL, not a filesystem path — the PDF lives only in IndexedDB,
+    // so this is generated fresh each time and revoked shortly after,
+    // rather than pointing at anywhere on disk.
+    const url = URL.createObjectURL(rec.blob);
+    window.open(url, "_blank");
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+
+  async function removeAttachment(rec) {
+    setBusyId(rec.id);
+    try {
+      await deleteStatementAttachment(rec.id);
+      setItems((prev) => prev.filter((x) => x.id !== rec.id));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  if (!items || items.length === 0) return null;
+
+  return (
+    <div className="mb-4 rounded-lg border border-zinc-800 divide-y divide-zinc-800 overflow-hidden">
+      <div className="px-3 py-1.5 font-mono text-[10px] text-zinc-500 uppercase tracking-widest bg-zinc-900/60">
+        Attached statement{items.length > 1 ? "s" : ""} ({items.length})
+      </div>
+      {items.map((rec) => (
+        <div key={rec.id} className="flex items-center gap-2 px-3 py-2">
+          <FileText size={14} className="text-zinc-500 shrink-0" />
+          <button onClick={() => openAttachment(rec)} className="flex-1 min-w-0 text-left">
+            <div className="font-mono text-xs text-zinc-200 truncate">{rec.filename}</div>
+            <div className="font-mono text-[10px] text-zinc-500 truncate">
+              {[rec.bankName, new Date(rec.importedAt).toLocaleDateString()].filter(Boolean).join(" · ")}
+            </div>
+          </button>
+          <button
+            onClick={() => removeAttachment(rec)}
+            disabled={busyId === rec.id}
+            title="Remove this attached PDF"
+            className="p-1.5 text-zinc-600 hover:text-rose-400 disabled:opacity-40 shrink-0"
+          >
+            <Trash2 size={14} />
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, setEntryOrder }) {
   const [account, setAccount] = useState(defaultAccount);
   const [month, setMonth] = useState(defaultMonth);
@@ -3016,6 +3263,8 @@ function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, set
           <ChevronRight size={16} />
         </button>
       </div>
+
+      <StatementAttachments account={account} month={month} />
 
       {accounts[account]?.[month] === undefined ? (
         <div className="rounded-lg border border-zinc-800 bg-zinc-800/60 px-3 py-2 font-mono text-[11px] text-zinc-400">
@@ -3101,6 +3350,14 @@ function ImportStatementView({
   const [errorMsg, setErrorMsg] = useState("");
   const fileInputRef = useRef(null);
 
+  // Holds the raw uploaded File (a File IS a Blob — reading it via
+  // .arrayBuffer() in handleFile below doesn't consume/detach it, so it's
+  // still good to hand to IndexedDB later). Kept in a ref rather than
+  // state since it's write-once-per-upload and never drives a render;
+  // consumed by attachPendingPdf() once account+month are confirmed.
+  const pendingFileRef = useRef(null);
+  const [attachStatus, setAttachStatus] = useState(null); // null | "saved" | "failed"
+
   const [meta, setMeta] = useState(null);
   const [targetAccount, setTargetAccount] = useState(activeAccount);
   const [targetMonth, setTargetMonth] = useState(activeMonth);
@@ -3109,13 +3366,32 @@ function ImportStatementView({
   const [qIndex, setQIndex] = useState(0);
   const [autoCount, setAutoCount] = useState(0);
   const [dupCount, setDupCount] = useState(0);
-  const [savedCount, setSavedCount] = useState(0);
-  const [skippedCount, setSkippedCount] = useState(0);
-  // Undo trail for the review step — one entry per Save/Skip action taken
-  // during this review session, so an accidental Save (or Skip) can be
-  // reverted and the entry re-edited or removed. Only covers manually
-  // reviewed items, not the ones auto-applied before review started.
-  const [history, setHistory] = useState([]);
+  // Per-queue-index outcome slot, one entry per row in `queue`, in the SAME
+  // order as the queue (i.e. the order the transactions appear in the
+  // statement) — not the order the user happened to act on them in. Each
+  // slot is either null (not yet decided — including a row the user hasn't
+  // reached yet AND a row that was explicitly skipped and left open), or
+  // `{ status: "saved" | "skipped", eDate, eDesc, eAmount, eType, eCategory,
+  // eSub }` snapshotting the editor fields at the time of that decision.
+  // Navigating with Back/Next only ever *reads* this array to repopulate
+  // the editor — it never deletes a slot. The ledger text itself is always
+  // rebuilt from scratch (see rebuildLedgerFromResults) by walking `queue`
+  // in order and inserting every currently-"saved" slot in that same
+  // order, so going back to fix an earlier row — or going back to finally
+  // fill in a row that was skipped — updates that row in place without
+  // touching, reordering, or duplicating any other row.
+  const [results, setResults] = useState([]);
+  // Snapshot of the ledger page text, and of this account's stmtImported
+  // signature list, taken once at the moment manual review starts (i.e.
+  // after the auto-applied "learned category" rows are already written in,
+  // but before any manually-reviewed row is). rebuildLedgerFromResults
+  // always starts from these two snapshots and replays `results` on top,
+  // so the rebuild is deterministic no matter what order rows were edited.
+  const [reviewBaseText, setReviewBaseText] = useState("");
+  const [reviewBaseSignatures, setReviewBaseSignatures] = useState([]);
+
+  const savedCount = results.filter((r) => r?.status === "saved").length;
+  const skippedCount = results.filter((r) => r?.status === "skipped").length;
 
   const [eDate, setEDate] = useState("");
   const [eDesc, setEDesc] = useState("");
@@ -3144,7 +3420,9 @@ function ImportStatementView({
   async function handleFile(file) {
     setStep("opening");
     setErrorMsg("");
+    setAttachStatus(null);
     passwordAttemptedOnce.current = false;
+    pendingFileRef.current = file;
     try {
       const buf = await file.arrayBuffer();
       const opened = await openStatementPdf(buf, stmtPasswords, requestPassword);
@@ -3207,9 +3485,95 @@ function ImportStatementView({
     setESub("");
   }
 
+  // Populates the editor for a given queue index — from that row's stored
+  // result snapshot if it was already saved or skipped, otherwise from the
+  // statement's raw guessed values. Used by both Back/Next navigation and
+  // by advancing to a fresh row, so revisiting any row (in either
+  // direction) always shows exactly what's really there instead of ever
+  // clearing it out.
+  function loadIndex(i, resultsArr) {
+    setQIndex(i);
+    const r = (resultsArr || results)[i];
+    if (r) {
+      setEDate(r.eDate);
+      setEDesc(r.eDesc);
+      setEAmount(r.eAmount);
+      setEType(r.eType);
+      setECategory(r.eCategory);
+      setESub(r.eSub);
+    } else {
+      loadIntoEditor(queue[i]);
+    }
+  }
+
+  // Rebuilds the ledger page text (and this account's stmtImported
+  // signature list) from scratch: start from the snapshot taken when
+  // review began, then walk the queue IN ORDER and insert every row
+  // currently marked "saved". Because this always replays in queue order
+  // rather than action order, editing an earlier row — or finally filling
+  // in a row that was skipped — lands that row back in its correct
+  // position instead of at the end, and never disturbs any other row.
+  function rebuildLedgerFromResults(resultsArr) {
+    let text = reviewBaseText;
+    const sigs = [];
+    queue.forEach((t, i) => {
+      const r = resultsArr[i];
+      if (r && r.status === "saved") {
+        const amt = parseFloat(r.eAmount);
+        const label = (r.eDate && dayLabelFromISO(r.eDate)) || (r.eDesc || "").slice(0, 20) || "Entry";
+        text = insertLedgerEntry(text, {
+          categoryTitle: r.eCategory.trim(),
+          sign: r.eType === "credit" ? "+" : "-",
+          subTitle: (r.eSub || "").trim(),
+          label,
+          amount: amt,
+        });
+        sigs.push(t.signature);
+      }
+    });
+    setAccounts((prev) => ({ ...prev, [targetAccount]: { ...prev[targetAccount], [targetMonth]: text } }));
+    setStmtImported((prev) => ({ ...prev, [targetAccount]: [...reviewBaseSignatures, ...sigs] }));
+  }
+
+  // Attaches the PDF that's currently pending (the one just uploaded and
+  // parsed) to the confirmed targetAccount/targetMonth page. Called right
+  // when account+month become known (startReview, below) — never earlier,
+  // since before that point there's no page to attach it to yet. Skips
+  // saving a second copy if a file with the same name+size is already
+  // attached to this exact page (covers re-uploading the same statement,
+  // same principle as dedupeTransactions not re-inserting rows). Never
+  // blocks or fails the actual import: an attachment-storage problem (e.g.
+  // IndexedDB unsupported/full) must not stop the transactions themselves
+  // from being written.
+  async function attachPendingPdf() {
+    const file = pendingFileRef.current;
+    if (!file || !targetAccount || !targetMonth) return;
+    try {
+      const existing = await listStatementAttachments(targetAccount, targetMonth);
+      const alreadyAttached = existing.some((a) => a.filename === file.name && a.size === file.size);
+      if (!alreadyAttached) {
+        await saveStatementAttachment({
+          account: targetAccount,
+          month: targetMonth,
+          filename: file.name,
+          bankName: meta?.bankName,
+          periodLabel: meta?.period?.label || "",
+          blob: file,
+        });
+      }
+      setAttachStatus("saved");
+    } catch (err) {
+      console.warn("Couldn't save statement attachment:", err);
+      setAttachStatus("failed");
+    } finally {
+      pendingFileRef.current = null;
+    }
+  }
+
   function startReview() {
     if (!meta || !targetAccount) return;
     setStmtBankMap((prev) => ({ ...prev, [meta.bkey]: targetAccount }));
+    attachPendingPdf(); // fire-and-forget: persists alongside review, never blocks it
     const pageText = accounts[targetAccount]?.[targetMonth] ?? "";
     const importedLog = stmtImported[targetAccount] || [];
     const { fresh, skipped } = dedupeTransactions(meta.rawTxns, importedLog);
@@ -3246,9 +3610,10 @@ function ImportStatementView({
       setStmtImported((prev) => ({ ...prev, [targetAccount]: [...(prev[targetAccount] || []), ...newSignatures] }));
     }
     setAutoCount(auto);
-    setSavedCount(0);
-    setSkippedCount(0);
     setQueue(toReview);
+    setResults(toReview.map(() => null));
+    setReviewBaseText(workingText);
+    setReviewBaseSignatures([...importedLog, ...newSignatures]);
     setQIndex(0);
     if (toReview.length === 0) {
       setStep("done");
@@ -3324,13 +3689,35 @@ function ImportStatementView({
     askPrompt("New subcategory name:", "", (name) => setESub((name || "").trim()));
   }
 
-  function advance() {
-    const next = qIndex + 1;
-    if (next >= queue.length) setStep("done");
-    else {
-      setQIndex(next);
-      loadIntoEditor(queue[next]);
+  // After deciding the current row (Save or Skip), move on: land on the
+  // next row after this one that hasn't been decided yet, so fixing an
+  // earlier row picks up again right where the user left off instead of
+  // re-walking rows already handled. If every row from here on is already
+  // decided, that means review is finished.
+  function goToNextUndecided(resultsArr) {
+    for (let i = qIndex + 1; i < queue.length; i++) {
+      if (!resultsArr[i]) {
+        loadIndex(i, resultsArr);
+        return;
+      }
     }
+    if (resultsArr.every(Boolean)) {
+      setStep("done");
+    } else if (qIndex + 1 < queue.length) {
+      loadIndex(qIndex + 1, resultsArr);
+    } else {
+      setStep("done");
+    }
+  }
+
+  function goBack() {
+    if (qIndex === 0) return;
+    loadIndex(qIndex - 1);
+  }
+
+  function goForward() {
+    if (qIndex >= queue.length - 1) return;
+    loadIndex(qIndex + 1);
   }
 
   function saveCurrentAndAdvance(remember) {
@@ -3344,64 +3731,29 @@ function ImportStatementView({
       return;
     }
     const t = queue[qIndex];
-    const label = (eDate && dayLabelFromISO(eDate)) || eDesc.slice(0, 20) || "Entry";
-    const prevPageText = pageTextNow;
-    const newText = insertLedgerEntry(prevPageText, {
-      categoryTitle: eCategory.trim(),
-      sign: wantedSign,
-      subTitle: eSub.trim(),
-      label,
-      amount: amt,
-    });
-    setAccounts((prev) => ({ ...prev, [targetAccount]: { ...prev[targetAccount], [targetMonth]: newText } }));
-    setStmtImported((prev) => ({ ...prev, [targetAccount]: [...(prev[targetAccount] || []), t.signature] }));
+    const snapshot = { status: "saved", eDate, eDesc, eAmount, eType, eCategory: eCategory.trim(), eSub: eSub.trim() };
+    const newResults = [...results];
+    newResults[qIndex] = snapshot;
+    setResults(newResults);
+    rebuildLedgerFromResults(newResults);
     if (remember) {
       setStmtCatMap((prev) => ({
         ...prev,
         [targetAccount]: {
           ...(prev[targetAccount] || {}),
-          [normalizeDesc(t.description)]: { category: eCategory.trim(), sign: wantedSign, sub: eSub.trim() },
+          [normalizeDesc(t.description)]: { category: snapshot.eCategory, sign: wantedSign, sub: snapshot.eSub },
         },
       }));
     }
-    setSavedCount((c) => c + 1);
-    setHistory((h) => [
-      ...h,
-      { qIndex, action: "saved", prevPageText, signature: t.signature, eDate, eDesc, eAmount, eType, eCategory, eSub },
-    ]);
-    advance();
+    goToNextUndecided(newResults);
   }
 
   function skipCurrent() {
-    setSkippedCount((c) => c + 1);
-    setHistory((h) => [...h, { qIndex, action: "skipped", eDate, eDesc, eAmount, eType, eCategory, eSub }]);
-    advance();
-  }
-
-  // Reverts the most recent Save or Skip and reloads that transaction back
-  // into the editor — covers both "accidentally entered" (undo a Save,
-  // fix it, save again) and "delete an entry" (undo a Save, then Skip it
-  // instead) without needing a separate edit/delete UI for already-written
-  // ledger lines.
-  function goBack() {
-    if (history.length === 0) return;
-    const last = history[history.length - 1];
-    setHistory((h) => h.slice(0, -1));
-    if (last.action === "saved") {
-      setAccounts((prev) => ({ ...prev, [targetAccount]: { ...prev[targetAccount], [targetMonth]: last.prevPageText } }));
-      setStmtImported((prev) => ({ ...prev, [targetAccount]: (prev[targetAccount] || []).slice(0, -1) }));
-      setSavedCount((c) => c - 1);
-    } else {
-      setSkippedCount((c) => c - 1);
-    }
-    setQIndex(last.qIndex);
-    setEDate(last.eDate);
-    setEDesc(last.eDesc);
-    setEAmount(last.eAmount);
-    setEType(last.eType);
-    setECategory(last.eCategory);
-    setESub(last.eSub);
-    setStep("review");
+    const newResults = [...results];
+    newResults[qIndex] = { status: "skipped", eDate, eDesc, eAmount, eType, eCategory, eSub };
+    setResults(newResults);
+    rebuildLedgerFromResults(newResults);
+    goToNextUndecided(newResults);
   }
 
   return (
@@ -3520,6 +3872,8 @@ function ImportStatementView({
         <div className="p-4 flex flex-col gap-1">
           <div className="font-mono text-[11px] text-zinc-500 mb-1">
             {qIndex + 1} of {queue.length}
+            {results[qIndex]?.status === "saved" && <span className="text-teal-500"> · already saved (editing)</span>}
+            {results[qIndex]?.status === "skipped" && <span className="text-amber-400"> · skipped (empty slot — fill in and Save to add it)</span>}
             {autoCount > 0 && <> · {autoCount} auto-categorized</>}
             {dupCount > 0 && <> · {dupCount} already entered</>}
           </div>
@@ -3620,11 +3974,19 @@ function ImportStatementView({
           <div className="flex gap-2 mt-4">
             <button
               onClick={goBack}
-              disabled={history.length === 0}
-              title="Undo the last Save/Skip and reload it here to fix or drop it"
+              disabled={qIndex === 0}
+              title="Go to the previous row to view or fix it — nothing is deleted"
               className="py-3 px-3 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-30 font-mono text-sm text-zinc-300 flex items-center justify-center"
             >
               <ChevronLeft size={15} />
+            </button>
+            <button
+              onClick={goForward}
+              disabled={qIndex >= queue.length - 1}
+              title="Go to the next row to view or fix it — nothing is deleted"
+              className="py-3 px-3 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-30 font-mono text-sm text-zinc-300 flex items-center justify-center"
+            >
+              <ChevronRight size={15} />
             </button>
             <button onClick={skipCurrent} className="flex-1 py-3 rounded-lg bg-zinc-800 hover:bg-zinc-700 font-mono text-sm text-zinc-300 flex items-center justify-center gap-1.5">
               <SkipForward size={15} /> Skip
@@ -3649,12 +4011,26 @@ function ImportStatementView({
           <div className="font-mono text-xs text-zinc-400 max-w-xs leading-relaxed">
             {savedCount + autoCount} entered ({autoCount} auto-categorized, {savedCount} reviewed) · {dupCount} already entered before, skipped · {skippedCount} skipped by you.
           </div>
+          {attachStatus === "saved" && (
+            <div className="font-mono text-[11px] text-zinc-500 flex items-center gap-1.5">
+              <FileText size={12} /> PDF saved to {targetAccount} · {monthLabel(targetMonth)} — find it under Statement any time.
+            </div>
+          )}
+          {attachStatus === "failed" && (
+            <div className="font-mono text-[11px] text-amber-500">Couldn't save a copy of the PDF for later — the entries above are unaffected.</div>
+          )}
           <button onClick={onClose} className="mt-4 py-2.5 px-6 rounded-lg bg-teal-700 hover:bg-teal-600 font-mono text-sm text-white">
             Done
           </button>
-          {history.length > 0 && (
-            <button onClick={goBack} className="font-mono text-[11px] text-zinc-500 underline text-center">
-              ← Back to fix the last entry
+          {queue.length > 0 && (
+            <button
+              onClick={() => {
+                setStep("review");
+                loadIndex(queue.length - 1);
+              }}
+              className="font-mono text-[11px] text-zinc-500 underline text-center"
+            >
+              ← Back to review any entry
             </button>
           )}
         </div>
