@@ -11,7 +11,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.4.1";
+const APP_VERSION = "1.5.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -181,12 +181,17 @@ function statementEntryRows(parsed, monthKey) {
   return { rows, openingBalance: pbBlock ? pbBlock.computedSum : 0 };
 }
 
-// Advances a page's persisted "order entered" map ({ counter, seq }) to
-// cover every row currently on the page, assigning a fresh sequence number
-// to any signature not seen on this page before. Existing assignments are
-// never touched, so an entry keeps the position it was first typed in even
-// after later edits move it around in the text, correct its amount, or
-// delete-and-retype it identically.
+// Advances a page's persisted "order entered" map ({ counter, seq, slot })
+// to cover every row currently on the page, assigning a fresh sequence
+// number to any signature not seen on this page before. Existing
+// assignments are never touched, so an entry keeps the position it was
+// first typed in even after later edits move it around in the text,
+// correct its amount, or delete-and-retype it identically. `slot` (the
+// feature #39 reservation map — see buildStatement) is carried through
+// untouched; this function only ever assigns fresh, never-reserved counter
+// values, so it can't collide with a reservation, but it must not drop the
+// map or a page's open (skipped) reservations would be lost the next time
+// anything typed on it triggers a re-save.
 function advancePageOrder(pageOrder, rows) {
   let counter = pageOrder?.counter || 0;
   const seq = { ...(pageOrder?.seq || {}) };
@@ -198,18 +203,94 @@ function advancePageOrder(pageOrder, rows) {
       changed = true;
     }
   }
-  return { pageOrder: { counter, seq }, changed };
+  return { pageOrder: { counter, seq, slot: pageOrder?.slot || {} }, changed };
 }
 
-// pageOrder is this page's persisted { counter, seq } (or undefined the
-// first time a page is ever seen). Returns the statement rows sorted by
-// the order each entry was actually typed, the updated pageOrder to
-// persist, and whether anything new was assigned this call (so the caller
-// only needs to write to storage when it actually changed).
+// Reserves one fresh slot per transaction in `txns` (in the order given —
+// real bank-statement order), keyed by each transaction's own stable
+// `signature` (the same one dedupeTransactions/stmtImported already track
+// for dedup purposes — independent of category/sub/label, so it's known
+// before the user has categorized anything). Called once, up front, when
+// a statement-import review queue is built. Reserving before a single row
+// is saved or skipped is what lets a skipped row keep its correct
+// bank-statement position even if it only gets filled in during a much
+// later session. Shares the same `counter` as advancePageOrder's typed-
+// order assignments, so a manually-typed entry and a reserved import slot
+// can never collide.
+function reserveSlots(pageOrder, txns) {
+  let counter = pageOrder?.counter || 0;
+  const slot = { ...(pageOrder?.slot || {}) };
+  let changed = false;
+  for (const t of txns) {
+    if (slot[t.signature] === undefined) {
+      counter += 1;
+      slot[t.signature] = counter;
+      changed = true;
+    }
+  }
+  return { pageOrder: { counter, seq: { ...(pageOrder?.seq || {}) }, slot }, changed };
+}
+
+// Claims a previously-reserved slot for the ledger line that was just
+// written for `txnSignature`. `newText` is the ledger text right after
+// that one insertion; `priorSigSet` is the set of statement-row
+// signatures that existed right before it (mutated in place to include
+// the newly-claimed one, so repeat calls in a loop stay correct call to
+// call). Diffs old vs. new to find the single new row's real, fully
+// index-disambiguated `.sig` (see statementEntryRows), then writes
+// pageOrder.seq[thatSig] = the reserved slot number directly — instead of
+// leaving it for advancePageOrder to assign the next counter value the
+// next time the page happens to be parsed, which is exactly the "typed
+// position, not statement position" behavior the slot system replaces.
+// A no-op (returns changed: false) if there was no reservation for this
+// transaction (e.g. a page from before this feature shipped) or the
+// target sig somehow already has a slot.
+function claimSlot(pageOrder, priorSigSet, newText, monthKey, txnSignature) {
+  const { rows } = statementEntryRows(parseLedger(newText), monthKey);
+  const newSig = rows.map((r) => r.sig).find((s) => !priorSigSet.has(s));
+  if (newSig) priorSigSet.add(newSig);
+  const reserved = pageOrder?.slot?.[txnSignature];
+  if (!newSig || reserved === undefined || pageOrder.seq[newSig] !== undefined) {
+    return { pageOrder, changed: false, newSig };
+  }
+  const counter = Math.max(pageOrder.counter || 0, reserved);
+  return {
+    pageOrder: { ...pageOrder, counter, seq: { ...pageOrder.seq, [newSig]: reserved } },
+    changed: true,
+    newSig,
+  };
+}
+
+// pageOrder is this page's persisted { counter, seq, slot } (or undefined
+// the first time a page is ever seen). Returns the statement rows sorted
+// purely by slot/enteredSeq — the single source of truth for order, no
+// date-based re-sorting — plus the updated pageOrder to persist, and
+// whether anything new was assigned this call (so the caller only needs to
+// write to storage when it actually changed).
+//
+// ==== SLOT SYSTEM (feature #39, replaces the 1.4.2 date-correction pass) ==
+// Every entry on a page occupies a numbered "slot" (`pageOrder.seq[sig]`).
+// Two ways a row gets its slot:
+//  1. Hand-typed entries: unchanged from feature #22 — `advancePageOrder`
+//     below assigns the next free counter value the first time an entry's
+//     signature is seen in the ledger text.
+//  2. Statement-import rows: RESERVED up front, in real bank-statement
+//     order, the moment the review queue is built (`startReview`, in
+//     ImportStatementView) — before the user has saved or skipped a single
+//     row. A skip leaves its reserved slot untouched and open; saving it,
+//     whether in that same session or a much later one after reopening an
+//     attached PDF, claims that same pre-reserved slot rather than
+//     whatever counter value happens to be current at save time. This is
+//     what makes cross-session order correct without ever consulting a
+//     date at report-build time: the row's position was locked in before
+//     it even had a chance to land in the wrong place.
+// Because both paths ultimately just write into the same `seq` map,
+// `buildStatement` itself only ever needs to do one thing: sort by slot.
 function buildStatement(parsed, monthKey, pageOrder) {
   const { rows, openingBalance } = statementEntryRows(parsed, monthKey);
   const { pageOrder: nextOrder, changed: orderChanged } = advancePageOrder(pageOrder, rows);
   for (const r of rows) r.enteredSeq = nextOrder.seq[r.sig];
+
   rows.sort((a, b) => a.enteredSeq - b.enteredSeq || a.lineIndex - b.lineIndex);
 
   let running = openingBalance;
@@ -2582,6 +2663,8 @@ export default function LedgerApp() {
         <ImportStatementView
           accounts={accounts}
           setAccounts={setAccounts}
+          entryOrder={entryOrder}
+          setEntryOrder={setEntryOrder}
           activeAccount={activeAccount}
           activeMonth={activeMonth}
           stmtPasswords={stmtPasswords}
@@ -3509,6 +3592,8 @@ const stmtLabelCls = "font-mono text-[10px] text-zinc-500 uppercase tracking-wid
 function ImportStatementView({
   accounts,
   setAccounts,
+  entryOrder,
+  setEntryOrder,
   activeAccount,
   activeMonth,
   stmtPasswords,
@@ -3716,7 +3801,11 @@ function ImportStatementView({
   // in a row that was skipped — lands that row back in its correct
   // position instead of at the end, and never disturbs any other row.
   function rebuildLedgerFromResults(resultsArr) {
+    const pageKey = `${targetAccount}::${targetMonth}`;
     let text = reviewBaseText;
+    let order = entryOrder[pageKey] || { counter: 0, seq: {}, slot: {} };
+    let orderChanged = false;
+    const claimedSigs = new Set(statementEntryRows(parseLedger(text), targetMonth).rows.map((r) => r.sig));
     const sigs = [];
     queue.forEach((t, i) => {
       const r = resultsArr[i];
@@ -3731,10 +3820,24 @@ function ImportStatementView({
           amount: amt,
         });
         sigs.push(t.signature);
+        // SLOT SYSTEM (feature #39): this row's position in the queue was
+        // reserved back when the queue itself was built (startReview) — in
+        // real bank-statement order, whatever session that ends up being.
+        // Claim that reserved slot for the ledger line just written above
+        // instead of leaving it to be assigned a fresh "first seen in
+        // text" number the next time the page is parsed.
+        const claim = claimSlot(order, claimedSigs, text, targetMonth, t.signature);
+        if (claim.changed) {
+          order = claim.pageOrder;
+          orderChanged = true;
+        }
       }
     });
     setAccounts((prev) => ({ ...prev, [targetAccount]: { ...prev[targetAccount], [targetMonth]: text } }));
     setStmtImported((prev) => ({ ...prev, [targetAccount]: [...reviewBaseSignatures, ...sigs] }));
+    if (orderChanged) {
+      setEntryOrder((prev) => ({ ...prev, [pageKey]: order }));
+    }
   }
 
   // Attaches the PDF that's currently pending (the one just uploaded and
@@ -3781,6 +3884,18 @@ function ImportStatementView({
     const { fresh, skipped } = dedupeTransactions(meta.rawTxns, importedLog);
     setDupCount(skipped.length);
 
+    // SLOT SYSTEM (feature #39): reserve every fresh row's position up
+    // front, in real bank-statement order, before a single one of them has
+    // been auto-applied, saved, or skipped. See the note above
+    // buildStatement for the full rationale — this is what a skipped row
+    // is actually "reserving" (previously that was only true within one
+    // review session's local `results` array; now it's true for the page's
+    // persisted order too, across however many sessions it takes to fill
+    // the row in).
+    const pageKey = `${targetAccount}::${targetMonth}`;
+    let order = reserveSlots(entryOrder[pageKey], fresh).pageOrder;
+    const claimedSigs = new Set(statementEntryRows(parseLedger(pageText), targetMonth).rows.map((r) => r.sig));
+
     // Auto-apply anything whose description was categorized before for this
     // account — "if a similar transaction is found, automatically update
     // the sheet."
@@ -3800,6 +3915,7 @@ function ImportStatementView({
           amount: t.amount,
         });
         newSignatures.push(t.signature);
+        order = claimSlot(order, claimedSigs, workingText, targetMonth, t.signature).pageOrder;
         auto++;
       } else {
         toReview.push(t);
@@ -3811,6 +3927,7 @@ function ImportStatementView({
     if (newSignatures.length) {
       setStmtImported((prev) => ({ ...prev, [targetAccount]: [...(prev[targetAccount] || []), ...newSignatures] }));
     }
+    setEntryOrder((prev) => ({ ...prev, [pageKey]: order }));
     setAutoCount(auto);
     setQueue(toReview);
     setResults(toReview.map(() => null));
