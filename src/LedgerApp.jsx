@@ -11,7 +11,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.0.1";
+const APP_VERSION = "1.0.2";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -852,7 +852,15 @@ function dedupeTransactions(candidates, importedSignatures) {
       candidateCounts[baseSig] = (candidateCounts[baseSig] || 0) + 1;
       const occIndex = candidateCounts[baseSig];
       const indexedSig = `${baseSig}#${occIndex}`;
-      if ((seenCounts[baseSig] || 0) >= occIndex) {
+      // Bug fix: what's actually stored in stmtImported (and therefore
+      // counted into seenCounts) is the INDEXED signature ("base#1",
+      // "base#2", ...), never the bare baseSig on its own -- so this must
+      // check seenCounts[indexedSig], not seenCounts[baseSig]. The old
+      // baseSig lookup could never find a match (that key never gets
+      // stored), so every ref-less transaction -- i.e. every non-UPI row
+      // with no extractable reference number -- was always treated as
+      // fresh and re-inserted on every re-import, duplicating it.
+      if (seenCounts[indexedSig]) {
         skipped.push(c);
       } else {
         fresh.push({ ...c, signature: indexedSig });
