@@ -11,7 +11,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.0.0";
+const APP_VERSION = "1.0.1";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -3158,7 +3158,6 @@ function ImportStatementView({
       }
 
       const bkey = bankMapKey(bankName, tail);
-      const mappedAccount = stmtBankMap[bkey];
       // Fresh evidence from THIS statement's own header outranks a
       // remembered bank-tail mapping, which could have been set by an
       // earlier statement that got imported into the wrong account.
@@ -3168,13 +3167,18 @@ function ImportStatementView({
       // mapping or whatever account happened to be active, since either
       // could silently be wrong. Leave it unselected and make the user
       // choose explicitly (see the "account" step below).
-      const defaultAccount = !holderName
-        ? ""
-        : holderMatch && accounts[holderMatch]
-        ? holderMatch
-        : mappedAccount && accounts[mappedAccount]
-        ? mappedAccount
-        : activeAccount;
+      //
+      // Same reasoning applies, just as importantly, when a holder name WAS
+      // detected but matches no existing account: that's fresh evidence
+      // that actively conflicts with a remembered bank-tail mapping (e.g.
+      // an SBI account belonging to "Ambika" being defaulted to "Sreedev"
+      // just because an earlier, different statement from that bank+tail
+      // combo was once imported there). A stale mapping is no more
+      // trustworthy here than no evidence at all, so this no longer falls
+      // back to `stmtBankMap` / `activeAccount` — it stays unselected too,
+      // with its own explanatory message below prompting the user to pick
+      // or create the right account explicitly.
+      const defaultAccount = holderMatch && accounts[holderMatch] ? holderMatch : "";
 
       setMeta({ bankName, tail, rawTxns, bkey, holderName, period });
       setTargetAccount(defaultAccount);
@@ -3257,7 +3261,11 @@ function ImportStatementView({
   const accountMissingForPeriod = meta && targetAccount && periodMonthKeys.some((mk) => accounts[targetAccount]?.[mk] === undefined);
 
   function createAccountForImport() {
-    askPrompt("New account name (e.g. Ambika, Home, Sree hand):", "", (name) => {
+    // If a holder name was detected, suggest its first word as a starting
+    // point (e.g. "Ambika" from "Ambika M") — just a convenience default,
+    // fully editable, not an auto-creation.
+    const suggested = meta?.holderName ? meta.holderName.split(" ")[0] : "";
+    askPrompt("New account name (e.g. Ambika, Home, Sree hand):", suggested, (name) => {
       const trimmed = (name || "").trim();
       if (!trimmed) return;
       const monthKeys = periodMonthKeys.length ? periodMonthKeys : [targetMonth];
@@ -3437,6 +3445,12 @@ function ImportStatementView({
           ) : (
             <div className="font-mono text-xs text-amber-300 leading-relaxed mb-1">
               Couldn't detect whose statement this is — please select or create the account below.
+            </div>
+          )}
+          {meta.holderName && !targetAccount && (
+            <div className="font-mono text-xs text-amber-300 leading-relaxed mb-1">
+              "{meta.holderName}" doesn't match any existing account — please select the right one below, or create a
+              new one for them.
             </div>
           )}
           {meta.period && (
