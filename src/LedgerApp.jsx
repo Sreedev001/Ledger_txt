@@ -828,24 +828,79 @@ function txnSignature(dateISO, amount, description, refNumber) {
 // generate a statement on the 10th and enter it, regenerating on the 20th
 // shouldn't ask me to re-enter the same rows."
 function dedupeTransactions(candidates, importedSignatures) {
-  const seen = new Set(importedSignatures || []);
+  const seenCounts = {};
+  for (const sig of importedSignatures || []) {
+    seenCounts[sig] = (seenCounts[sig] || 0) + 1;
+  }
   const fresh = [];
   const skipped = [];
+  const candidateCounts = {};
+
   for (const c of candidates) {
-    const sig = txnSignature(c.dateISO, c.amount, c.description, c.refNumber);
-    if (seen.has(sig)) skipped.push(c);
-    else fresh.push({ ...c, signature: sig });
+    if (c.refNumber) {
+      const sig = `ref:${c.refNumber}`;
+      if (seenCounts[sig]) skipped.push(c);
+      else fresh.push({ ...c, signature: sig });
+    } else {
+      const baseSig = `${c.dateISO || "?"}|${formatNum(c.amount)}|${normalizeDesc(c.description)}`;
+      candidateCounts[baseSig] = (candidateCounts[baseSig] || 0) + 1;
+      const occIndex = candidateCounts[baseSig];
+      const indexedSig = `${baseSig}#${occIndex}`;
+      if ((seenCounts[baseSig] || 0) >= occIndex) {
+        skipped.push(c);
+      } else {
+        fresh.push({ ...c, signature: indexedSig });
+      }
+    }
   }
   return { fresh, skipped };
 }
 
+function isHeaderMetadataLine(line) {
+  return /^\s*(as on|date\s*:|date of statement|statement (from|period|date)|period\s*:|printed|generated|page \d|account summary|statement of account)/i.test(line);
+}
+function isTableColumnHeaderLine(line) {
+  const hasDateCol = /\b(value date|post date|txn date|date)\b/i.test(line);
+  const hasDescCol = /\b(particulars|details|narration|description)\b/i.test(line);
+  const hasAmountCol = /\b(debit|credit|balance|withdrawal|deposit|amount)\b/i.test(line);
+  return (hasDateCol && (hasDescCol || hasAmountCol)) || (hasDescCol && hasAmountCol);
+}
+function getHeaderEndIdx(lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    if (isTableColumnHeaderLine(line)) return i;
+    if (isHeaderMetadataLine(line)) continue;
+    const dateM = line.match(DATE_TOKEN_RE);
+    if (dateM && dateM.index <= 6) {
+      const rest = line.slice(dateM.index + dateM[0].length);
+      if (AMOUNT_TOKEN_RE.test(rest) || (i + 1 < lines.length && lines[i + 1].match(DATE_TOKEN_RE))) {
+        return i;
+      }
+    }
+  }
+  return lines.length;
+}
+
 const KNOWN_BANK_NAMES = [
-  "State Bank of India", "SBI", "HDFC Bank", "HDFC", "ICICI Bank", "ICICI",
-  "Axis Bank", "Kotak Mahindra Bank", "Kotak", "Punjab National Bank", "PNB",
-  "Bank of Baroda", "Canara Bank", "Union Bank of India", "IDFC FIRST Bank",
-  "IndusInd Bank", "Yes Bank", "IDBI Bank", "Federal Bank", "RBL Bank",
-  "Bank of India", "Central Bank of India", "Indian Bank", "UCO Bank",
-  "Chase", "Bank of America", "Wells Fargo", "Citibank", "HSBC",
+  "State Bank of India", "SBI", "State Bank", "HDFC Bank", "HDFC", "ICICI Bank", "ICICI",
+  "Axis Bank", "Axis", "Kotak Mahindra Bank", "Kotak", "Punjab National Bank", "PNB",
+  "Bank of Baroda", "BOB", "Canara Bank", "Union Bank of India", "Union Bank",
+  "IDFC FIRST Bank", "IDFC First", "IDFC", "IndusInd Bank", "IndusInd",
+  "Yes Bank", "IDBI Bank", "IDBI", "Federal Bank", "RBL Bank", "Ratnakar Bank",
+  "Bank of India", "BOI", "Central Bank of India", "Indian Bank", "UCO Bank",
+  "Bandhan Bank", "Karur Vysya Bank", "KVB", "South Indian Bank", "SIB",
+  "Karnataka Bank", "City Union Bank", "CUB", "Jammu & Kashmir Bank", "J&K Bank",
+  "Dhanlaxmi Bank", "Saraswat Bank", "Cosmos Bank", "SVC Bank", "CSB Bank", "Catholic Syrian Bank",
+  "Punjab & Sind Bank", "PSB", "Standard Chartered Bank", "Standard Chartered",
+  "DBS Bank", "DBS", "HSBC Bank", "HSBC", "Citibank", "Citi", "Bank of America",
+  "Wells Fargo", "Chase", "JPMorgan Chase",
+  "AU Small Finance Bank", "AU SFB", "Equitas Small Finance Bank", "Equitas",
+  "Ujjivan Small Finance Bank", "Ujjivan", "Capital Small Finance Bank",
+  "Jana Small Finance Bank", "Suryoday Small Finance Bank", "Utkarsh Small Finance Bank",
+  "Fincare Small Finance Bank", "Unity Small Finance Bank", "ESAF Small Finance Bank",
+  "Paytm Payments Bank", "Paytm Bank", "Airtel Payments Bank", "Airtel Bank",
+  "India Post Payments Bank", "IPPB", "FINO Payments Bank", "NSDL Payments Bank", "Jio Payments Bank",
 ];
 
 function scanForBankName(text, preferFullNames) {
@@ -866,17 +921,13 @@ function scanForBankName(text, preferFullNames) {
 // the page instead of the actual letterhead, which always sits at the top.
 function guessBankName(fullText) {
   const lines = fullText.split("\n");
-  let headerEndIdx = lines.length;
-  for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(DATE_TOKEN_RE);
-    if (m && m.index <= 6) {
-      headerEndIdx = i;
-      break;
-    }
-  }
+  const headerEndIdx = getHeaderEndIdx(lines);
   const header = lines.slice(0, headerEndIdx).join("\n");
   const headerHit = scanForBankName(header);
   if (headerHit) return headerHit;
+  const genericBankM = header.match(/\b([A-Za-z0-9&. -]{2,30}\s+(?:Bank|Payments Bank|Small Finance Bank|Co-?operative Bank))\b/i);
+  if (genericBankM) return genericBankM[1].trim();
+
   // Fallback: header extraction can vary by PDF, so if nothing matched
   // there, scan the whole document -- but prefer full multi-word names
   // over bare abbreviations, since a full name is far less likely to be a
@@ -910,12 +961,22 @@ function findAccountMatchingHolder(accounts, holderName) {
   const h = normalizeDesc(holderName);
   if (!h) return null;
   const hTokens = h.split(" ").filter(Boolean);
+  let bestMatch = null;
+  let maxScore = 0;
+
   for (const name of Object.keys(accounts)) {
     const a = normalizeDesc(name);
     if (!a) continue;
-    if (a === h || hTokens.includes(a) || h.startsWith(a + " ")) return name;
+    if (a === h) return name;
+    if (h.startsWith(a + " ")) return name;
+    if (a.length >= 2 && hTokens.includes(a)) {
+      if (a.length > maxScore) {
+        maxScore = a.length;
+        bestMatch = name;
+      }
+    }
   }
-  return null;
+  return bestMatch;
 }
 
 const MONTH_NAME_RE = /(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*/i;
@@ -1166,15 +1227,20 @@ function parseTransactionRow(row) {
   const dateISO = parseDateToken(dateM[1]);
   if (!dateISO) return null;
   const rest = line.slice(dateM.index + dateM[0].length);
-  let amountMatches = [...rest.matchAll(DECIMAL_AMOUNT_RE)];
-  if (amountMatches.length === 0) amountMatches = [...rest.matchAll(AMOUNT_TOKEN_RE)];
+
+  // Strip percentage and rate tokens (e.g. "18.00%", "@ 18.00") before matching amounts
+  const cleanedRest = rest.replace(/(\d+(?:\.\d{1,2})?)\s*%/g, " ")
+                          .replace(/@\s*\d+(?:\.\d{1,2})?/g, " ");
+
+  let amountMatches = [...cleanedRest.matchAll(DECIMAL_AMOUNT_RE)];
+  if (amountMatches.length === 0) amountMatches = [...cleanedRest.matchAll(AMOUNT_TOKEN_RE)];
   if (amountMatches.length === 0) return null;
   const parsedAmounts = amountMatches
     .map((mm) => ({
       value: parseFloat(mm[0].replace(/,/g, "")),
       start: mm.index,
       end: mm.index + mm[0].length,
-      marker: markerNear(rest, mm.index, mm.index + mm[0].length),
+      marker: markerNear(cleanedRest, mm.index, mm.index + mm[0].length),
     }))
     .filter((a) => !isNaN(a.value));
   if (parsedAmounts.length === 0) return null;
@@ -1204,19 +1270,6 @@ function parseTransactionRow(row) {
     balance = null;
   }
 
-  // Debit vs credit is decided ONLY by an explicit Cr/Dr marker actually
-  // present in the row's text -- never guessed from column position or
-  // from whether the running balance went up or down. Those are
-  // assumptions the statement itself never states, and guessing wrong
-  // silently sends a transaction to the wrong side of the ledger. If no
-  // marker is found anywhere, `type` stays "unknown" and the review step
-  // requires the user to pick Money In / Money Out by hand.
-  // Priority: (1) a marker glued or bracketed onto one specific amount --
-  // the most direct evidence; (2) an explicit Cr/Dr or credited/debited
-  // word anywhere in the row's text -- still direct evidence, just not
-  // tied to one amount's exact position (this is what catches a marker
-  // like "DR" sitting mid-narration, e.g. "UPIAR/.../DR/PAYEE NAME/...",
-  // far from the amount digits).
   let type = "unknown";
   for (const a of parsedAmounts) {
     if (a.marker) {
@@ -1224,16 +1277,23 @@ function parseTransactionRow(row) {
       break;
     }
   }
+  // Debit vs credit is decided ONLY by an explicit Cr/Dr marker actually
+  // present in the row's text -- never guessed from column position or
+  // from whether the running balance went up or down. Those are
+  // assumptions the statement itself never states, and guessing wrong
+  // silently sends a transaction to the wrong side of the ledger. If no
+  // marker is found anywhere, `type` stays "unknown" and the review step
+  // requires the user to pick Money In / Money Out by hand.
   if (type === "unknown") {
     if (/\bcr\b|credit(ed)?\b/i.test(fullRow)) type = "credit";
     else if (/\bdr\b|debit(ed)?\b/i.test(fullRow)) type = "debit";
   }
   // Some banks (SBI here) print no Cr/Dr word at all on certain rows,
   // instead prefixing the narration itself with "DEP" (deposit, i.e. money
-  // coming in) or "WDL" (withdrawal, i.e. money going out) -- e.g. "DEP TFR
-  // NEFT*...". Still an explicit word the statement itself states, same
-  // tier of evidence as the Cr/Dr check above, just bank-specific
-  // terminology -- not a guess from column position or balance direction.
+  // coming in) or "WDL" (withdrawal, i.e. money going out). Still an
+  // explicit word the statement itself states, same tier of evidence as
+  // the Cr/Dr check above, just bank-specific terminology -- not a guess
+  // from column position or balance direction.
   if (type === "unknown") {
     if (/\bDEP\b/i.test(narrationHead)) type = "credit";
     else if (/\bWDL\b/i.test(narrationHead)) type = "debit";
@@ -1282,15 +1342,6 @@ function resolveTransactionSigns(transactions) {
 // header block — everything before the transaction table starts, same
 // boundary guessBankName uses — so a counterparty's name sitting inside a
 // narration row can never be mistaken for the statement owner's own name.
-// Tries an explicit label first ("Name:", "Account Holder:", "Customer
-// Name:"), then a "Mr./Mrs./Shri <name>" style salutation line, since not
-// every bank's PDF layout uses a labelled field.
-// A two-column statement header (name on the left, bank name on the right,
-// same visual row) gets flattened by reconstructLines into ONE line, e.g.
-// "Miss. AMBIKA M State Bank of India" — column position/spacing is lost at
-// that point, so a salutation regex anchored to end-of-line never matches.
-// Strips a recognized bank name (and everything after it) off the end of a
-// line first, so the salutation match below sees just "Miss. AMBIKA M".
 function stripTrailingBankName(line) {
   const sorted = [...KNOWN_BANK_NAMES].sort((a, b) => b.length - a.length);
   for (const name of sorted) {
@@ -1301,28 +1352,43 @@ function stripTrailingBankName(line) {
 }
 function guessAccountHolderName(fullText) {
   const lines = fullText.split("\n").map((l) => l.trim()).filter(Boolean);
-  let headerEndIdx = lines.length;
-  for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(DATE_TOKEN_RE);
-    if (m && m.index <= 6) {
-      headerEndIdx = i;
-      break;
-    }
-  }
+  const headerEndIdx = getHeaderEndIdx(lines);
   const header = lines.slice(0, headerEndIdx);
+
   for (const rawLine of header) {
     const line = stripTrailingBankName(rawLine);
-    const m = line.match(/(?:account\s*holder(?:'?s)?\s*name|holder\s*name|customer\s*name|name)\s*[:\-]\s*(.+)/i);
+    if (/^\s*(branch|bank|product|nominee|scheme|company)\s+name\b/i.test(line)) continue;
+    const m = line.match(/(?:account\s*holder(?:'?s)?\s*name|holder\s*name|customer\s*name|account\s*name|a\/c\s*holder\s*name|a\/c\s*name|client\s*name|primary\s*holder|account\s*title|\bname)\s*[:\-]\s*(.+)/i);
     if (m) {
-      const val = m[1].replace(/\s{2,}/g, " ").trim();
+      let val = m[1].replace(/\s{2,}/g, " ").trim();
+      const cut = val.search(/\b(email|a\/c|account|branch|ifsc|cif|pan|mobile|phone|address)\b/i);
+      if (cut > 0) val = val.slice(0, cut).trim();
       if (val && /[A-Za-z]/.test(val) && val.length <= 60) return titleCaseWords(val);
     }
   }
+
   for (const rawLine of header) {
     const line = stripTrailingBankName(rawLine);
-    const m = line.match(/^(?:mr|mrs|ms|miss|shri|smt|m\/s)\.?\s+([A-Za-z][A-Za-z .]{2,50})$/i);
-    if (m) return titleCaseWords(m[1].trim());
+    const m = line.match(/(?:^|\b)(?:mr|mrs|ms|miss|shri|smt|m\/s|dr)\.?\s+([A-Za-z][A-Za-z .]{2,50})/i);
+    if (m) {
+      let val = m[1].trim();
+      const cut = val.search(/\b(email|address|road|street|nagar|post|p\.?o|dist|flat|house|bhavan|near|opposite|state|bank|india)\b/i);
+      if (cut > 0) val = val.slice(0, cut).trim();
+      if (val && val.length >= 2) return titleCaseWords(val);
+    }
   }
+
+  for (const rawLine of header) {
+    const line = stripTrailingBankName(rawLine);
+    if (/^\s*(statement|account|summary|bank|period|branch|ifsc|micr|cif|page|date|balance)\b/i.test(line)) continue;
+    if (/\d/.test(line)) continue;
+    if (/@/.test(line)) continue;
+    const words = line.split(/\s+/).filter(Boolean);
+    if (words.length >= 2 && words.length <= 4 && words.every((w) => /^[A-Za-z.]{2,}$/.test(w))) {
+      return titleCaseWords(line.trim());
+    }
+  }
+
   return "";
 }
 
