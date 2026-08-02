@@ -11,7 +11,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.3.0";
+const APP_VERSION = "1.4.1";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -1415,6 +1415,15 @@ function guessAccountHolderName(fullText) {
 // Also returns every monthKey the period spans (usually one, but a
 // mid-cycle statement can straddle two), capped at 24 to guard against a
 // parsing fluke producing a wild date range.
+// Short "1 Jul" / "1 Jul 2025" style formatter for the period label below —
+// deliberately not reusing dayLabelFromISO (bare day number, no month), since
+// this needs to read standalone in an attachment list without a month
+// already shown alongside it.
+function formatDateShort(iso, withYear) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return `${d} ${MONTHS_SHORT[m - 1]}` + (withYear ? ` ${y}` : "");
+}
+
 function guessStatementPeriod(transactions) {
   const dated = transactions.filter((t) => t.dateISO);
   if (!dated.length) return null;
@@ -1428,7 +1437,9 @@ function guessStatementPeriod(transactions) {
     monthKeys.push(cur);
     cur = addMonths(cur, 1);
   }
-  return { startISO, endISO, monthKeys };
+  const sameYear = startISO.slice(0, 4) === endISO.slice(0, 4);
+  const label = `${formatDateShort(startISO, !sameYear)} – ${formatDateShort(endISO, true)}`;
+  return { startISO, endISO, monthKeys, label };
 }
 
 // Best-effort statement month guess from a "Period: dd/mm/yyyy to dd/mm/yyyy"
@@ -1946,6 +1957,13 @@ export default function LedgerApp() {
   const [showingLoans, setShowingLoans] = useState(false);
   const [showingStatement, setShowingStatement] = useState(false);
   const [showingImport, setShowingImport] = useState(false);
+  // Set when an already-attached statement PDF is reopened via the
+  // attachments sheet or the Statement report's attachment list, instead of
+  // via the wizard's own "Choose PDF statement" picker. ImportStatementView
+  // consumes this once on mount to skip straight past the file-pick step.
+  // Always cleared alongside showingImport (both on open-via-Accounts-sheet
+  // and on close) so a stale reopen never bleeds into a later normal import.
+  const [pendingImportAttachment, setPendingImportAttachment] = useState(null);
   const [showHelp, setShowHelp] = useState(false);
   const [stmtPasswords, setStmtPasswords] = useState(() => {
     try {
@@ -2206,6 +2224,20 @@ export default function LedgerApp() {
     } else {
       setSheet(null);
     }
+  }
+  // Reopens an already-attached statement PDF straight into the Import
+  // bank statement wizard, pre-loaded (used by both the top-bar attachments
+  // sheet and the Statement report's attachment list — see onOpenAttachment
+  // threaded into AttachmentsSheetBody/StatementView below). The blob only
+  // ever lived in IndexedDB, so it's wrapped back into a File here (same
+  // filename/type) purely so it satisfies the same `File`-shaped interface
+  // handleFile/attachPendingPdf already expect from the normal upload path.
+  function openAttachmentInImport(rec, account, month) {
+    const file = new File([rec.blob], rec.filename, { type: rec.blob.type || "application/pdf" });
+    setPendingImportAttachment({ file, account, month });
+    setShowingStatement(false);
+    closeSheet();
+    setShowingImport(true);
   }
   // The only sanctioned way to close the non-dismissible month-new sheet:
   // used when the app itself resolves the "fresh month" state (an account
@@ -2519,7 +2551,14 @@ export default function LedgerApp() {
           </button>
           <span className="font-mono text-xs uppercase tracking-widest text-zinc-400">Statement</span>
         </div>
-        <StatementView accounts={accounts} defaultAccount={activeAccount} defaultMonth={activeMonth} entryOrder={entryOrder} setEntryOrder={setEntryOrder} />
+        <StatementView
+          accounts={accounts}
+          defaultAccount={activeAccount}
+          defaultMonth={activeMonth}
+          entryOrder={entryOrder}
+          setEntryOrder={setEntryOrder}
+          onOpenAttachment={openAttachmentInImport}
+        />
       </div>
     );
   }
@@ -2528,7 +2567,13 @@ export default function LedgerApp() {
     return (
       <div className="h-screen flex flex-col bg-black text-zinc-100">
         <div className="flex items-center gap-3 px-4 py-3 bg-[#151517] shrink-0">
-          <button onClick={() => setShowingImport(false)} className="flex items-center gap-1 -ml-1 px-1 py-1 text-zinc-300 hover:text-white">
+          <button
+            onClick={() => {
+              setShowingImport(false);
+              setPendingImportAttachment(null);
+            }}
+            className="flex items-center gap-1 -ml-1 px-1 py-1 text-zinc-300 hover:text-white"
+          >
             <X size={20} />
             <span className="font-mono text-xs">Close</span>
           </button>
@@ -2550,7 +2595,13 @@ export default function LedgerApp() {
           askPrompt={askPrompt}
           askConfirm={askConfirm}
           showAlert={showAlert}
-          onClose={() => setShowingImport(false)}
+          initialFile={pendingImportAttachment?.file}
+          initialAccount={pendingImportAttachment?.account}
+          initialMonth={pendingImportAttachment?.month}
+          onClose={() => {
+            setShowingImport(false);
+            setPendingImportAttachment(null);
+          }}
         />
         <Dialog dialog={dialog} setDialog={setDialog} />
       </div>
@@ -2680,6 +2731,7 @@ export default function LedgerApp() {
             icon={<FileText size={17} />}
             label="Import bank statement"
             onClick={() => {
+              setPendingImportAttachment(null);
               setShowingImport(true);
               closeSheet();
             }}
@@ -2769,7 +2821,12 @@ export default function LedgerApp() {
           attached to the account+month currently open, without leaving the
           main editor or touching the file picker again */}
       <BottomSheet open={sheet === "attachments"} onClose={closeSheet} title={`Statements · ${activeAccount} · ${monthLabel(activeMonth)}`}>
-        <AttachmentsSheetBody account={activeAccount} month={activeMonth} onCountChange={setAttachCount} />
+        <AttachmentsSheetBody
+          account={activeAccount}
+          month={activeMonth}
+          onCountChange={setAttachCount}
+          onOpenAttachment={openAttachmentInImport}
+        />
       </BottomSheet>
 
       {/* menu sheet */}
@@ -3182,7 +3239,7 @@ function statementDateCell(iso) {
 // into the Statement report at all). `onCountChange`, if given, is called
 // every time the loaded count changes, purely so a caller (the top-bar
 // badge) can mirror it without its own separate IndexedDB read.
-function useStatementAttachments(account, month, onCountChange) {
+function useStatementAttachments(account, month, onCountChange, onOpenAttachment) {
   const [items, setItems] = useState(null); // null = still loading this page
   const [busyId, setBusyId] = useState(null);
 
@@ -3209,11 +3266,18 @@ function useStatementAttachments(account, month, onCountChange) {
   }, [account, month]);
 
   function openAttachment(rec) {
-    // Blob URL, not a filesystem path — the PDF lives only in IndexedDB,
-    // so this is generated fresh each time and revoked shortly after,
-    // rather than pointing at anywhere on disk. This is the "reopen
-    // without reopening/reuploading the original file" path: the bytes
-    // never left IndexedDB, so there's nothing to re-pick from the OS.
+    // Tapping an attached statement re-opens it straight into the Import
+    // bank statement wizard (pre-loaded, skipping the file picker) rather
+    // than opening the raw PDF in a viewer tab — a PDF viewer isn't
+    // actionable for a finance ledger, but re-running it through review is
+    // (e.g. to fix a skipped row). `onOpenAttachment`, when given, is the
+    // caller's hook to do that navigation; it's always provided by both
+    // current call sites (the top-bar sheet and the Statement report), so
+    // the blob-URL path below only remains as a defensive fallback.
+    if (onOpenAttachment) {
+      onOpenAttachment(rec, account, month);
+      return;
+    }
     const url = URL.createObjectURL(rec.blob);
     window.open(url, "_blank");
     setTimeout(() => URL.revokeObjectURL(url), 60000);
@@ -3242,8 +3306,8 @@ function useStatementAttachments(account, month, onCountChange) {
 // visual clutter to months that were typed by hand with no statement
 // import involved. (Embedded in the Statement report; see
 // AttachmentsSheetBody below for the always-visible top-bar version.)
-function StatementAttachments({ account, month }) {
-  const { items, busyId, openAttachment, removeAttachment } = useStatementAttachments(account, month);
+function StatementAttachments({ account, month, onOpenAttachment }) {
+  const { items, busyId, openAttachment, removeAttachment } = useStatementAttachments(account, month, null, onOpenAttachment);
 
   if (!items || items.length === 0) return null;
 
@@ -3282,8 +3346,8 @@ function StatementAttachments({ account, month }) {
 // user explicitly opened shouldn't just render blank. Reports its live
 // count up to the parent via onCountChange, which drives the small badge
 // on the top-bar paperclip button.
-function AttachmentsSheetBody({ account, month, onCountChange }) {
-  const { items, busyId, openAttachment, removeAttachment } = useStatementAttachments(account, month, onCountChange);
+function AttachmentsSheetBody({ account, month, onCountChange, onOpenAttachment }) {
+  const { items, busyId, openAttachment, removeAttachment } = useStatementAttachments(account, month, onCountChange, onOpenAttachment);
 
   if (!items) {
     return <div className="px-1 py-6 text-center font-mono text-xs text-zinc-500">Loading…</div>;
@@ -3324,7 +3388,7 @@ function AttachmentsSheetBody({ account, month, onCountChange }) {
   );
 }
 
-function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, setEntryOrder }) {
+function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, setEntryOrder, onOpenAttachment }) {
   const [account, setAccount] = useState(defaultAccount);
   const [month, setMonth] = useState(defaultMonth);
 
@@ -3378,7 +3442,7 @@ function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, set
         </button>
       </div>
 
-      <StatementAttachments account={account} month={month} />
+      <StatementAttachments account={account} month={month} onOpenAttachment={onOpenAttachment} />
 
       {accounts[account]?.[month] === undefined ? (
         <div className="rounded-lg border border-zinc-800 bg-zinc-800/60 px-3 py-2 font-mono text-[11px] text-zinc-400">
@@ -3458,6 +3522,9 @@ function ImportStatementView({
   askPrompt,
   askConfirm,
   showAlert,
+  initialFile,
+  initialAccount,
+  initialMonth,
   onClose,
 }) {
   const [step, setStep] = useState("pick"); // pick | opening | account | review | done
@@ -3589,6 +3656,27 @@ function ImportStatementView({
       setStep("pick");
     }
   }
+
+  // Reopening an already-attached PDF (via the top-bar attachments sheet or
+  // the Statement report's list) skips the "Choose PDF statement" step
+  // entirely and jumps straight to parsing it, same as if it had just been
+  // picked from the file input. Runs once on mount only — this component is
+  // freshly mounted every time the wizard is opened (see the showingImport
+  // early-return in the parent), so there's no risk of re-firing on a later
+  // re-render. Since this PDF is already known to belong to a specific
+  // account+month (that's literally where it's attached), that known page
+  // overrides whatever handleFile's own bank/holder-name detection guesses
+  // once parsing finishes — real evidence beats a guess, same principle
+  // used elsewhere in this file (feature #34).
+  useEffect(() => {
+    if (!initialFile) return;
+    (async () => {
+      await handleFile(initialFile);
+      if (initialAccount) setTargetAccount(initialAccount);
+      if (initialMonth) setTargetMonth(initialMonth);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function loadIntoEditor(t) {
     setEDate(t.dateISO || "");
