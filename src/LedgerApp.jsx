@@ -1,17 +1,23 @@
 import React, { useState, useRef, useMemo, useEffect } from "react";
-import { Undo2, Redo2, Plus, AlignLeft, MoreVertical, X, Download, Upload, Pencil, Trash2, Layers, HelpCircle, Type, AlignJustify, Landmark, ChevronLeft, ChevronRight, CalendarDays, Receipt, FileText, Check, SkipForward, Loader2, Paperclip } from "lucide-react";
+import { Undo2, Redo2, Plus, AlignLeft, MoreVertical, X, Download, Upload, Pencil, Trash2, Layers, HelpCircle, Type, AlignJustify, Landmark, ChevronLeft, ChevronRight, CalendarDays, Receipt, FileText, Check, SkipForward, Loader2, Paperclip, Cloud, CloudOff } from "lucide-react";
 import * as pdfjsLib from "pdfjs-dist";
 // NOTE: requires "pdfjs-dist" added to package.json dependencies (not part of
 // the previously-generated scaffold — see CONTEXT.md's package list, which
 // needs this one addition for the statement-import feature below).
 import pdfjsWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
+// NOTE: requires "@capawesome/capacitor-google-sign-in" added to
+// package.json (see CONTEXT.md's Google Drive backup section, feature
+// #40, for the Google Cloud Console + native setup this also needs — it
+// can't be done from inside this file alone).
+import { GoogleSignIn } from "@capawesome/capacitor-google-sign-in";
+import { App as CapApp } from "@capacitor/app";
 
 // App version, shown in the Menu sheet (see the "menu" BottomSheet further
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.5.0";
+const APP_VERSION = "1.6.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -1844,6 +1850,40 @@ async function renameAttachmentsAccount(oldName, newName) {
   }
 }
 
+// Every attachment across every account/month, for the Google Drive
+// backup (feature #40) — the whole point of a backup is it isn't scoped
+// to one page. Blobs are handed back as-is; the caller (buildBackupPayload)
+// is responsible for base64-encoding them for JSON transport.
+async function listAllStatementAttachments() {
+  const db = await openAttachDb();
+  try {
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(ATTACH_STORE, "readonly");
+      const req = tx.objectStore(ATTACH_STORE).getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+// Writes a fully-formed attachment record back in as-is (same shape
+// listAllStatementAttachments returns, with `blob` already converted back
+// from base64) — used only by restoreBackupPayload. Existing local
+// attachments are left untouched; a restore is additive (put, not clear +
+// put), so restoring on top of a page that already has some attachments
+// doesn't lose them, and re-restoring the same backup twice just
+// overwrites the same ids harmlessly (put is idempotent by id).
+async function putStatementAttachmentRecord(record) {
+  const db = await openAttachDb();
+  try {
+    await runAttachTx(db, "readwrite", (store) => store.put(record));
+  } finally {
+    db.close();
+  }
+}
+
 /* ========================================================================= */
 
 const STORAGE_ACCOUNTS = "ledger_accounts_v3";
@@ -1875,6 +1915,229 @@ const STORAGE_STMT_PASSWORDS = "ledger_stmt_passwords_v1";
 const STORAGE_STMT_BANKMAP = "ledger_stmt_bankmap_v1";
 const STORAGE_STMT_CATMAP = "ledger_stmt_catmap_v1";
 const STORAGE_STMT_IMPORTED = "ledger_stmt_imported_v1";
+// Google Drive backup (feature #40, see the BACKUP section below):
+// STORAGE_GOOGLE_ACCOUNT: { email, displayName } | null — just enough to
+//   show "Backing up to you@gmail.com" in the Menu sheet. Never stores the
+//   access token itself (short-lived by design; re-obtained from the
+//   Credential Manager each time it's needed instead of persisted).
+// STORAGE_DRIVE_FOLDER_ID / STORAGE_DRIVE_FILE_ID: the Drive file IDs of
+//   this app's backup folder and the backup file inside it, cached after
+//   the first backup so every later run doesn't have to re-search Drive
+//   for them.
+// STORAGE_LAST_BACKUP_AT: ISO timestamp of the last successful backup, for
+//   the "Last backed up: ..." line in the Menu sheet.
+const STORAGE_GOOGLE_ACCOUNT = "ledger_google_account_v1";
+const STORAGE_DRIVE_FOLDER_ID = "ledger_drive_folder_id_v1";
+const STORAGE_DRIVE_FILE_ID = "ledger_drive_file_id_v1";
+const STORAGE_LAST_BACKUP_AT = "ledger_last_backup_at_v1";
+
+/* =========================================================================
+   GOOGLE DRIVE BACKUP (feature #40, user-requested)
+   ========================================================================= 
+   Goal: survive an uninstall/reinstall (or a fresh install of a new APK
+   build) without losing data, via an automatic backup to the user's own
+   Google Drive — NOT Android's opaque "Auto Backup for Apps" and NOT the
+   Drive API's hidden `drive.appdata` scope, both of which the user
+   explicitly doesn't want (an invisible backup they can't see or manage).
+   Instead this uses the `drive.file` scope and writes into a perfectly
+   normal, visible folder ("Ledger App Backups") in the user's own My
+   Drive — the same as if they'd created it and dropped a file in there
+   themselves.
+
+   SETUP THIS FILE ALONE CAN'T DO — see CONTEXT.md's Google Drive Backup
+   section for the full checklist (Google Cloud Console OAuth client,
+   enabling the Drive API, registering the app's SHA-1 fingerprints, adding
+   the "@capawesome/capacitor-google-sign-in" package + native sync). The
+   GOOGLE_WEB_CLIENT_ID constant below is a placeholder until that's done.
+   ========================================================================= */
+
+// TODO: replace with the real Web-application OAuth client ID from Google
+// Cloud Console — see CONTEXT.md. Must be a *Web* client ID even though
+// this only runs on Android (the plugin uses it as the server client ID
+// for the native Credential Manager flow).
+const GOOGLE_WEB_CLIENT_ID = "81997445381-nrh4nhvpl4f53t6kbqfcb9pco8odl6q4.apps.googleusercontent.com";
+// drive.file, not drive.appdata: grants access only to files/folders this
+// app itself creates, but — unlike appdata — those files are ordinary,
+// visible Drive content, exactly what was asked for.
+const GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+const DRIVE_API = "https://www.googleapis.com/drive/v3";
+const DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3";
+const DRIVE_FOLDER_NAME = "Ledger App Backups";
+const DRIVE_BACKUP_FILENAME = "ledger-backup.json";
+const BACKUP_SCHEMA_VERSION = 1;
+
+// Blob <-> base64, chunked to avoid blowing the call stack on a multi-MB
+// PDF attachment. Uses arrayBuffer()/btoa()/atob(), all available in a
+// WebView (and, conveniently, in modern Node — which is what lets this be
+// Node-simulated below, same as the rest of this file's pure logic).
+async function blobToBase64(blob) {
+  const buf = await blob.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+function base64ToBlob(base64, mimeType) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: mimeType || "application/octet-stream" });
+}
+
+// Gathers everything a fresh install needs to be made whole again: every
+// piece of localStorage state this app persists, plus every statement PDF
+// attachment across every account/month (base64-encoded for JSON
+// transport). Deliberately does NOT include stmtPasswords' plaintext... no
+// wait, it does — see the note in restoreBackupPayload for why that's an
+// accepted tradeoff, not an oversight.
+async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported }) {
+  const rawAttachments = await listAllStatementAttachments();
+  const attachments = [];
+  for (const a of rawAttachments) {
+    attachments.push({
+      id: a.id,
+      pageKey: a.pageKey,
+      account: a.account,
+      month: a.month,
+      filename: a.filename,
+      bankName: a.bankName,
+      periodLabel: a.periodLabel,
+      size: a.size,
+      importedAt: a.importedAt,
+      blobType: a.blob.type || "application/pdf",
+      blobBase64: await blobToBase64(a.blob),
+    });
+  }
+  return {
+    schemaVersion: BACKUP_SCHEMA_VERSION,
+    appVersion: APP_VERSION,
+    exportedAt: new Date().toISOString(),
+    accounts: accounts || {},
+    entryOrder: entryOrder || {},
+    stmtPasswords: stmtPasswords || [],
+    stmtBankMap: stmtBankMap || {},
+    stmtCatMap: stmtCatMap || {},
+    stmtImported: stmtImported || {},
+    attachments,
+  };
+}
+
+// Restores a previously-built payload: replaces every piece of localStorage
+// state wholesale via the provided setters (this is meant for "fresh
+// install, nothing local to merge with" — not a partial/incremental sync),
+// and writes attachments back into IndexedDB by id (put, not clear+put, so
+// it's safe to run twice). NOTE on stmtPasswords: bank-statement PDF
+// passwords are included in the backup so a restored install doesn't have
+// to re-prompt for every bank's password again — same information already
+// sat in this device's own localStorage unencrypted, so this doesn't lower
+// the bar, but it does mean anyone with access to the backup file (i.e.
+// anyone with access to this Drive folder) can read them. Worth knowing.
+async function restoreBackupPayload(payload, setters) {
+  const { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported } = setters;
+  if (payload.accounts) setAccounts(payload.accounts);
+  if (payload.entryOrder) setEntryOrder(payload.entryOrder);
+  if (payload.stmtPasswords) setStmtPasswords(payload.stmtPasswords);
+  if (payload.stmtBankMap) setStmtBankMap(payload.stmtBankMap);
+  if (payload.stmtCatMap) setStmtCatMap(payload.stmtCatMap);
+  if (payload.stmtImported) setStmtImported(payload.stmtImported);
+  for (const a of payload.attachments || []) {
+    const { blobBase64, blobType, ...rest } = a;
+    await putStatementAttachmentRecord({ ...rest, blob: base64ToBlob(blobBase64, blobType) });
+  }
+}
+
+async function driveApiFetch(token, url, options = {}) {
+  const res = await fetch(url, { ...options, headers: { Authorization: `Bearer ${token}`, ...(options.headers || {}) } });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Drive API ${res.status}: ${text.slice(0, 300)}`);
+  }
+  return res;
+}
+
+// Finds (or creates) the visible backup folder, caching its id so later
+// calls skip the search. Re-validates the cached id (a trashed/deleted
+// folder is treated the same as "not found yet").
+async function ensureDriveFolder(token) {
+  const cached = localStorage.getItem(STORAGE_DRIVE_FOLDER_ID);
+  if (cached) {
+    const check = await fetch(`${DRIVE_API}/files/${cached}?fields=id,trashed`, { headers: { Authorization: `Bearer ${token}` } });
+    if (check.ok) {
+      const info = await check.json();
+      if (!info.trashed) return cached;
+    }
+  }
+  const q = encodeURIComponent(`mimeType='application/vnd.google-apps.folder' and name='${DRIVE_FOLDER_NAME}' and trashed=false`);
+  const searchRes = await driveApiFetch(token, `${DRIVE_API}/files?q=${q}&fields=files(id,name)&spaces=drive`);
+  const found = (await searchRes.json()).files || [];
+  if (found.length) {
+    localStorage.setItem(STORAGE_DRIVE_FOLDER_ID, found[0].id);
+    return found[0].id;
+  }
+  const createRes = await driveApiFetch(token, `${DRIVE_API}/files?fields=id`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: DRIVE_FOLDER_NAME, mimeType: "application/vnd.google-apps.folder" }),
+  });
+  const { id } = await createRes.json();
+  localStorage.setItem(STORAGE_DRIVE_FOLDER_ID, id);
+  return id;
+}
+
+async function findBackupFileId(token, folderId) {
+  const cached = localStorage.getItem(STORAGE_DRIVE_FILE_ID);
+  if (cached) {
+    const check = await fetch(`${DRIVE_API}/files/${cached}?fields=id,trashed`, { headers: { Authorization: `Bearer ${token}` } });
+    if (check.ok) {
+      const info = await check.json();
+      if (!info.trashed) return cached;
+    }
+  }
+  const q = encodeURIComponent(`'${folderId}' in parents and name='${DRIVE_BACKUP_FILENAME}' and trashed=false`);
+  const searchRes = await driveApiFetch(token, `${DRIVE_API}/files?q=${q}&fields=files(id,name)&spaces=drive`);
+  const found = (await searchRes.json()).files || [];
+  return found.length ? found[0].id : null;
+}
+
+// Always writes to ONE file (overwrite in place once it exists) — the
+// backup only ever needs to represent "the current state," not a history
+// of every past state, so there's no snapshot pile-up to manage or prune.
+async function uploadBackupToDrive(token, jsonString) {
+  const folderId = await ensureDriveFolder(token);
+  const existingId = await findBackupFileId(token, folderId);
+  const body = new Blob([jsonString], { type: "application/json" });
+  let fileId;
+  if (existingId) {
+    await driveApiFetch(token, `${DRIVE_UPLOAD_API}/files/${existingId}?uploadType=media`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+    fileId = existingId;
+  } else {
+    const metadata = { name: DRIVE_BACKUP_FILENAME, parents: [folderId] };
+    const form = new FormData();
+    form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+    form.append("file", body);
+    const res = await driveApiFetch(token, `${DRIVE_UPLOAD_API}/files?uploadType=multipart&fields=id`, { method: "POST", body: form });
+    fileId = (await res.json()).id;
+  }
+  localStorage.setItem(STORAGE_DRIVE_FILE_ID, fileId);
+  localStorage.setItem(STORAGE_DRIVE_FOLDER_ID, folderId);
+  return fileId;
+}
+
+async function downloadBackupFromDrive(token) {
+  const folderId = await ensureDriveFolder(token);
+  const fileId = await findBackupFileId(token, folderId);
+  if (!fileId) return null;
+  const res = await driveApiFetch(token, `${DRIVE_API}/files/${fileId}?alt=media`);
+  return JSON.parse(await res.text());
+}
+
 const FONT_SIZE_MIN = 12;
 const FONT_SIZE_MAX = 26;
 const LINE_SPACING_MIN = 1.2;
@@ -2074,6 +2337,30 @@ export default function LedgerApp() {
     } catch {}
     return {};
   });
+  // Google Drive backup (feature #40). `googleAccount` and `lastBackupAt`
+  // are the only pieces of this that persist to localStorage (see the
+  // effects below) — the access token itself is deliberately kept only in
+  // `accessTokenRef`, in memory, never written to disk.
+  const [googleAccount, setGoogleAccount] = useState(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_GOOGLE_ACCOUNT);
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return null;
+  });
+  const [lastBackupAt, setLastBackupAt] = useState(() => {
+    try {
+      return localStorage.getItem(STORAGE_LAST_BACKUP_AT) || null;
+    } catch {
+      return null;
+    }
+  });
+  const [backupStatus, setBackupStatus] = useState("idle"); // idle | working | error
+  const [backupError, setBackupError] = useState("");
+  const accessTokenRef = useRef(null);
+  const backupDebounceRef = useRef(null);
+  const googleInitedRef = useRef(false);
+
   const [sheet, setSheet] = useState(null); // null | 'accounts' | 'totals' | 'menu' | 'attachments'
   const [dialog, setDialog] = useState(null);
   // Mirrors the live count from AttachmentsSheetBody for the currently open
@@ -2184,6 +2471,17 @@ export default function LedgerApp() {
       localStorage.setItem(STORAGE_STMT_IMPORTED, JSON.stringify(stmtImported));
     } catch {}
   }, [stmtImported]);
+  useEffect(() => {
+    try {
+      if (googleAccount) localStorage.setItem(STORAGE_GOOGLE_ACCOUNT, JSON.stringify(googleAccount));
+      else localStorage.removeItem(STORAGE_GOOGLE_ACCOUNT);
+    } catch {}
+  }, [googleAccount]);
+  useEffect(() => {
+    try {
+      if (lastBackupAt) localStorage.setItem(STORAGE_LAST_BACKUP_AT, lastBackupAt);
+    } catch {}
+  }, [lastBackupAt]);
   // Keeps the active page's "order entered" map current on every keystroke
   // — this is what lets the Statement report reflect real typing order
   // instead of just current text position, for the page actually being
@@ -2338,6 +2636,161 @@ export default function LedgerApp() {
   function showAlert(message) {
     setDialog({ type: "alert", message, value: null, onSubmit: () => {} });
   }
+
+  /* ---- Google Drive backup (feature #40) ---- */
+  useEffect(() => {
+    if (googleInitedRef.current) return;
+    googleInitedRef.current = true;
+    GoogleSignIn.initialize({ clientId: GOOGLE_WEB_CLIENT_ID, scopes: [GOOGLE_DRIVE_SCOPE] }).catch((err) => {
+      console.warn("Google Sign-In init failed (is GOOGLE_WEB_CLIENT_ID set up? see CONTEXT.md):", err);
+    });
+  }, []);
+
+  async function signInToGoogle() {
+    try {
+      const result = await GoogleSignIn.signIn();
+      accessTokenRef.current = result.accessToken;
+      setGoogleAccount({ email: result.email, displayName: result.displayName });
+      await backupNow(result.accessToken);
+    } catch (err) {
+      console.warn("Google sign-in failed:", err);
+      showAlert("Couldn't sign in with Google. Please try again.");
+    }
+  }
+
+  async function signOutOfGoogle() {
+    try {
+      await GoogleSignIn.signOut();
+    } catch {}
+    accessTokenRef.current = null;
+    setGoogleAccount(null);
+    setBackupStatus("idle");
+    setBackupError("");
+  }
+
+  // Backs up right now. Reuses the in-memory access token if we still have
+  // one; otherwise re-runs signIn(), which on Android goes back through
+  // the Credential Manager and — since the user already granted consent
+  // once — normally completes without the user seeing anything, rather
+  // than a fresh sign-in screen.
+  async function backupNow(tokenOverride) {
+    if (!googleAccount && !tokenOverride) return;
+    setBackupStatus("working");
+    setBackupError("");
+    try {
+      let token = tokenOverride || accessTokenRef.current;
+      if (!token) {
+        const result = await GoogleSignIn.signIn();
+        token = result.accessToken;
+        accessTokenRef.current = token;
+      }
+      const payload = await buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported });
+      await uploadBackupToDrive(token, JSON.stringify(payload));
+      setLastBackupAt(new Date().toISOString());
+      setBackupStatus("idle");
+    } catch (err) {
+      console.warn("Google Drive backup failed:", err);
+      accessTokenRef.current = null; // force a fresh token next attempt — covers an expired-token 401
+      setBackupStatus("error");
+      setBackupError(String(err.message || err));
+    }
+  }
+
+  // Core restore logic, no confirmation dialog and no prior sign-in
+  // required — used both by the menu's "Restore latest" button (wrapped in
+  // its own confirm, below) and by the fresh-install prompt (which already
+  // got its own confirmation from the user before calling this).
+  async function performRestore() {
+    setBackupStatus("working");
+    setBackupError("");
+    try {
+      let token = accessTokenRef.current;
+      if (!token) {
+        const result = await GoogleSignIn.signIn();
+        token = result.accessToken;
+        accessTokenRef.current = token;
+        setGoogleAccount({ email: result.email, displayName: result.displayName });
+      }
+      const payload = await downloadBackupFromDrive(token);
+      if (!payload) {
+        setBackupStatus("idle");
+        showAlert("No backup found in Google Drive yet — nothing to restore.");
+        return;
+      }
+      await restoreBackupPayload(payload, { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported });
+      setBackupStatus("idle");
+    } catch (err) {
+      console.warn("Google Drive restore failed:", err);
+      setBackupStatus("error");
+      setBackupError(String(err.message || err));
+    }
+  }
+
+  function restoreFromGoogleDrive() {
+    askConfirm(
+      "Restore from your Google Drive backup? This replaces everything currently on this device — all accounts, months, and statement attachments — with what's in the backup.",
+      performRestore,
+      { danger: true, confirmLabel: "Restore" }
+    );
+  }
+
+  // Fresh-install prompt: if this device has no local data at all (a
+  // clean install) offer to restore before the user starts typing into a
+  // brand-new, empty ledger. Deliberately does NOT go through
+  // signInToGoogle()/backupNow() first — that would upload this empty
+  // starter state and clobber a real backup before performRestore() ever
+  // gets to read it. Runs once, on mount.
+  const isFreshInstallRef = useRef(
+    (() => {
+      try {
+        return localStorage.getItem(STORAGE_ACCOUNTS) === null;
+      } catch {
+        return false;
+      }
+    })()
+  );
+  useEffect(() => {
+    if (!isFreshInstallRef.current) return;
+    askConfirm(
+      "This looks like a fresh install. If you've backed up to Google Drive before, sign in to restore your data now.",
+      performRestore,
+      { confirmLabel: "Sign in & restore" }
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Auto-backup: whenever any of the backed-up data changes and a Google
+  // account is signed in, wait for a quiet moment (60s of no further
+  // changes) before actually uploading — so a burst of typing triggers one
+  // backup at the end, not one per keystroke. Also see the appStateChange
+  // listener below, which backs up immediately on backgrounding so a quick
+  // edit-then-close isn't left waiting on the debounce timer.
+  useEffect(() => {
+    if (!googleAccount) return;
+    if (backupDebounceRef.current) clearTimeout(backupDebounceRef.current);
+    backupDebounceRef.current = setTimeout(() => {
+      backupNow();
+    }, 60000);
+    return () => clearTimeout(backupDebounceRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, googleAccount]);
+
+  useEffect(() => {
+    if (!googleAccount) return undefined;
+    let listenerHandle;
+    CapApp.addListener("appStateChange", ({ isActive }) => {
+      if (!isActive) {
+        if (backupDebounceRef.current) clearTimeout(backupDebounceRef.current);
+        backupNow();
+      }
+    }).then((h) => {
+      listenerHandle = h;
+    });
+    return () => {
+      listenerHandle?.remove();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [googleAccount]);
 
   /* ---- editing + working undo/redo (coalesced into ~800ms bursts) ---- */
   function handleChange(e) {
@@ -2938,6 +3391,47 @@ export default function LedgerApp() {
           <div className="h-px bg-zinc-800 my-1" />
           <SheetRow icon={<Download size={17} />} label="Save .txt" onClick={downloadTxt} />
           <SheetRow icon={<Upload size={17} />} label="Open .txt" onClick={() => fileInputRef.current.click()} />
+          <div className="h-px bg-zinc-800 my-1" />
+          {googleAccount ? (
+            <div className="px-3 py-2.5 rounded-lg font-mono text-sm text-zinc-200">
+              <div className="flex items-center gap-3 text-zinc-300">
+                <Cloud size={17} className={backupStatus === "working" ? "animate-pulse text-teal-400" : "text-teal-500"} />
+                <div className="flex-1 min-w-0">
+                  <div className="truncate">{googleAccount.email}</div>
+                  <div className="text-[10px] text-zinc-500 mt-0.5">
+                    {backupStatus === "working"
+                      ? "Backing up…"
+                      : backupStatus === "error"
+                      ? `Backup failed${backupError ? `: ${backupError}` : ""}`
+                      : lastBackupAt
+                      ? `Last backed up ${new Date(lastBackupAt).toLocaleString()}`
+                      : "Not backed up yet"}
+                  </div>
+                </div>
+              </div>
+              <div className="flex gap-2 mt-2">
+                <button
+                  onClick={() => backupNow()}
+                  disabled={backupStatus === "working"}
+                  className="flex-1 px-2 py-1.5 rounded-md bg-zinc-800 text-zinc-200 text-xs hover:bg-zinc-700 disabled:opacity-50"
+                >
+                  Back up now
+                </button>
+                <button
+                  onClick={restoreFromGoogleDrive}
+                  disabled={backupStatus === "working"}
+                  className="flex-1 px-2 py-1.5 rounded-md bg-zinc-800 text-zinc-200 text-xs hover:bg-zinc-700 disabled:opacity-50"
+                >
+                  Restore latest
+                </button>
+                <button onClick={signOutOfGoogle} className="px-2 py-1.5 rounded-md bg-zinc-800 text-rose-400 text-xs hover:bg-rose-950/40">
+                  Disconnect
+                </button>
+              </div>
+            </div>
+          ) : (
+            <SheetRow icon={<CloudOff size={17} />} label="Back up to Google Drive" onClick={signInToGoogle} />
+          )}
           <div className="h-px bg-zinc-800 my-1" />
           <SheetRow icon={<Pencil size={17} />} label="Rename account" onClick={renameAccount} />
           <SheetRow icon={<Trash2 size={17} />} label={`Delete ${monthLabel(activeMonth)} entries`} onClick={deleteAccount} danger />
