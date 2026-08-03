@@ -6,11 +6,13 @@ import * as pdfjsLib from "pdfjs-dist";
 // needs this one addition for the statement-import feature below).
 import pdfjsWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
-// NOTE: requires "@capawesome/capacitor-google-sign-in" added to
-// package.json (see CONTEXT.md's Google Drive backup section, feature
-// #40, for the Google Cloud Console + native setup this also needs — it
-// can't be done from inside this file alone).
-import { GoogleSignIn } from "@capawesome/capacitor-google-sign-in";
+// NOTE: requires "@capgo/capacitor-social-login" (pinned to major version 6,
+// matching this project's Capacitor 6 — see CONTEXT.md's Google Drive
+// backup section, feature #40, for the Google Cloud Console + native setup
+// this also needs — it can't be done from inside this file alone).
+// Switched from "@capawesome/capacitor-google-sign-in" (v0.1.2) because that
+// plugin requires Capacitor 8+; this project is on Capacitor 6.
+import { SocialLogin } from "@capgo/capacitor-social-login";
 import { App as CapApp } from "@capacitor/app";
 
 // App version, shown in the Menu sheet (see the "menu" BottomSheet further
@@ -1947,14 +1949,14 @@ const STORAGE_LAST_BACKUP_AT = "ledger_last_backup_at_v1";
    SETUP THIS FILE ALONE CAN'T DO — see CONTEXT.md's Google Drive Backup
    section for the full checklist (Google Cloud Console OAuth client,
    enabling the Drive API, registering the app's SHA-1 fingerprints, adding
-   the "@capawesome/capacitor-google-sign-in" package + native sync). The
-   GOOGLE_WEB_CLIENT_ID constant below is a placeholder until that's done.
+   the "@capgo/capacitor-social-login" package, pinned to major version 6 to
+   match this project's Capacitor 6, + native sync).
    ========================================================================= */
 
-// TODO: replace with the real Web-application OAuth client ID from Google
-// Cloud Console — see CONTEXT.md. Must be a *Web* client ID even though
-// this only runs on Android (the plugin uses it as the server client ID
-// for the native Credential Manager flow).
+// The real Web-application OAuth client ID from Google Cloud Console — see
+// CONTEXT.md. Must be a *Web* client ID even though this only runs on
+// Android (the plugin uses it as the server client ID for the underlying
+// sign-in flow).
 const GOOGLE_WEB_CLIENT_ID = "81997445381-nrh4nhvpl4f53t6kbqfcb9pco8odl6q4.apps.googleusercontent.com";
 // drive.file, not drive.appdata: grants access only to files/folders this
 // app itself creates, but — unlike appdata — those files are ordinary,
@@ -2641,17 +2643,21 @@ export default function LedgerApp() {
   useEffect(() => {
     if (googleInitedRef.current) return;
     googleInitedRef.current = true;
-    GoogleSignIn.initialize({ clientId: GOOGLE_WEB_CLIENT_ID, scopes: [GOOGLE_DRIVE_SCOPE] }).catch((err) => {
+    SocialLogin.initialize({ google: { webClientId: GOOGLE_WEB_CLIENT_ID } }).catch((err) => {
       console.warn("Google Sign-In init failed (is GOOGLE_WEB_CLIENT_ID set up? see CONTEXT.md):", err);
     });
   }, []);
 
   async function signInToGoogle() {
     try {
-      const result = await GoogleSignIn.signIn();
-      accessTokenRef.current = result.accessToken;
-      setGoogleAccount({ email: result.email, displayName: result.displayName });
-      await backupNow(result.accessToken);
+      const res = await SocialLogin.login({
+        provider: "google",
+        options: { scopes: ["email", "profile", GOOGLE_DRIVE_SCOPE] },
+      });
+      const token = res.result.accessToken?.token;
+      accessTokenRef.current = token;
+      setGoogleAccount({ email: res.result.profile?.email, displayName: res.result.profile?.name });
+      await backupNow(token);
     } catch (err) {
       console.warn("Google sign-in failed:", err);
       showAlert("Couldn't sign in with Google. Please try again.");
@@ -2660,7 +2666,7 @@ export default function LedgerApp() {
 
   async function signOutOfGoogle() {
     try {
-      await GoogleSignIn.signOut();
+      await SocialLogin.logout({ provider: "google" });
     } catch {}
     accessTokenRef.current = null;
     setGoogleAccount(null);
@@ -2680,8 +2686,11 @@ export default function LedgerApp() {
     try {
       let token = tokenOverride || accessTokenRef.current;
       if (!token) {
-        const result = await GoogleSignIn.signIn();
-        token = result.accessToken;
+        const res = await SocialLogin.login({
+          provider: "google",
+          options: { scopes: ["email", "profile", GOOGLE_DRIVE_SCOPE] },
+        });
+        token = res.result.accessToken?.token;
         accessTokenRef.current = token;
       }
       const payload = await buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported });
@@ -2706,10 +2715,13 @@ export default function LedgerApp() {
     try {
       let token = accessTokenRef.current;
       if (!token) {
-        const result = await GoogleSignIn.signIn();
-        token = result.accessToken;
+        const res = await SocialLogin.login({
+          provider: "google",
+          options: { scopes: ["email", "profile", GOOGLE_DRIVE_SCOPE] },
+        });
+        token = res.result.accessToken?.token;
         accessTokenRef.current = token;
-        setGoogleAccount({ email: result.email, displayName: result.displayName });
+        setGoogleAccount({ email: res.result.profile?.email, displayName: res.result.profile?.name });
       }
       const payload = await downloadBackupFromDrive(token);
       if (!payload) {
