@@ -1,0 +1,101 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build web app
+        run: npm run build
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Patch MainActivity for Google Sign-In
+        run: |
+          cat > android/app/src/main/java/com/sreedev/ledger/MainActivity.java << 'EOF'
+          package com.sreedev.ledger;
+
+          import ee.forgr.capacitor.social.login.GoogleProvider;
+          import ee.forgr.capacitor.social.login.SocialLoginPlugin;
+          import ee.forgr.capacitor.social.login.ModifiedMainActivityForSocialLoginPlugin;
+          import com.getcapacitor.PluginHandle;
+          import com.getcapacitor.Plugin;
+          import android.content.Intent;
+          import android.util.Log;
+          import com.getcapacitor.BridgeActivity;
+
+          // ModifiedMainActivityForSocialLoginPlugin is required by
+          // @capgo/capacitor-social-login (see CONTEXT.md, feature #40) so its
+          // Google sign-in flow can receive its activity result. Because
+          // "Add Android platform" above regenerates this file from scratch on
+          // every build, this step re-applies the required change every time —
+          // editing this file directly in Android Studio would NOT persist.
+          public class MainActivity extends BridgeActivity implements ModifiedMainActivityForSocialLoginPlugin {
+
+              @Override
+              public void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+
+                  if (requestCode >= GoogleProvider.REQUEST_AUTHORIZE_GOOGLE_MIN && requestCode < GoogleProvider.REQUEST_AUTHORIZE_GOOGLE_MAX) {
+                      PluginHandle pluginHandle = getBridge().getPlugin("SocialLogin");
+                      if (pluginHandle == null) {
+                          Log.i("Google Activity Result", "SocialLogin login handle is null");
+                          return;
+                      }
+                      Plugin plugin = pluginHandle.getInstance();
+                      if (!(plugin instanceof SocialLoginPlugin)) {
+                          Log.i("Google Activity Result", "SocialLogin plugin instance is not SocialLoginPlugin");
+                          return;
+                      }
+                      ((SocialLoginPlugin) plugin).handleGoogleLoginIntent(requestCode, data);
+                  }
+              }
+
+              // Required by the interface; never actually called.
+              @Override
+              public void IHaveModifiedTheMainActivityForTheUseWithSocialLoginPlugin() {}
+          }
+          EOF
+
+      - name: Sync Capacitor
+        run: npx cap sync android
+
+      - name: Make gradlew executable
+        run: chmod +x android/gradlew
+
+      - name: Build debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug
+
+      - name: Print debug SHA-1
+        working-directory: android
+        run: ./gradlew signingReport
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ledger-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
