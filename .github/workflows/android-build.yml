@@ -43,6 +43,10 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x android/gradlew
 
+      - name: Print debug SHA-1
+        working-directory: android
+        run: ./gradlew signingReport
+
       - name: Build debug APK
         working-directory: android
         run: ./gradlew assembleDebug
