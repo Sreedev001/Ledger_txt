@@ -1932,6 +1932,14 @@ const STORAGE_GOOGLE_ACCOUNT = "ledger_google_account_v1";
 const STORAGE_DRIVE_FOLDER_ID = "ledger_drive_folder_id_v1";
 const STORAGE_DRIVE_FILE_ID = "ledger_drive_file_id_v1";
 const STORAGE_LAST_BACKUP_AT = "ledger_last_backup_at_v1";
+// STORAGE_DRIVE_ATTACH_IDS: { [attachmentId]: driveFileId } — every
+// statement PDF attachment that has already been uploaded to Drive as its
+// own small file inside the backup folder. Lets the main backup JSON
+// reference attachments by id instead of re-embedding their base64 every
+// time, so a routine text edit only ever has to upload the (tiny) ledger
+// data, not every PDF ever imported. New attachments are the only ones
+// that cost an upload; everything already in this map is free to skip.
+const STORAGE_DRIVE_ATTACH_IDS = "ledger_drive_attach_ids_v1";
 // STORAGE_GOOGLE_CONNECTED: "1" | absent — whether this device currently
 //   has an active Drive backup connection. Separate from
 //   STORAGE_GOOGLE_ACCOUNT because a silent token refresh can re-establish
@@ -1979,20 +1987,10 @@ const DRIVE_FOLDER_NAME = "Ledger App Backups";
 const DRIVE_BACKUP_FILENAME = "ledger-backup.json";
 const BACKUP_SCHEMA_VERSION = 1;
 
-// Blob <-> base64, chunked to avoid blowing the call stack on a multi-MB
-// PDF attachment. Uses arrayBuffer()/btoa()/atob(), all available in a
-// WebView (and, conveniently, in modern Node — which is what lets this be
-// Node-simulated below, same as the rest of this file's pure logic).
-async function blobToBase64(blob) {
-  const buf = await blob.arrayBuffer();
-  const bytes = new Uint8Array(buf);
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
-}
+// base64 -> Blob, kept only for restoring older backups that still have
+// attachments inlined as base64 (see the backward-compat branch in
+// restoreBackupPayload) — new backups reference attachments by Drive file
+// id instead.
 function base64ToBlob(base64, mimeType) {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
@@ -2000,30 +1998,76 @@ function base64ToBlob(base64, mimeType) {
   return new Blob([bytes], { type: mimeType || "application/octet-stream" });
 }
 
-// Gathers everything a fresh install needs to be made whole again: every
-// piece of localStorage state this app persists, plus every statement PDF
-// attachment across every account/month (base64-encoded for JSON
-// transport). Deliberately does NOT include stmtPasswords' plaintext... no
-// wait, it does — see the note in restoreBackupPayload for why that's an
-// accepted tradeoff, not an oversight.
-async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported }) {
-  const rawAttachments = await listAllStatementAttachments();
-  const attachments = [];
-  for (const a of rawAttachments) {
-    attachments.push({
-      id: a.id,
-      pageKey: a.pageKey,
-      account: a.account,
-      month: a.month,
-      filename: a.filename,
-      bankName: a.bankName,
-      periodLabel: a.periodLabel,
-      size: a.size,
-      importedAt: a.importedAt,
-      blobType: a.blob.type || "application/pdf",
-      blobBase64: await blobToBase64(a.blob),
-    });
+// Small helpers around the attachment-id -> driveFileId map, so every
+// caller reads/writes it the same (safe) way.
+function loadDriveAttachIdMap() {
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_DRIVE_ATTACH_IDS)) || {};
+  } catch {
+    return {};
   }
+}
+function saveDriveAttachIdMap(map) {
+  try {
+    localStorage.setItem(STORAGE_DRIVE_ATTACH_IDS, JSON.stringify(map));
+  } catch {}
+}
+
+// Uploads ONE attachment's PDF blob as its own small file in the backup
+// folder (not inlined into the main JSON). Only ever called for
+// attachments that aren't already in the id map, so this is a one-time
+// cost per PDF, not a recurring one.
+async function uploadAttachmentToDrive(token, folderId, attachment) {
+  const metadata = { name: `attach-${attachment.id}.pdf`, parents: [folderId] };
+  const form = new FormData();
+  form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+  form.append("file", attachment.blob);
+  const res = await driveApiFetch(token, `${DRIVE_UPLOAD_API}/files?uploadType=multipart&fields=id`, { method: "POST", body: form });
+  return (await res.json()).id;
+}
+
+// Makes sure every current attachment has a Drive file id, uploading only
+// the ones that don't yet (i.e. new statement imports since the last
+// backup). Returns { rawAttachments, attachMap } for buildBackupPayload to
+// use. This is the only part of a backup whose cost scales with how many
+// PDFs you've imported — and even then, only with how many are *new*.
+async function syncAttachmentsToDrive(token, folderId) {
+  const rawAttachments = await listAllStatementAttachments();
+  const attachMap = loadDriveAttachIdMap();
+  let changed = false;
+  for (const a of rawAttachments) {
+    if (attachMap[a.id]) continue;
+    attachMap[a.id] = await uploadAttachmentToDrive(token, folderId, a);
+    changed = true;
+  }
+  if (changed) saveDriveAttachIdMap(attachMap);
+  return { rawAttachments, attachMap };
+}
+
+// Gathers everything a fresh install needs to be made whole again: every
+// piece of localStorage state this app persists, plus a reference (Drive
+// file id, not the PDF bytes) to every statement attachment across every
+// account/month. Attachments themselves are uploaded separately by
+// syncAttachmentsToDrive — this just records where to find them, which is
+// why a routine save (no new PDFs) stays small and fast no matter how many
+// statements have accumulated over time. Deliberately does NOT include
+// stmtPasswords' plaintext... no wait, it does — see the note in
+// restoreBackupPayload for why that's an accepted tradeoff, not an
+// oversight.
+async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, rawAttachments, attachMap }) {
+  const attachments = rawAttachments.map((a) => ({
+    id: a.id,
+    pageKey: a.pageKey,
+    account: a.account,
+    month: a.month,
+    filename: a.filename,
+    bankName: a.bankName,
+    periodLabel: a.periodLabel,
+    size: a.size,
+    importedAt: a.importedAt,
+    blobType: a.blob.type || "application/pdf",
+    driveFileId: attachMap[a.id],
+  }));
   return {
     schemaVersion: BACKUP_SCHEMA_VERSION,
     appVersion: APP_VERSION,
@@ -2048,7 +2092,7 @@ async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBan
 // sat in this device's own localStorage unencrypted, so this doesn't lower
 // the bar, but it does mean anyone with access to the backup file (i.e.
 // anyone with access to this Drive folder) can read them. Worth knowing.
-async function restoreBackupPayload(payload, setters) {
+async function restoreBackupPayload(payload, setters, token) {
   const { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported } = setters;
   if (payload.accounts) setAccounts(payload.accounts);
   if (payload.entryOrder) setEntryOrder(payload.entryOrder);
@@ -2056,10 +2100,24 @@ async function restoreBackupPayload(payload, setters) {
   if (payload.stmtBankMap) setStmtBankMap(payload.stmtBankMap);
   if (payload.stmtCatMap) setStmtCatMap(payload.stmtCatMap);
   if (payload.stmtImported) setStmtImported(payload.stmtImported);
+  const attachMap = loadDriveAttachIdMap();
   for (const a of payload.attachments || []) {
-    const { blobBase64, blobType, ...rest } = a;
-    await putStatementAttachmentRecord({ ...rest, blob: base64ToBlob(blobBase64, blobType) });
+    const { blobBase64, blobType, driveFileId, ...rest } = a;
+    let blob;
+    if (blobBase64) {
+      // Backward compatibility with backups written before attachments
+      // were split into their own Drive files.
+      blob = base64ToBlob(blobBase64, blobType);
+    } else if (driveFileId) {
+      const res = await driveApiFetch(token, `${DRIVE_API}/files/${driveFileId}?alt=media`);
+      blob = await res.blob();
+      attachMap[a.id] = driveFileId; // this device now has it too — no need to re-upload later
+    } else {
+      continue;
+    }
+    await putStatementAttachmentRecord({ ...rest, blob });
   }
+  saveDriveAttachIdMap(attachMap);
 }
 
 async function driveApiFetch(token, url, options = {}) {
@@ -2861,7 +2919,12 @@ export default function LedgerApp() {
     showToast("Saving…", { autoHideMs: 0 });
     try {
       let token = tokenOverride || (await getGoogleAccessToken());
-      const payload = await buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported });
+      const folderId = await ensureDriveFolder(token);
+      // Only uploads PDFs that aren't already up there — a no-op scan on
+      // any save that isn't a fresh statement import, so this stays fast
+      // no matter how many statements have piled up over time.
+      const { rawAttachments, attachMap } = await syncAttachmentsToDrive(token, folderId);
+      const payload = await buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, rawAttachments, attachMap });
       await uploadBackupToDrive(token, JSON.stringify(payload));
       setLastBackupAt(new Date().toISOString());
       setBackupStatus("idle");
@@ -2893,7 +2956,7 @@ export default function LedgerApp() {
         showAlert("No backup found in Google Drive yet — nothing to restore.");
         return;
       }
-      await restoreBackupPayload(payload, { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported });
+      await restoreBackupPayload(payload, { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported }, token);
       setBackupStatus("idle");
       showToast("Restored from Google Drive", { tone: "success", autoHideMs: 2000 });
     } catch (err) {
@@ -2942,17 +3005,21 @@ export default function LedgerApp() {
   }, []);
 
   // Auto-backup: whenever any of the backed-up data changes and a Google
-  // account is signed in, wait for a quiet moment (60s of no further
+  // account is signed in, wait for a quiet moment (3s of no further
   // changes) before actually uploading — so a burst of typing triggers one
-  // backup at the end, not one per keystroke. Also see the appStateChange
-  // listener below, which backs up immediately on backgrounding so a quick
-  // edit-then-close isn't left waiting on the debounce timer.
+  // backup at the end, not one per keystroke, while still feeling as
+  // prompt as Google Docs' "Saving..." rather than a once-a-minute batch
+  // job. Safe to keep short now that a routine save no longer re-uploads
+  // every PDF attachment (see syncAttachmentsToDrive) — only the small
+  // ledger JSON goes out on every debounce tick. Also see the
+  // appStateChange listener below, which backs up immediately on
+  // backgrounding so a quick edit-then-close isn't left waiting even 3s.
   useEffect(() => {
     if (!googleConnected) return;
     if (backupDebounceRef.current) clearTimeout(backupDebounceRef.current);
     backupDebounceRef.current = setTimeout(() => {
       backupNow();
-    }, 60000);
+    }, 3000);
     return () => clearTimeout(backupDebounceRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, googleConnected]);
