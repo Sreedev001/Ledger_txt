@@ -2914,6 +2914,17 @@ export default function LedgerApp() {
   // still valid.
   async function backupNow(tokenOverride) {
     if (!googleConnected && !tokenOverride) return;
+    // Never let a backup run while a restore is in flight. Without this,
+    // performRestore()'s call to getGoogleAccessToken() flips
+    // googleConnected to true *before* it has downloaded anything, which
+    // independently wakes the auto-backup debounce effect below — and
+    // that effect has no way to know a restore is why accounts/entryOrder
+    // are still empty. Left unguarded, it races the restore's download:
+    // if it wins, it uploads the still-blank state, clobbering the real
+    // backup in Drive moments before the restore reads it back — so the
+    // blank version is what actually gets "restored". restoreInProgress
+    // is the one signal both effects can check to avoid that.
+    if (restoreInProgress) return;
     setBackupStatus("working");
     setBackupError("");
     showToast("Saving…", { autoHideMs: 0 });
