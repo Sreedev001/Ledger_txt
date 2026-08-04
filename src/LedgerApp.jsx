@@ -19,7 +19,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.6.2";
+const APP_VERSION = "1.8.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -1932,6 +1932,17 @@ const STORAGE_GOOGLE_ACCOUNT = "ledger_google_account_v1";
 const STORAGE_DRIVE_FOLDER_ID = "ledger_drive_folder_id_v1";
 const STORAGE_DRIVE_FILE_ID = "ledger_drive_file_id_v1";
 const STORAGE_LAST_BACKUP_AT = "ledger_last_backup_at_v1";
+// STORAGE_GOOGLE_CONNECTED: "1" | absent — whether this device currently
+//   has an active Drive backup connection. Separate from
+//   STORAGE_GOOGLE_ACCOUNT because a silent token refresh can re-establish
+//   the connection (and should re-enable auto-backup) without necessarily
+//   returning profile info to display.
+// STORAGE_GOOGLE_DECLINED: "1" | absent — set only when the user taps
+//   "Disconnect" explicitly. Prevents the automatic connect-on-launch
+//   effect from re-prompting/re-connecting a device the user deliberately
+//   opted out on; cleared again on any successful sign-in.
+const STORAGE_GOOGLE_CONNECTED = "ledger_google_connected_v1";
+const STORAGE_GOOGLE_DECLINED = "ledger_google_declined_v1";
 
 /* =========================================================================
    GOOGLE DRIVE BACKUP (feature #40, user-requested)
@@ -2357,6 +2368,19 @@ export default function LedgerApp() {
       return null;
     }
   });
+  // Whether a Drive backup connection is currently active. This — not
+  // googleAccount — is what gates auto-backup, so a connection re-established
+  // via a silent token refresh (which may not return profile info) still
+  // keeps backups running. Back-compat: a device updating from a version
+  // that only ever persisted googleAccount is treated as still connected.
+  const [googleConnected, setGoogleConnected] = useState(() => {
+    try {
+      if (localStorage.getItem(STORAGE_GOOGLE_CONNECTED) === "1") return true;
+      return localStorage.getItem(STORAGE_GOOGLE_ACCOUNT) !== null;
+    } catch {
+      return false;
+    }
+  });
   const [backupStatus, setBackupStatus] = useState("idle"); // idle | working | error
   const [backupError, setBackupError] = useState("");
   const accessTokenRef = useRef(null);
@@ -2398,6 +2422,59 @@ export default function LedgerApp() {
   const fileInputRef = useRef(null);
   const historyRef = useRef({}); // { [account::month]: { past: [], future: [] } }
   const lastPushRef = useRef({}); // { [account::month]: timestamp }
+
+  // Read-only mode (Google-Docs-style): the editor opens locked on every
+  // page visit — a stray tap while scrolling/reading can't accidentally
+  // insert or delete text. Double-tapping the editor unlocks it for typing;
+  // switching account or month re-locks it, so landing on a different page
+  // always starts in the safe, view-only state again.
+  const [isEditable, setIsEditable] = useState(false);
+  const lastEditorTapRef = useRef(0);
+  const DOUBLE_TAP_MS = 350;
+  function handleEditorTap() {
+    if (isEditable || restoreInProgress) return;
+    const now = Date.now();
+    if (now - lastEditorTapRef.current <= DOUBLE_TAP_MS) {
+      setIsEditable(true);
+      lastEditorTapRef.current = 0;
+    } else {
+      lastEditorTapRef.current = now;
+    }
+  }
+  useEffect(() => {
+    if (isEditable && textareaRef.current) textareaRef.current.focus();
+  }, [isEditable]);
+  useEffect(() => {
+    setIsEditable(false);
+  }, [activeAccount, activeMonth]);
+
+  // Small Google-Docs-style status pill (top center) — shows "Saving…" /
+  // "Saved" / "Restoring…" etc. Reused for both the backup notifier and the
+  // fresh-install/manual restore lock message, so there's one mechanism for
+  // both. autoHideMs: 0 keeps it up indefinitely until the next showToast()
+  // call replaces or clears it (used while an operation is in progress).
+  const [toast, setToast] = useState(null); // { text, tone: 'info'|'success'|'error' } | null
+  const [toastVisible, setToastVisible] = useState(false);
+  const toastHideTimerRef = useRef(null);
+  const toastClearTimerRef = useRef(null);
+  function showToast(text, opts = {}) {
+    if (toastHideTimerRef.current) clearTimeout(toastHideTimerRef.current);
+    if (toastClearTimerRef.current) clearTimeout(toastClearTimerRef.current);
+    setToast({ text, tone: opts.tone || "info" });
+    setToastVisible(true);
+    if (opts.autoHideMs !== 0) {
+      const ms = opts.autoHideMs ?? 1800;
+      toastHideTimerRef.current = setTimeout(() => {
+        setToastVisible(false);
+        toastClearTimerRef.current = setTimeout(() => setToast(null), 300);
+      }, ms);
+    }
+  }
+
+  // Locks the editor for the duration of a restore (fresh-install or
+  // manual "Restore latest"), so a payload landing mid-typing can't
+  // silently clobber something just entered — see performRestore().
+  const [restoreInProgress, setRestoreInProgress] = useState(false);
 
   const pageKey = `${activeAccount}::${activeMonth}`;
   const text = accounts[activeAccount]?.[activeMonth] ?? "";
@@ -2479,6 +2556,12 @@ export default function LedgerApp() {
       else localStorage.removeItem(STORAGE_GOOGLE_ACCOUNT);
     } catch {}
   }, [googleAccount]);
+  useEffect(() => {
+    try {
+      if (googleConnected) localStorage.setItem(STORAGE_GOOGLE_CONNECTED, "1");
+      else localStorage.removeItem(STORAGE_GOOGLE_CONNECTED);
+    } catch {}
+  }, [googleConnected]);
   useEffect(() => {
     try {
       if (lastBackupAt) localStorage.setItem(STORAGE_LAST_BACKUP_AT, lastBackupAt);
@@ -2643,10 +2726,43 @@ export default function LedgerApp() {
   useEffect(() => {
     if (googleInitedRef.current) return;
     googleInitedRef.current = true;
-    SocialLogin.initialize({ google: { webClientId: GOOGLE_WEB_CLIENT_ID } }).catch((err) => {
-      console.warn("Google Sign-In init failed (is GOOGLE_WEB_CLIENT_ID set up? see CONTEXT.md):", err);
-    });
+    SocialLogin.initialize({ google: { webClientId: GOOGLE_WEB_CLIENT_ID } })
+      .then(() => {
+        autoConnectGoogle();
+      })
+      .catch((err) => {
+        console.warn("Google Sign-In init failed (is GOOGLE_WEB_CLIENT_ID set up? see CONTEXT.md):", err);
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Fully automatic connect, so backup starts without the user ever having
+  // to find and tap "Back up to Google Drive". Runs once, right after
+  // SocialLogin initializes. Skipped on a fresh install (the fresh-install
+  // restore effect below establishes the connection itself, in the right
+  // order — sign in, download, restore — before anything backs up) and
+  // skipped if the user already explicitly disconnected (STORAGE_GOOGLE_DECLINED),
+  // so tapping "Disconnect" is respected instead of being silently undone
+  // on the next launch.
+  async function autoConnectGoogle() {
+    if (isFreshInstallRef.current) return;
+    if (googleConnected) return;
+    try {
+      if (localStorage.getItem(STORAGE_GOOGLE_DECLINED) === "1") return;
+    } catch {}
+    try {
+      await getGoogleAccessToken();
+      backupNow();
+    } catch (err) {
+      // No account has ever been connected on this device and the silent
+      // path found nothing to reuse — getGoogleAccessToken's interactive
+      // fallback needs the OS account picker, which requires the person
+      // actually pick an account there. Nothing more to do automatically;
+      // the "Back up to Google Drive" row stays available as a manual
+      // fallback, and this is retried on the next app open.
+      console.warn("Automatic Google Drive connect didn't complete:", err);
+    }
+  }
 
   async function signInToGoogle() {
     try {
@@ -2657,6 +2773,10 @@ export default function LedgerApp() {
       const token = res.result.accessToken?.token;
       accessTokenRef.current = token;
       setGoogleAccount({ email: res.result.profile?.email, displayName: res.result.profile?.name });
+      setGoogleConnected(true);
+      try {
+        localStorage.removeItem(STORAGE_GOOGLE_DECLINED);
+      } catch {}
       await backupNow(token);
     } catch (err) {
       console.warn("Google sign-in failed:", err);
@@ -2683,19 +2803,33 @@ export default function LedgerApp() {
         const token = res?.result?.accessToken?.token || res?.accessToken?.token;
         if (token) {
           accessTokenRef.current = token;
+          setGoogleConnected(true);
+          // A silent refresh doesn't always carry profile info back — only
+          // update googleAccount if it did, otherwise leave whatever's
+          // already stored (or the "Connected" fallback label) alone.
+          const profile = res?.result?.profile || res?.profile;
+          if (profile) setGoogleAccount({ email: profile.email, displayName: profile.name });
           return token;
         }
       }
     } catch (err) {
       console.warn("Silent Google token refresh failed, falling back to interactive sign-in:", err);
     }
-    // Silent path didn't yield a token — last resort, may show UI.
+    // Silent path didn't yield a token — last resort, may show UI. This is
+    // also the path a brand-new device/account takes, since there's no
+    // prior session to silently refresh — reaching it doesn't require the
+    // user to have tapped any in-app button first, since it's called
+    // automatically by autoConnectGoogle() or the fresh-install restore.
     const res = await SocialLogin.login({
       provider: "google",
       options: { scopes: ["email", "profile", GOOGLE_DRIVE_SCOPE] },
     });
     const token = res.result.accessToken?.token;
     accessTokenRef.current = token;
+    setGoogleConnected(true);
+    try {
+      localStorage.removeItem(STORAGE_GOOGLE_DECLINED);
+    } catch {}
     if (res.result.profile) {
       setGoogleAccount({ email: res.result.profile.email, displayName: res.result.profile.name });
     }
@@ -2708,6 +2842,10 @@ export default function LedgerApp() {
     } catch {}
     accessTokenRef.current = null;
     setGoogleAccount(null);
+    setGoogleConnected(false);
+    try {
+      localStorage.setItem(STORAGE_GOOGLE_DECLINED, "1");
+    } catch {}
     setBackupStatus("idle");
     setBackupError("");
   }
@@ -2717,20 +2855,23 @@ export default function LedgerApp() {
   // silent (no picker/UI) as long as the Credential Manager session is
   // still valid.
   async function backupNow(tokenOverride) {
-    if (!googleAccount && !tokenOverride) return;
+    if (!googleConnected && !tokenOverride) return;
     setBackupStatus("working");
     setBackupError("");
+    showToast("Saving…", { autoHideMs: 0 });
     try {
       let token = tokenOverride || (await getGoogleAccessToken());
       const payload = await buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported });
       await uploadBackupToDrive(token, JSON.stringify(payload));
       setLastBackupAt(new Date().toISOString());
       setBackupStatus("idle");
+      showToast("Saved to Google Drive", { tone: "success", autoHideMs: 1500 });
     } catch (err) {
       console.warn("Google Drive backup failed:", err);
       accessTokenRef.current = null; // force a fresh token next attempt — covers an expired-token 401
       setBackupStatus("error");
       setBackupError(String(err.message || err));
+      showToast("Backup failed", { tone: "error", autoHideMs: 2500 });
     }
   }
 
@@ -2739,22 +2880,29 @@ export default function LedgerApp() {
   // its own confirm, below) and by the fresh-install prompt (which already
   // got its own confirmation from the user before calling this).
   async function performRestore() {
+    setRestoreInProgress(true);
     setBackupStatus("working");
     setBackupError("");
+    showToast("Restoring your data…", { autoHideMs: 0 });
     try {
       let token = await getGoogleAccessToken();
       const payload = await downloadBackupFromDrive(token);
       if (!payload) {
         setBackupStatus("idle");
+        showToast("No backup found yet", { tone: "error", autoHideMs: 2500 });
         showAlert("No backup found in Google Drive yet — nothing to restore.");
         return;
       }
       await restoreBackupPayload(payload, { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported });
       setBackupStatus("idle");
+      showToast("Restored from Google Drive", { tone: "success", autoHideMs: 2000 });
     } catch (err) {
       console.warn("Google Drive restore failed:", err);
       setBackupStatus("error");
       setBackupError(String(err.message || err));
+      showToast("Restore failed", { tone: "error", autoHideMs: 2500 });
+    } finally {
+      setRestoreInProgress(false);
     }
   }
 
@@ -2766,12 +2914,18 @@ export default function LedgerApp() {
     );
   }
 
-  // Fresh-install prompt: if this device has no local data at all (a
-  // clean install) offer to restore before the user starts typing into a
-  // brand-new, empty ledger. Deliberately does NOT go through
-  // signInToGoogle()/backupNow() first — that would upload this empty
-  // starter state and clobber a real backup before performRestore() ever
-  // gets to read it. Runs once, on mount.
+  // Fresh-install auto-restore: if this device has no local data at all (a
+  // clean install) restore automatically, before the user starts typing
+  // into a brand-new, empty ledger — no confirmation dialog, since there's
+  // nothing on-device yet for a restore to overwrite. Deliberately does NOT
+  // go through signInToGoogle()/backupNow() first — that would upload this
+  // empty starter state and clobber a real backup before performRestore()
+  // ever gets to read it. Runs once, on mount. (If there's genuinely no
+  // prior Google session on this device, getGoogleAccessToken() inside
+  // performRestore() still needs the one unavoidable OS-level account
+  // picker — there's no way to grant Drive access without the person
+  // choosing an account at least once — but that's the OS's UI, not an
+  // in-app prompt.)
   const isFreshInstallRef = useRef(
     (() => {
       try {
@@ -2783,11 +2937,7 @@ export default function LedgerApp() {
   );
   useEffect(() => {
     if (!isFreshInstallRef.current) return;
-    askConfirm(
-      "This looks like a fresh install. If you've backed up to Google Drive before, sign in to restore your data now.",
-      performRestore,
-      { confirmLabel: "Sign in & restore" }
-    );
+    performRestore();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -2798,17 +2948,17 @@ export default function LedgerApp() {
   // listener below, which backs up immediately on backgrounding so a quick
   // edit-then-close isn't left waiting on the debounce timer.
   useEffect(() => {
-    if (!googleAccount) return;
+    if (!googleConnected) return;
     if (backupDebounceRef.current) clearTimeout(backupDebounceRef.current);
     backupDebounceRef.current = setTimeout(() => {
       backupNow();
     }, 60000);
     return () => clearTimeout(backupDebounceRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, googleAccount]);
+  }, [accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, googleConnected]);
 
   useEffect(() => {
-    if (!googleAccount) return undefined;
+    if (!googleConnected) return undefined;
     let listenerHandle;
     CapApp.addListener("appStateChange", ({ isActive }) => {
       if (!isActive) {
@@ -2822,7 +2972,7 @@ export default function LedgerApp() {
       listenerHandle?.remove();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [googleAccount]);
+  }, [googleConnected]);
 
   /* ---- editing + working undo/redo (coalesced into ~800ms bursts) ---- */
   function handleChange(e) {
@@ -3243,15 +3393,58 @@ export default function LedgerApp() {
         </div>
       </div>
 
+      {/* status pill: backup notifier + restore lock message (feature #41) */}
+      {toast && (
+        <div
+          className={
+            "pointer-events-none fixed left-1/2 -translate-x-1/2 z-50 px-3 py-1.5 rounded-full font-mono text-[11px] shadow-lg flex items-center gap-1.5 transition-opacity duration-300 " +
+            (toastVisible ? "opacity-100" : "opacity-0") +
+            " " +
+            (toast.tone === "success"
+              ? "bg-teal-900/95 text-teal-200"
+              : toast.tone === "error"
+              ? "bg-rose-950/95 text-rose-200"
+              : "bg-zinc-800/95 text-zinc-200")
+          }
+          style={{ top: "calc(0.5rem + env(safe-area-inset-top))" }}
+        >
+          {toast.tone === "success" ? (
+            <Check size={12} />
+          ) : toast.tone === "error" ? (
+            <CloudOff size={12} />
+          ) : (
+            <Cloud size={12} className="animate-pulse" />
+          )}
+          {toast.text}
+        </div>
+      )}
+
       {/* blank editor */}
       <textarea
         ref={textareaRef}
         value={text}
         onChange={handleChange}
+        onClick={handleEditorTap}
+        readOnly={!isEditable || restoreInProgress}
         spellCheck={false}
         style={{ fontSize: `${fontSize}px`, lineHeight: lineSpacing }}
-        className="flex-1 w-full resize-none outline-none px-5 py-4 font-mono bg-black text-zinc-100 placeholder-zinc-700 caret-white"
+        className={
+          "flex-1 w-full resize-none outline-none px-5 py-4 font-mono bg-black text-zinc-100 placeholder-zinc-700 caret-white " +
+          (!isEditable || restoreInProgress ? "opacity-80" : "")
+        }
       />
+
+      {/* read-only hint (Google-Docs-style): visible whenever the editor
+          is locked, tells the person how to unlock it. Hidden during a
+          restore, since the toast above already explains that lock. */}
+      {!isEditable && !restoreInProgress && (
+        <div
+          className="pointer-events-none fixed left-1/2 -translate-x-1/2 z-40 px-3 py-1 rounded-full font-mono text-[10px] bg-zinc-800/90 text-zinc-400 shadow"
+          style={{ bottom: "calc(0.75rem + env(safe-area-inset-bottom))" }}
+        >
+          Double-tap to edit
+        </div>
+      )}
 
       <input ref={fileInputRef} type="file" accept=".txt" className="hidden" onChange={openTxt} />
 
@@ -3440,12 +3633,12 @@ export default function LedgerApp() {
           <SheetRow icon={<Download size={17} />} label="Save .txt" onClick={downloadTxt} />
           <SheetRow icon={<Upload size={17} />} label="Open .txt" onClick={() => fileInputRef.current.click()} />
           <div className="h-px bg-zinc-800 my-1" />
-          {googleAccount ? (
+          {googleConnected ? (
             <div className="px-3 py-2.5 rounded-lg font-mono text-sm text-zinc-200">
               <div className="flex items-center gap-3 text-zinc-300">
                 <Cloud size={17} className={backupStatus === "working" ? "animate-pulse text-teal-400" : "text-teal-500"} />
                 <div className="flex-1 min-w-0">
-                  <div className="truncate">{googleAccount.email}</div>
+                  <div className="truncate">{googleAccount?.email || "Connected"}</div>
                   <div className="text-[10px] text-zinc-500 mt-0.5">
                     {backupStatus === "working"
                       ? "Backing up…"
