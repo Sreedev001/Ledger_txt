@@ -19,7 +19,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.6.0";
+const APP_VERSION = "1.6.1";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -2664,6 +2664,44 @@ export default function LedgerApp() {
     }
   }
 
+  // Gets a usable Drive access token without ever showing the account
+  // picker again once the user has signed in once. The interactive picker
+  // (SocialLogin.login()'s UI) should only ever appear from
+  // signInToGoogle() above, on an explicit first sign-in. Every other spot
+  // that needs a token (auto-backup, restore) goes through this instead:
+  // reuse the in-memory token if we still have one, otherwise silently
+  // re-authorize via isLoggedIn()+refresh() (Credential Manager's stored
+  // session — no UI), and only fall back to the interactive login() if
+  // that silent path fails outright (e.g. the user actually revoked access
+  // from their Google account, not just an app restart clearing memory).
+  async function getGoogleAccessToken() {
+    if (accessTokenRef.current) return accessTokenRef.current;
+    try {
+      const status = await SocialLogin.isLoggedIn({ provider: "google" });
+      if (status?.isLoggedIn) {
+        const res = await SocialLogin.refresh({ provider: "google" });
+        const token = res?.result?.accessToken?.token || res?.accessToken?.token;
+        if (token) {
+          accessTokenRef.current = token;
+          return token;
+        }
+      }
+    } catch (err) {
+      console.warn("Silent Google token refresh failed, falling back to interactive sign-in:", err);
+    }
+    // Silent path didn't yield a token — last resort, may show UI.
+    const res = await SocialLogin.login({
+      provider: "google",
+      options: { scopes: ["email", "profile", GOOGLE_DRIVE_SCOPE] },
+    });
+    const token = res.result.accessToken?.token;
+    accessTokenRef.current = token;
+    if (res.result.profile) {
+      setGoogleAccount({ email: res.result.profile.email, displayName: res.result.profile.name });
+    }
+    return token;
+  }
+
   async function signOutOfGoogle() {
     try {
       await SocialLogin.logout({ provider: "google" });
@@ -2675,24 +2713,15 @@ export default function LedgerApp() {
   }
 
   // Backs up right now. Reuses the in-memory access token if we still have
-  // one; otherwise re-runs signIn(), which on Android goes back through
-  // the Credential Manager and — since the user already granted consent
-  // once — normally completes without the user seeing anything, rather
-  // than a fresh sign-in screen.
+  // one; otherwise gets a fresh one via getGoogleAccessToken(), which stays
+  // silent (no picker/UI) as long as the Credential Manager session is
+  // still valid.
   async function backupNow(tokenOverride) {
     if (!googleAccount && !tokenOverride) return;
     setBackupStatus("working");
     setBackupError("");
     try {
-      let token = tokenOverride || accessTokenRef.current;
-      if (!token) {
-        const res = await SocialLogin.login({
-          provider: "google",
-          options: { scopes: ["email", "profile", GOOGLE_DRIVE_SCOPE] },
-        });
-        token = res.result.accessToken?.token;
-        accessTokenRef.current = token;
-      }
+      let token = tokenOverride || (await getGoogleAccessToken());
       const payload = await buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported });
       await uploadBackupToDrive(token, JSON.stringify(payload));
       setLastBackupAt(new Date().toISOString());
@@ -2713,16 +2742,7 @@ export default function LedgerApp() {
     setBackupStatus("working");
     setBackupError("");
     try {
-      let token = accessTokenRef.current;
-      if (!token) {
-        const res = await SocialLogin.login({
-          provider: "google",
-          options: { scopes: ["email", "profile", GOOGLE_DRIVE_SCOPE] },
-        });
-        token = res.result.accessToken?.token;
-        accessTokenRef.current = token;
-        setGoogleAccount({ email: res.result.profile?.email, displayName: res.result.profile?.name });
-      }
+      let token = await getGoogleAccessToken();
       const payload = await downloadBackupFromDrive(token);
       if (!payload) {
         setBackupStatus("idle");
