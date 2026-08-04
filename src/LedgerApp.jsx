@@ -19,7 +19,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.6.1";
+const APP_VERSION = "1.6.2";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -3179,8 +3179,14 @@ export default function LedgerApp() {
   return (
     <div className="h-screen flex flex-col bg-black">
       {/* top bar */}
-      <div className="flex items-center justify-between px-3 py-2.5 bg-[#151517] shrink-0">
-        <div className="flex items-center gap-1">
+      <div
+        className="flex items-center px-3 py-2.5 bg-[#151517] shrink-0 overflow-x-auto"
+        style={{
+          paddingLeft: "calc(0.75rem + env(safe-area-inset-left))",
+          paddingRight: "calc(0.75rem + env(safe-area-inset-right))",
+        }}
+      >
+        <div className="flex items-center gap-1 shrink-0">
           <button onClick={() => setActiveMonth((m) => addMonths(m, -1))} title="Previous month" className="p-1.5 text-zinc-500 hover:text-white active:text-white">
             <ChevronLeft size={18} />
           </button>
@@ -3203,7 +3209,17 @@ export default function LedgerApp() {
           </button>
         </div>
 
-        <div className="flex items-center gap-1">
+        {/* flexible spacer — keeps the two groups pinned to opposite ends
+            when everything fits, but (unlike justify-between) never forces
+            the right group off the edge of the scroll container if the
+            content is ever wider than the screen (narrow devices, large
+            system font scaling, a display cutout eating into the safe
+            width, etc.) — the row just becomes horizontally scrollable
+            instead of clipping the rightmost button (e.g. the "More" menu)
+            out of reach. */}
+        <div className="flex-1 min-w-[8px]" />
+
+        <div className="flex items-center gap-1 shrink-0">
           <button onClick={runUndo} title="Undo" className="p-2 text-zinc-400 hover:text-white active:text-white">
             <Undo2 size={19} />
           </button>
