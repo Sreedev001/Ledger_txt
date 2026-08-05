@@ -3025,8 +3025,23 @@ export default function LedgerApp() {
   // ledger JSON goes out on every debounce tick. Also see the
   // appStateChange listener below, which backs up immediately on
   // backgrounding so a quick edit-then-close isn't left waiting even 3s.
+  // Skips the effect's first invocation — React always runs a new effect
+  // once on mount, and since googleConnected is restored from localStorage
+  // as true on any already-connected device, that first run is "the app
+  // just opened," not an edit. Left unguarded, it schedules a backup 3s
+  // after every single launch — and if the in-memory token cache is still
+  // empty that early (fresh JS runtime after a restart) and the silent
+  // refresh doesn't land in time, that backup falls back to the
+  // interactive account picker on open. Everything from the second
+  // invocation onward is a genuine change to accounts/entryOrder/etc., so
+  // only those should ever schedule anything.
+  const backupEffectMountedRef = useRef(false);
   useEffect(() => {
     if (!googleConnected) return;
+    if (!backupEffectMountedRef.current) {
+      backupEffectMountedRef.current = true;
+      return;
+    }
     if (backupDebounceRef.current) clearTimeout(backupDebounceRef.current);
     backupDebounceRef.current = setTimeout(() => {
       backupNow();
