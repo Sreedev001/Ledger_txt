@@ -14,6 +14,17 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
 // named export; the older `import jsPDF from "jspdf"` default-export form
 // only worked on 2.x and would silently break the build on today's version.
 import { jsPDF } from "jspdf";
+// NOTE: requires "@capacitor/filesystem" and "@capacitor/share" added to
+// package.json dependencies, both pinned to major version 6 to match this
+// project's Capacitor 6 core (same reasoning as the social-login pin
+// below). Used by exportStatementPdf() to get the generated PDF onto the
+// device on native platforms — Android's WebView doesn't support the
+// blob-URL + `<a download>` technique jsPDF's own `.save()` uses, so a
+// plain `doc.save()` silently does nothing there (see that function's
+// comment for the full explanation and the upstream issue it matches).
+import { Filesystem, Directory } from "@capacitor/filesystem";
+import { Share } from "@capacitor/share";
+import { Capacitor } from "@capacitor/core";
 // NOTE: requires "@capgo/capacitor-social-login" (pinned to major version 6,
 // matching this project's Capacitor 6 — see CONTEXT.md's Google Drive
 // backup section, feature #40, for the Google Cloud Console + native setup
@@ -27,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.10.2";
+const APP_VERSION = "1.11.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -4309,14 +4320,11 @@ function AttachmentsSheetBody({ account, month, onCountChange, onOpenAttachment 
   );
 }
 
-// Renders the same rows StatementView shows on screen (opening balance,
-// every dated/undated line with its running balance, closing balance) into
-// a downloadable PDF. Built by hand with jsPDF's low-level text/line
-// drawing (no jspdf-autotable) so this only adds one new dependency, not a
-// second package with its own version-matching requirements against jsPDF.
-// Paginates itself — ensureSpace() starts a fresh page and repeats the
-// column header whenever a row would run past the bottom margin.
-function exportStatementPdf(account, month, statement) {
+// Builds the jsPDF document — pure drawing logic, no saving/sharing side
+// effect. Split out from the export flow below so the actual "get this PDF
+// onto the device" step (which needs native plugins, see that function's
+// comment) can be swapped without touching the drawing code.
+function buildStatementPdfDoc(account, month, statement) {
   const doc = new jsPDF({ unit: "mm", format: "a4" });
   const marginX = 14;
   const pageWidth = doc.internal.pageSize.getWidth();
@@ -4412,7 +4420,50 @@ function exportStatementPdf(account, month, statement) {
     topBorder: true,
   });
 
-  doc.save(`${account.replace(/\s+/g, "_")}_${month}_statement.pdf`);
+  return doc;
+}
+
+// Gets the built PDF onto the device. This is the part that actually needed
+// fixing, not the drawing above: `doc.save()` (jsPDF's own save method, and
+// what `downloadTxt()` used to do too via a manual Blob+anchor) relies on
+// the HTML5 `<a download>` attribute against a `blob:` URL. Chrome and
+// desktop browsers handle that fine, but Android's WebView — which is what
+// every Capacitor app actually runs in, this one included — is documented
+// to silently no-op on it: no error, no file, nothing (see
+// github.com/ionic-team/capacitor/issues/5478). That almost certainly is
+// what "nothing happens" meant in practice, on both this button and the
+// old "Save .txt" one that came before it.
+// On a native platform this now writes the PDF to the app's cache folder
+// via @capacitor/filesystem, then hands it to @capacitor/share, which opens
+// Android's native "Share/Save via…" sheet — the standard, reliable way to
+// get a generated file out of a Capacitor app and somewhere the user
+// actually wants it (Drive, Files, email, etc.), since direct writes to a
+// public Downloads folder are increasingly restricted by Android's scoped
+// storage anyway. Falls back to the old `doc.save()` blob-download when
+// running outside a native shell (e.g. `npm run dev` in a desktop browser
+// for quick iteration) — that path works fine there, it's specifically the
+// WebView that doesn't support it.
+async function exportStatementPdf(account, month, statement) {
+  const doc = buildStatementPdfDoc(account, month, statement);
+  const filename = `${account.replace(/\s+/g, "_")}_${month}_statement.pdf`;
+
+  if (Capacitor.isNativePlatform()) {
+    const base64 = doc.output("datauristring").split(",")[1];
+    const written = await Filesystem.writeFile({
+      path: filename,
+      data: base64,
+      directory: Directory.Cache,
+    });
+    await Share.share({
+      title: filename,
+      text: `${account} — ${monthLabel(month)} statement`,
+      url: written.uri,
+      dialogTitle: "Save or share statement PDF",
+    });
+    return;
+  }
+
+  doc.save(filename);
 }
 
 function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, setEntryOrder, onOpenAttachment, showToast }) {
@@ -4473,16 +4524,21 @@ function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, set
 
       {accounts[account]?.[month] !== undefined && (
         <button
-          onClick={() => {
-            // exportStatementPdf() is synchronous but can still throw (bad
-            // input, a jsPDF/environment issue, etc.) — without this, a
-            // thrown error here has nowhere to go but the console, which
-            // isn't visible on-device, so the button would just look like
-            // it silently did nothing. showToast() surfaces the real
-            // outcome either way, same pattern as backup/restore's pill.
+          onClick={async () => {
+            // exportStatementPdf() is async now (native path writes to
+            // Filesystem then opens the Share sheet) and can still reject
+            // (bad input, a jsPDF/plugin/environment issue, etc.) —
+            // without this, a rejection here has nowhere to go but the
+            // console, which isn't visible on-device, so the button would
+            // just look like it silently did nothing. showToast()
+            // surfaces the real outcome either way, same pattern as
+            // backup/restore's pill.
             try {
-              exportStatementPdf(account, month, statement);
-              showToast?.("Statement PDF ready — check your Downloads", { tone: "success", autoHideMs: 2500 });
+              await exportStatementPdf(account, month, statement);
+              showToast?.(
+                Capacitor.isNativePlatform() ? "Statement PDF ready to save/share" : "Statement PDF downloaded",
+                { tone: "success", autoHideMs: 2500 }
+              );
             } catch (err) {
               showToast?.(`PDF export failed: ${err?.message || err}`, { tone: "error", autoHideMs: 4000 });
             }
