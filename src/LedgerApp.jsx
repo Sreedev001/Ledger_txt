@@ -3039,8 +3039,19 @@ export default function LedgerApp() {
     if (!googleConnected) return undefined;
     let listenerHandle;
     CapApp.addListener("appStateChange", ({ isActive }) => {
-      if (!isActive) {
-        if (backupDebounceRef.current) clearTimeout(backupDebounceRef.current);
+      // isActive:false fires for more than genuine backgrounding — on
+      // Android's WebView it also fires for the keyboard opening, a native
+      // picker, or even the Google account chooser itself briefly
+      // stealing focus. Only treat it as "the user left, save now" when a
+      // save is actually pending (the debounce timer is running because
+      // something real changed in the last 3s). Otherwise this becomes a
+      // loop: an unconditional backupNow() here can need the interactive
+      // account picker, and that picker opening triggers another
+      // isActive:false, which calls backupNow() again — a single tap that
+      // merely blurs focus (no edit at all) shouldn't ever reach that path.
+      if (!isActive && backupDebounceRef.current) {
+        clearTimeout(backupDebounceRef.current);
+        backupDebounceRef.current = null;
         backupNow();
       }
     }).then((h) => {
