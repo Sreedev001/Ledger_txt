@@ -1,11 +1,16 @@
 import React, { useState, useRef, useMemo, useEffect } from "react";
-import { Undo2, Redo2, Plus, AlignLeft, MoreVertical, X, Download, Upload, Pencil, Trash2, Layers, HelpCircle, Type, AlignJustify, Landmark, ChevronLeft, ChevronRight, CalendarDays, Receipt, FileText, Check, SkipForward, Loader2, Paperclip, Cloud, CloudOff } from "lucide-react";
+import { Undo2, Redo2, Plus, AlignLeft, MoreVertical, X, Download, Pencil, Trash2, Layers, HelpCircle, Type, AlignJustify, Landmark, ChevronLeft, ChevronRight, CalendarDays, Receipt, FileText, Check, SkipForward, Loader2, Paperclip, Cloud, CloudOff } from "lucide-react";
 import * as pdfjsLib from "pdfjs-dist";
 // NOTE: requires "pdfjs-dist" added to package.json dependencies (not part of
 // the previously-generated scaffold — see CONTEXT.md's package list, which
 // needs this one addition for the statement-import feature below).
 import pdfjsWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
+// NOTE: requires "jspdf" added to package.json dependencies — see
+// CONTEXT.md's package list. Used only to render the generated Statement
+// report (StatementView) to a PDF the user can save/share; unrelated to the
+// pdfjs-dist import above, which only ever *reads* bank-statement PDFs.
+import jsPDF from "jspdf";
 // NOTE: requires "@capgo/capacitor-social-login" (pinned to major version 6,
 // matching this project's Capacitor 6 — see CONTEXT.md's Google Drive
 // backup section, feature #40, for the Google Cloud Console + native setup
@@ -19,7 +24,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.8.0";
+const APP_VERSION = "1.10.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -2477,7 +2482,6 @@ export default function LedgerApp() {
   });
   const textareaRef = useRef(null);
   const pendingCursor = useRef(null);
-  const fileInputRef = useRef(null);
   const historyRef = useRef({}); // { [account::month]: { past: [], future: [] } }
   const lastPushRef = useRef({}); // { [account::month]: timestamp }
 
@@ -3268,8 +3272,8 @@ export default function LedgerApp() {
     }
     askConfirm(
       wholeIdentityGoes
-        ? `Delete account "${activeAccount}"? It has no other months, so this removes it entirely. Save a .txt backup first if you need one.`
-        : `Delete "${activeAccount}"'s ${monthLabel(activeMonth)} entries? Its other months are untouched. Save a .txt backup first if you need one.`,
+        ? `Delete account "${activeAccount}"? It has no other months, so this removes it entirely.`
+        : `Delete "${activeAccount}"'s ${monthLabel(activeMonth)} entries? Its other months are untouched.`,
       () => {
         setAccounts((prev) => {
           const next = { ...prev };
@@ -3303,32 +3307,11 @@ export default function LedgerApp() {
     );
   }
 
-  function downloadTxt() {
-    const blob = new Blob([text], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${activeAccount.replace(/\s+/g, "_")}_${activeMonth}.txt`;
-    a.click();
-    URL.revokeObjectURL(url);
-  }
-
   function adjustFontSize(delta) {
     setFontSize((s) => Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, Math.round((s + delta) * 10) / 10)));
   }
   function adjustLineSpacing(delta) {
     setLineSpacing((s) => Math.min(LINE_SPACING_MAX, Math.max(LINE_SPACING_MIN, Math.round((s + delta) * 10) / 10)));
-  }
-
-  function openTxt(e) {
-    const file = e.target.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      setAccounts((prev) => ({ ...prev, [activeAccount]: { ...prev[activeAccount], [activeMonth]: reader.result } }));
-    };
-    reader.readAsText(file);
-    e.target.value = "";
   }
 
   if (showingAgg) {
@@ -3550,8 +3533,6 @@ export default function LedgerApp() {
         </div>
       )}
 
-      <input ref={fileInputRef} type="file" accept=".txt" className="hidden" onChange={openTxt} />
-
       {/* accounts sheet */}
       <BottomSheet open={sheet === "accounts"} onClose={closeSheet} title="Accounts">
         <div className="flex flex-col gap-1 mt-1">
@@ -3733,9 +3714,6 @@ export default function LedgerApp() {
             disabledDec={lineSpacing <= LINE_SPACING_MIN}
             disabledInc={lineSpacing >= LINE_SPACING_MAX}
           />
-          <div className="h-px bg-zinc-800 my-1" />
-          <SheetRow icon={<Download size={17} />} label="Save .txt" onClick={downloadTxt} />
-          <SheetRow icon={<Upload size={17} />} label="Open .txt" onClick={() => fileInputRef.current.click()} />
           <div className="h-px bg-zinc-800 my-1" />
           {googleConnected ? (
             <div className="px-3 py-2.5 rounded-lg font-mono text-sm text-zinc-200">
@@ -4310,6 +4288,112 @@ function AttachmentsSheetBody({ account, month, onCountChange, onOpenAttachment 
   );
 }
 
+// Renders the same rows StatementView shows on screen (opening balance,
+// every dated/undated line with its running balance, closing balance) into
+// a downloadable PDF. Built by hand with jsPDF's low-level text/line
+// drawing (no jspdf-autotable) so this only adds one new dependency, not a
+// second package with its own version-matching requirements against jsPDF.
+// Paginates itself — ensureSpace() starts a fresh page and repeats the
+// column header whenever a row would run past the bottom margin.
+function exportStatementPdf(account, month, statement) {
+  const doc = new jsPDF({ unit: "mm", format: "a4" });
+  const marginX = 14;
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const colDay = marginX;
+  const colDesc = marginX + 14;
+  const colDebitRight = pageWidth - marginX - 46;
+  const colCreditRight = pageWidth - marginX - 24;
+  const colBalanceRight = pageWidth - marginX;
+  const descWidth = colDebitRight - colDesc - 4;
+
+  let y = 20;
+
+  function drawHeaderRow() {
+    doc.setFont("courier", "bold");
+    doc.setFontSize(9);
+    doc.text("Day", colDay, y);
+    doc.text("Description", colDesc, y);
+    doc.text("Debit", colDebitRight, y, { align: "right" });
+    doc.text("Credit", colCreditRight, y, { align: "right" });
+    doc.text("Balance", colBalanceRight, y, { align: "right" });
+    y += 2;
+    doc.setLineWidth(0.2);
+    doc.line(marginX, y, pageWidth - marginX, y);
+    y += 5;
+    doc.setFont("courier", "normal");
+  }
+
+  function ensureSpace(rowHeight) {
+    if (y + rowHeight > pageHeight - 16) {
+      doc.addPage();
+      y = 20;
+      drawHeaderRow();
+    }
+  }
+
+  function drawRow({ day, desc, debit, credit, balance, bold, topBorder }) {
+    doc.setFont("courier", bold ? "bold" : "normal");
+    const descLines = doc.splitTextToSize(desc, descWidth);
+    const rowHeight = Math.max(5, descLines.length * 4.2);
+    ensureSpace(rowHeight + (topBorder ? 3 : 0));
+    if (topBorder) {
+      doc.setLineWidth(0.3);
+      doc.line(marginX, y - 3, pageWidth - marginX, y - 3);
+    }
+    doc.text(String(day), colDay, y);
+    doc.text(descLines, colDesc, y);
+    if (debit) doc.text(debit, colDebitRight, y, { align: "right" });
+    if (credit) doc.text(credit, colCreditRight, y, { align: "right" });
+    doc.text(balance, colBalanceRight, y, { align: "right" });
+    y += rowHeight;
+  }
+
+  doc.setFont("courier", "bold");
+  doc.setFontSize(13);
+  doc.text(`${account} — ${monthLabel(month)}`, marginX, y);
+  y += 6;
+  doc.setFont("courier", "normal");
+  doc.setFontSize(8);
+  doc.setTextColor(120);
+  doc.text("Statement — generated from Ledger App", marginX, y);
+  doc.setTextColor(0);
+  y += 8;
+
+  drawHeaderRow();
+
+  drawRow({
+    day: "—",
+    desc: "Opening balance",
+    debit: "",
+    credit: "",
+    balance: formatNum(statement.openingBalance) || "0",
+  });
+
+  for (const r of statement.rows) {
+    const desc = r.sub ? `${r.label} · ${r.category} — ${r.sub}` : `${r.label} · ${r.category}`;
+    drawRow({
+      day: statementDateCell(r.date),
+      desc,
+      debit: r.sign === "-" ? formatNum(r.amount) : "",
+      credit: r.sign === "+" ? formatNum(r.amount) : "",
+      balance: formatNum(r.balance) || "0",
+    });
+  }
+
+  drawRow({
+    day: "",
+    desc: "Closing balance",
+    debit: "",
+    credit: "",
+    balance: formatNum(statement.closingBalance) || "0",
+    bold: true,
+    topBorder: true,
+  });
+
+  doc.save(`${account.replace(/\s+/g, "_")}_${month}_statement.pdf`);
+}
+
 function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, setEntryOrder, onOpenAttachment }) {
   const [account, setAccount] = useState(defaultAccount);
   const [month, setMonth] = useState(defaultMonth);
@@ -4365,6 +4449,16 @@ function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, set
       </div>
 
       <StatementAttachments account={account} month={month} onOpenAttachment={onOpenAttachment} />
+
+      {accounts[account]?.[month] !== undefined && (
+        <button
+          onClick={() => exportStatementPdf(account, month, statement)}
+          className="w-full flex items-center justify-center gap-2 mb-4 rounded-lg border border-zinc-800 px-3 py-2 font-mono text-xs text-zinc-300 hover:text-white hover:border-zinc-600"
+        >
+          <Download size={14} />
+          Export statement as PDF
+        </button>
+      )}
 
       {accounts[account]?.[month] === undefined ? (
         <div className="rounded-lg border border-zinc-800 bg-zinc-800/60 px-3 py-2 font-mono text-[11px] text-zinc-400">
