@@ -10,7 +10,10 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
 // CONTEXT.md's package list. Used only to render the generated Statement
 // report (StatementView) to a PDF the user can save/share; unrelated to the
 // pdfjs-dist import above, which only ever *reads* bank-statement PDFs.
-import jsPDF from "jspdf";
+// Named import (not default) — current jsPDF (4.x) publishes `jsPDF` as a
+// named export; the older `import jsPDF from "jspdf"` default-export form
+// only worked on 2.x and would silently break the build on today's version.
+import { jsPDF } from "jspdf";
 // NOTE: requires "@capgo/capacitor-social-login" (pinned to major version 6,
 // matching this project's Capacitor 6 — see CONTEXT.md's Google Drive
 // backup section, feature #40, for the Google Cloud Console + native setup
@@ -24,7 +27,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.10.0";
+const APP_VERSION = "1.10.1";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
