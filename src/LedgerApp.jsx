@@ -27,7 +27,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.10.1";
+const APP_VERSION = "1.10.2";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -2261,6 +2261,42 @@ function BottomSheet({ open, onClose, title, children, dismissible = true }) {
   );
 }
 
+// Shared "status pill" markup (backup/restore notifier, feature #41; now
+// also used by the Statement report's PDF-export feedback). Pulled out
+// into its own component because the app has several full-screen branches
+// (Aggregate, Loans, Statement, Import) that each `return` their own
+// top-level <div>, separate from the main editor's JSX tree that originally
+// held this markup inline — a toast fired while one of those screens was
+// open would update state but never actually render anywhere. Each branch
+// below now renders this too, not just the main editor return.
+function StatusToastPill({ toast, toastVisible }) {
+  if (!toast) return null;
+  return (
+    <div
+      className={
+        "pointer-events-none fixed left-1/2 -translate-x-1/2 z-50 px-3 py-1.5 rounded-full font-mono text-[11px] shadow-lg flex items-center gap-1.5 transition-opacity duration-300 " +
+        (toastVisible ? "opacity-100" : "opacity-0") +
+        " " +
+        (toast.tone === "success"
+          ? "bg-teal-900/95 text-teal-200"
+          : toast.tone === "error"
+          ? "bg-rose-950/95 text-rose-200"
+          : "bg-zinc-800/95 text-zinc-200")
+      }
+      style={{ top: "calc(0.5rem + env(safe-area-inset-top))" }}
+    >
+      {toast.tone === "success" ? (
+        <Check size={12} />
+      ) : toast.tone === "error" ? (
+        <CloudOff size={12} />
+      ) : (
+        <Cloud size={12} className="animate-pulse" />
+      )}
+      {toast.text}
+    </div>
+  );
+}
+
 function SheetRow({ icon, label, onClick, danger }) {
   return (
     <button
@@ -3320,6 +3356,7 @@ export default function LedgerApp() {
   if (showingAgg) {
     return (
       <div className="h-screen flex flex-col bg-black text-zinc-100">
+        <StatusToastPill toast={toast} toastVisible={toastVisible} />
         <div className="flex items-center gap-3 px-4 py-3 bg-[#151517] shrink-0">
           <button onClick={() => setShowingAgg(false)} className="flex items-center gap-1 -ml-1 px-1 py-1 text-zinc-300 hover:text-white">
             <X size={20} />
@@ -3335,6 +3372,7 @@ export default function LedgerApp() {
   if (showingLoans) {
     return (
       <div className="h-screen flex flex-col bg-black text-zinc-100">
+        <StatusToastPill toast={toast} toastVisible={toastVisible} />
         <div className="flex items-center gap-3 px-4 py-3 bg-[#151517] shrink-0">
           <button onClick={() => setShowingLoans(false)} className="flex items-center gap-1 -ml-1 px-1 py-1 text-zinc-300 hover:text-white">
             <X size={20} />
@@ -3350,6 +3388,7 @@ export default function LedgerApp() {
   if (showingStatement) {
     return (
       <div className="h-screen flex flex-col bg-black text-zinc-100">
+        <StatusToastPill toast={toast} toastVisible={toastVisible} />
         <div className="flex items-center gap-3 px-4 py-3 bg-[#151517] shrink-0">
           <button onClick={() => setShowingStatement(false)} className="flex items-center gap-1 -ml-1 px-1 py-1 text-zinc-300 hover:text-white">
             <X size={20} />
@@ -3364,6 +3403,7 @@ export default function LedgerApp() {
           entryOrder={entryOrder}
           setEntryOrder={setEntryOrder}
           onOpenAttachment={openAttachmentInImport}
+          showToast={showToast}
         />
       </div>
     );
@@ -3372,6 +3412,7 @@ export default function LedgerApp() {
   if (showingImport) {
     return (
       <div className="h-screen flex flex-col bg-black text-zinc-100">
+        <StatusToastPill toast={toast} toastVisible={toastVisible} />
         <div className="flex items-center gap-3 px-4 py-3 bg-[#151517] shrink-0">
           <button
             onClick={() => {
@@ -3484,30 +3525,7 @@ export default function LedgerApp() {
       </div>
 
       {/* status pill: backup notifier + restore lock message (feature #41) */}
-      {toast && (
-        <div
-          className={
-            "pointer-events-none fixed left-1/2 -translate-x-1/2 z-50 px-3 py-1.5 rounded-full font-mono text-[11px] shadow-lg flex items-center gap-1.5 transition-opacity duration-300 " +
-            (toastVisible ? "opacity-100" : "opacity-0") +
-            " " +
-            (toast.tone === "success"
-              ? "bg-teal-900/95 text-teal-200"
-              : toast.tone === "error"
-              ? "bg-rose-950/95 text-rose-200"
-              : "bg-zinc-800/95 text-zinc-200")
-          }
-          style={{ top: "calc(0.5rem + env(safe-area-inset-top))" }}
-        >
-          {toast.tone === "success" ? (
-            <Check size={12} />
-          ) : toast.tone === "error" ? (
-            <CloudOff size={12} />
-          ) : (
-            <Cloud size={12} className="animate-pulse" />
-          )}
-          {toast.text}
-        </div>
-      )}
+      <StatusToastPill toast={toast} toastVisible={toastVisible} />
 
       {/* blank editor */}
       <textarea
@@ -4397,7 +4415,7 @@ function exportStatementPdf(account, month, statement) {
   doc.save(`${account.replace(/\s+/g, "_")}_${month}_statement.pdf`);
 }
 
-function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, setEntryOrder, onOpenAttachment }) {
+function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, setEntryOrder, onOpenAttachment, showToast }) {
   const [account, setAccount] = useState(defaultAccount);
   const [month, setMonth] = useState(defaultMonth);
 
@@ -4455,7 +4473,20 @@ function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, set
 
       {accounts[account]?.[month] !== undefined && (
         <button
-          onClick={() => exportStatementPdf(account, month, statement)}
+          onClick={() => {
+            // exportStatementPdf() is synchronous but can still throw (bad
+            // input, a jsPDF/environment issue, etc.) — without this, a
+            // thrown error here has nowhere to go but the console, which
+            // isn't visible on-device, so the button would just look like
+            // it silently did nothing. showToast() surfaces the real
+            // outcome either way, same pattern as backup/restore's pill.
+            try {
+              exportStatementPdf(account, month, statement);
+              showToast?.("Statement PDF ready — check your Downloads", { tone: "success", autoHideMs: 2500 });
+            } catch (err) {
+              showToast?.(`PDF export failed: ${err?.message || err}`, { tone: "error", autoHideMs: 4000 });
+            }
+          }}
           className="w-full flex items-center justify-center gap-2 mb-4 rounded-lg border border-zinc-800 px-3 py-2 font-mono text-xs text-zinc-300 hover:text-white hover:border-zinc-600"
         >
           <Download size={14} />
