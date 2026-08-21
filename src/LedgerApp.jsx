@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.11.0";
+const APP_VERSION = "1.12.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -119,8 +119,7 @@ function starterLine(accountName, monthKey) {
 
 // Flattens the nested { account: { month: text } } shape into a single
 // account-name -> text map for one month, filling in "" for any account
-// that has no page in that month yet. Used for the same-month-only Personal
-// Incoming/Outgoing sync, and for the Aggregate report.
+// that has no page in that month yet. Used by the Aggregate report.
 function monthSlice(accounts, month) {
   const slice = {};
   for (const acct of Object.keys(accounts)) slice[acct] = accounts[acct]?.[month] ?? "";
@@ -552,173 +551,16 @@ function parseLedger(text) {
 }
 
 /* =========================================================================
-   PERSONAL OUTGOING <-> PERSONAL INCOMING SYNC
-   A "(-): Personal Outgoing" category whose subcategory is named after
-   another existing account mirrors those entries into that account's
-   "(+): Personal Incoming" category (and vice versa), under a subcategory
-   named after the counterpart account.
-
-   The two directions are NOT symmetric on purpose:
-     - Outgoing -> Incoming is fully authoritative: it creates, updates, and
-       deletes the mirrored subcategory to exactly match the Outgoing side.
-     - Incoming -> Outgoing only creates/updates; it never deletes. This is
-       what stops the two directions from fighting over ownership and
-       oscillating forever when a relationship is bootstrapped from the
-       receiving side (see runSyncRounds below).
-   Once a relationship's Outgoing side exists, it becomes the authoritative
-   copy going forward — editing/removing it there is what should be trusted;
-   the Incoming mirror will always follow it exactly.
+   PERSONAL OUTGOING <-> PERSONAL INCOMING AUTO-SYNC — REMOVED (v1.12.0).
+   This used to auto-mirror a "(-): Personal Outgoing" subcategory into
+   another account's "(+): Personal Incoming" (and vice versa). Dropped at
+   user request: it caused confusion while entering data from bank
+   statements (entries could get mirrored/marked in an account the user
+   didn't intend, or land in the wrong slot). "Personal Incoming" and
+   "Personal Outgoing" remain perfectly normal category names you can type
+   by hand — the app just no longer auto-generates or auto-deletes anything
+   under them.
    ========================================================================= */
-
-// { [targetAccountName]: { [counterpartAccountName]: [{label, amount}] } }
-function computeCategoryUpdates(accounts, sourceCategoryNorm) {
-  const names = Object.keys(accounts);
-  const map = {};
-  for (const acctName of names) {
-    const parsed = parseLedger(accounts[acctName]);
-    for (const b of parsed.blocks) {
-      if (normLabel(b.title) !== sourceCategoryNorm) continue;
-      for (const s of b.subs) {
-        const targetTrim = s.title.trim();
-        const target = names.find((n) => n === targetTrim) || names.find((n) => n.toLowerCase() === targetTrim.toLowerCase());
-        if (!target || target === acctName) continue;
-        if (!map[target]) map[target] = {};
-        map[target][acctName] = s.entries.map((e) => ({ label: e.label, amount: e.amount }));
-      }
-    }
-  }
-  return map;
-}
-const computeIncomingUpdates = (accounts) => computeCategoryUpdates(accounts, "personaloutgoing");
-const computeOutgoingUpdates = (accounts) => computeCategoryUpdates(accounts, "personalincoming");
-
-function buildManagedCategoryLines(title, sign, subsFinal) {
-  if (subsFinal.length === 0) return [];
-  const lines = [`(${sign}): ${title}`];
-  subsFinal.forEach((s) => {
-    lines.push(s.title);
-    s.entries.forEach((e) => lines.push(`${e.label} - ${formatNum(e.amount)}`));
-    const subTotal = s.entries.reduce((a, e) => a + e.amount, 0);
-    lines.push(`${s.title} Total - ${formatNum(subTotal)}`);
-  });
-  const total = subsFinal.reduce((a, s) => a + s.entries.reduce((x, e) => x + e.amount, 0), 0);
-  lines.push(`${title} Total - ${formatNum(total)}`);
-  return lines;
-}
-
-// Rewrites one account's text so a managed category (Personal Incoming or
-// Personal Outgoing) reflects `desiredBySource`. With deleteUnlisted=true
-// (the default) any managed subcategory not present in desiredBySource is
-// removed; with deleteUnlisted=false it's left exactly as-is instead.
-function applyManagedCategorySync(text, accountNames, desiredBySource, categoryTitle, sign, deleteUnlisted = true) {
-  const wantedNorm = normLabel(categoryTitle);
-  const parsed = parseLedger(text);
-  const existing = parsed.blocks.find((b) => normLabel(b.title) === wantedNorm);
-
-  // Safety: if the user already hand-wrote flat entries directly under this
-  // category (not organized into subcategories), leave it alone rather than
-  // risk discarding something they typed by hand.
-  if (existing && existing.entries.length > 0) return text;
-
-  const desiredKeysLower = new Set(Object.keys(desiredBySource).map((k) => k.toLowerCase()));
-  const preserved = [];
-  if (existing) {
-    for (const s of existing.subs) {
-      const title = s.title.trim();
-      const isManaged = accountNames.some((n) => n.toLowerCase() === title.toLowerCase());
-      const inDesired = desiredKeysLower.has(title.toLowerCase());
-      if (!isManaged || (!deleteUnlisted && !inDesired)) {
-        preserved.push({ title: s.title, entries: s.entries.map((e) => ({ label: e.label, amount: e.amount })) });
-      }
-    }
-  }
-
-  const syncedNames = Object.keys(desiredBySource)
-    .filter((src) => desiredBySource[src].length > 0)
-    .sort((a, b) => a.localeCompare(b));
-  const subsFinal = [...syncedNames.map((src) => ({ title: src, entries: desiredBySource[src] })), ...preserved];
-  const newBlockLines = buildManagedCategoryLines(categoryTitle, sign, subsFinal);
-
-  const lines = text.split("\n");
-  const removeSet = new Set(existing ? existing.lineIndices : []);
-
-  // Insert right before the first summary line (Sub incoming/outgoing/Balance)
-  // if one exists, otherwise at the very end of the document.
-  const summaryIdxs = Object.values(parsed.summary)
-    .filter(Boolean)
-    .map((s) => s.lineIndex)
-    .sort((a, b) => a - b);
-  const anchor = summaryIdxs.length ? summaryIdxs[0] : null;
-
-  const result = [];
-  let inserted = false;
-  for (let i = 0; i < lines.length; i++) {
-    if (anchor !== null && i === anchor && !inserted) {
-      if (newBlockLines.length) {
-        if (result.length && result[result.length - 1].trim() !== "") result.push("");
-        result.push(...newBlockLines);
-        result.push("");
-      }
-      inserted = true;
-    }
-    if (!removeSet.has(i)) result.push(lines[i]);
-  }
-  if (!inserted && newBlockLines.length) {
-    if (result.length && result[result.length - 1].trim() !== "") result.push("");
-    result.push(...newBlockLines);
-  }
-
-  let finalText = result.join("\n").replace(/\n{3,}/g, "\n\n").replace(/^\n+/, "");
-
-  // Re-run the normal parser + autofill so every Total/Sub/Balance line in
-  // the whole account reflects the new numbers immediately, not just the
-  // block we just wrote.
-  const p2 = parseLedger(finalText);
-  if (p2.autofillTargets.length) {
-    const finalLines = finalText.split("\n");
-    p2.autofillTargets.forEach((t) => {
-      finalLines[t.lineIndex] = rewriteAmountLine(finalLines[t.lineIndex], t.value);
-    });
-    finalText = finalLines.join("\n");
-  }
-  return finalText;
-}
-
-function applyIncomingSync(text, accountNames, desiredBySource) {
-  return applyManagedCategorySync(text, accountNames, desiredBySource, "Personal Incoming", "+", true);
-}
-function applyOutgoingSync(text, accountNames, desiredBySource) {
-  return applyManagedCategorySync(text, accountNames, desiredBySource, "Personal Outgoing", "-", false);
-}
-
-// Runs both sync directions to a fixed point (bootstrapping a relationship
-// from either side can take a couple of rounds to settle), all within one
-// synchronous pass so nothing is ever visibly half-synced. Accounts equal to
-// `excludeFromWrite` are read for their current data but never rewritten —
-// used to guarantee the account someone is actively typing into is never
-// touched mid-keystroke.
-function runSyncRounds(accounts, excludeFromWrite, maxRounds = 5) {
-  let working = accounts;
-  for (let round = 0; round < maxRounds; round++) {
-    const names = Object.keys(working);
-    const incomingMap = computeIncomingUpdates(working);
-    const outgoingMap = computeOutgoingUpdates(working);
-    let changed = false;
-    const next = { ...working };
-    for (const acct of names) {
-      if (acct === excludeFromWrite) continue;
-      let t = applyIncomingSync(working[acct], names, incomingMap[acct] || {});
-      t = applyOutgoingSync(t, names, outgoingMap[acct] || {});
-      if (t !== working[acct]) {
-        next[acct] = t;
-        changed = true;
-      }
-    }
-    working = next;
-    if (!changed) break;
-  }
-  return working;
-}
 
 /* =========================================================================
    LOAN / LOAN REPAYMENT / OUTSTANDING LOANS
@@ -1580,9 +1422,10 @@ function dayLabelFromISO(dateISO) {
 // Inserts one new entry into ledger `text` under (categoryTitle, sign),
 // optionally nested under subTitle — creating the category and/or
 // subcategory if they don't exist yet, matching the same "insert before the
-// closing Total line, re-run autofill after" pattern used by
-// applyManagedCategorySync above. This is the single write-path statement
-// import uses, so it's also the one most worth Node-simulating before trust.
+// closing Total line, re-run autofill after" pattern the old (now-removed)
+// Personal Incoming/Outgoing sync used to use. This is the single write-path
+// statement import uses, so it's also the one most worth Node-simulating
+// before trust.
 function insertLedgerEntry(text, { categoryTitle, sign, subTitle, label, amount }) {
   const parsed = parseLedger(text);
   const catNorm = normLabel(categoryTitle);
@@ -2725,36 +2568,10 @@ export default function LedgerApp() {
     }
   }, [activeMonth, accounts]);
 
-  // ---- keep every OTHER account's Personal Incoming/Outgoing synced live,
-  //      scoped to the currently active month only (these are same-month
-  //      convenience transfers, not the cross-month Loan mechanism below).
-  //      Never rewrites the page currently open for editing. ----
-  useEffect(() => {
-    const slice = monthSlice(accounts, activeMonth);
-    const result = runSyncRounds(slice, activeAccount);
-    const updates = {};
-    for (const k of Object.keys(result)) {
-      if (result[k] !== slice[k]) updates[k] = result[k];
-    }
-    if (Object.keys(updates).length) {
-      setAccounts((prev) => {
-        const next = { ...prev };
-        for (const k of Object.keys(updates)) next[k] = { ...next[k], [activeMonth]: updates[k] };
-        return next;
-      });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [accounts, activeAccount, activeMonth]);
-
-  // ---- catch the newly-opened page up to date the moment you switch to it ----
-  useEffect(() => {
-    const slice = monthSlice(accounts, activeMonth);
-    const result = runSyncRounds(slice, null);
-    if (result[activeAccount] !== undefined && result[activeAccount] !== slice[activeAccount]) {
-      setAccounts((prev) => ({ ...prev, [activeAccount]: { ...prev[activeAccount], [activeMonth]: result[activeAccount] } }));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeAccount, activeMonth]);
+  // ---- Personal Incoming/Outgoing auto-sync effects removed (v1.12.0) —
+  //      see the REMOVED block near computeCategoryUpdates's old location
+  //      above for why. Those categories are now plain hand-typed text like
+  //      any other, so no effect needs to run on account/month switch. ----
 
   // ---- loan tracking has no text-mutation effect anymore: Loan and Loan
   //      repayment entries are plain hand-typed lines like everything else.
@@ -3805,14 +3622,8 @@ export default function LedgerApp() {
               Leave any Total, <code>Sub incoming -</code>, <code>Sub outgoing -</code>, or <code>Balance -</code> blank (or even a
               stale number) and it keeps itself synced automatically as you edit.
               <br />
-              A <code>(-): Personal Outgoing</code> category with a subcategory named after another account (e.g.{" "}
-              <code>Ambika</code>) mirrors those entries into that account's <code>(+): Personal Incoming</code> automatically, and
-              it works the other way too — recording a <code>(+): Personal Incoming</code> entry named after another account
-              creates a matching <code>(-): Personal Outgoing</code> entry over there. Only works if that account exists;
-              unrecognized names are left as plain entries.
-              <br />
-              Caveat: once a pair like this exists on both sides, delete it from just one side and it can reappear from the
-              other side's copy. To remove it for good, delete it from both accounts.
+              <code>(-): Personal Outgoing</code> and <code>(+): Personal Incoming</code> are just plain categories — write
+              entries under them the same way as any other category. Nothing auto-mirrors between accounts.
               <br />
               <br />
               <strong>Loans:</strong> record a loan as an entry under <code>(+): Loan</code> (e.g. <code>Saneesh - 2000</code>).
@@ -3829,7 +3640,7 @@ export default function LedgerApp() {
               <br />
               <strong>Months:</strong> every account is now a set of monthly pages — switch months with the ◀ / ▶ arrows
               or the month pill in the top bar. An account doesn't need a page in every month; a blank one is created the
-              moment you type in it. Personal Incoming/Outgoing only mirrors within the same month. Loans are the
+              moment you type in it. Loans are the
               exception: a loan and its repayment(s) can be in different months (same account only) and will still
               match up in the Outstanding Loans report, which always reflects the full history. That report can also be
               pointed at any month to see a snapshot as of that point in time, instead of always "right now."
