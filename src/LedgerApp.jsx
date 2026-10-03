@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.12.0";
+const APP_VERSION = "1.14.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -46,7 +46,7 @@ const APP_VERSION = "1.12.0";
 
 const ENTRY_RE = /^(.+?)\s-\s([0-9]+(?:\.[0-9]+)?(?:\s*\+\s*[0-9]+(?:\.[0-9]+)?)*)\s*(\((?:[^()]|\([^()]*\))*\))?\s*$/;
 const BLANK_RE = /^(.+?)\s*-\s*$/;
-const MARKER_RE = /^\(([+-])\)\s*:?\s*(.*)$/;
+const MARKER_RE = /^\(([+=-])\)\s*:?\s*(.*)$/;
 const SUMMARY_KEYS = {
   subincoming: "subIncoming",
   suboutgoing: "subOutgoing",
@@ -540,6 +540,11 @@ function parseLedger(text) {
   return {
     blocks,
     unclassified: blocks.filter((b) => b.sign === null),
+    // (=): categories (feature #49, v1.13.0) — intentionally marked as a
+    // pass-through/wash, not merely forgotten to be marked. Kept as a
+    // separate list from `unclassified` above so the UI can tell "you
+    // forgot a marker" apart from "you deliberately excluded this."
+    passthrough: blocks.filter((b) => b.sign === "="),
     subIncoming,
     subOutgoing,
     balance,
@@ -2384,6 +2389,11 @@ export default function LedgerApp() {
   // switching account or month re-locks it, so landing on a different page
   // always starts in the safe, view-only state again.
   const [isEditable, setIsEditable] = useState(false);
+  // Text | Summary view toggle (1.14.0). "summary" swaps the editor for a
+  // strictly read-only, totals-only view computed live from `parsed`.
+  // Deliberately NOT reset on account/month switch, so you can flip through
+  // months while staying in Summary. Not persisted across app restarts.
+  const [viewMode, setViewMode] = useState("text");
   const lastEditorTapRef = useRef(0);
   const DOUBLE_TAP_MS = 350;
   function handleEditorTap() {
@@ -3328,6 +3338,25 @@ export default function LedgerApp() {
             out of reach. */}
         <div className="flex-1 min-w-[8px]" />
 
+        {/* Text | Summary toggle (1.14.0) */}
+        <div className="flex items-center shrink-0 rounded-md bg-zinc-800 p-0.5 mr-1 font-mono text-[11px]">
+          {[["text", "Text"], ["summary", "Summary"]].map(([mode, label]) => (
+            <button
+              key={mode}
+              onClick={() => {
+                setViewMode(mode);
+                if (mode === "summary") setIsEditable(false);
+              }}
+              className={
+                "px-2 py-1 rounded " +
+                (viewMode === mode ? "bg-zinc-600 text-white font-semibold" : "text-zinc-400")
+              }
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
         <div className="flex items-center gap-1 shrink-0">
           <button onClick={runUndo} title="Undo" className="p-2 text-zinc-400 hover:text-white active:text-white">
             <Undo2 size={19} />
@@ -3355,8 +3384,10 @@ export default function LedgerApp() {
       {/* status pill: backup notifier + restore lock message (feature #41) */}
       <StatusToastPill toast={toast} toastVisible={toastVisible} />
 
+      {viewMode === "summary" && <SummaryView parsed={parsed} fontSize={fontSize} />}
+
       {/* blank editor */}
-      <textarea
+      {viewMode === "text" && <textarea
         ref={textareaRef}
         value={text}
         onChange={handleChange}
@@ -3368,12 +3399,12 @@ export default function LedgerApp() {
           "flex-1 w-full resize-none outline-none px-5 py-4 font-mono bg-black text-zinc-100 placeholder-zinc-700 caret-white " +
           (!isEditable || restoreInProgress ? "opacity-80" : "")
         }
-      />
+      />}
 
       {/* read-only hint (Google-Docs-style): visible whenever the editor
           is locked, tells the person how to unlock it. Hidden during a
           restore, since the toast above already explains that lock. */}
-      {!isEditable && !restoreInProgress && (
+      {viewMode === "text" && !isEditable && !restoreInProgress && (
         <div
           className="pointer-events-none fixed left-1/2 -translate-x-1/2 z-40 px-3 py-1 rounded-full font-mono text-[10px] bg-zinc-800/90 text-zinc-400 shadow"
           style={{ bottom: "calc(0.75rem + env(safe-area-inset-bottom))" }}
@@ -3611,7 +3642,15 @@ export default function LedgerApp() {
           <SheetRow icon={<HelpCircle size={17} />} label={showHelp ? "Hide format guide" : "Format guide"} onClick={() => setShowHelp((s) => !s)} />
           {showHelp && (
             <div className="mx-3 mb-1 p-3 rounded-lg border border-teal-900 bg-teal-950/40 font-mono text-[11px] leading-relaxed text-teal-200">
-              Mark a category <code>(+):</code> for credit, <code>(-):</code> for debit.
+              Mark a category <code>(+):</code> for credit, <code>(-):</code> for debit, or <code>(=):</code> for a
+              pass-through — money you received and paid straight back out on someone else's behalf (they send it,
+              you spend the exact same amount for them), so it's not really your income or expense. A{" "}
+              <code>(=):</code> category is written and totaled exactly like any other, but is left out of Sub
+              incoming/outgoing, Balance, the Aggregate report, and anywhere else the app rolls up your real totals —
+              it's a record you can read back, without it ever landing in a number that's supposed to reflect only
+              your own money. If the amount you actually spent ever differs from what you were given (you kept or
+              added some of your own), only that leftover/gap is real money — record that part separately as a
+              normal <code>(+)</code> or <code>(-)</code> entry.
               <br />
               Entries look like <code>Label - amount</code>; chain several with <code>+</code>.
               <br />
@@ -3664,6 +3703,68 @@ function Stat({ label, value, accent }) {
   );
 }
 
+/* =========================================================================
+   SUMMARY VIEW (1.14.0) — totals only, strictly read-only.
+   Pure render of `parsed`: no inputs, no handlers, no writes anywhere.
+   Every number shown is the *computed* sum, so it can never drift from
+   the entries. Categories appear in typed order; (=) pass-through
+   categories are listed last, muted, and clearly labelled as excluded.
+   ========================================================================= */
+function SummaryView({ parsed, fontSize }) {
+  const shown = parsed.blocks.filter(
+    (b) => (b.sign === "+" || b.sign === "-" || b.sign === "=") && normLabel(b.title) !== "outstandingloans"
+  );
+  const regular = shown.filter((b) => b.sign !== "=");
+  const wash = shown.filter((b) => b.sign === "=");
+  const fs = { fontSize: `${Math.max(12, fontSize)}px` };
+
+  const Row = ({ label, value, indent, bold, tone }) => (
+    <div className={"flex items-baseline justify-between gap-3 " + (bold ? "mt-3 font-semibold " : "") + (tone || "text-zinc-300")}>
+      <span className={(indent ? "pl-4 " : "") + "min-w-0 break-words"}>{label}</span>
+      <span className="shrink-0 tabular-nums">{formatNum(value) || "0"}</span>
+    </div>
+  );
+
+  const Group = ({ b, tone }) => {
+    const other = b.subs.length > 0 ? b.entries.reduce((a, e) => a + e.amount, 0) : 0;
+    return (
+      <>
+        <Row label={b.title} value={b.computedSum} bold tone={tone || (b.sign === "+" ? "text-emerald-300" : "text-rose-300")} />
+        {b.subs.map((sb, i) => (
+          <Row key={i} label={sb.title} value={sb.computedSum} indent tone={tone ? "text-zinc-500" : undefined} />
+        ))}
+        {other !== 0 && <Row label="Other entries" value={other} indent tone={tone ? "text-zinc-500" : undefined} />}
+      </>
+    );
+  };
+
+  return (
+    <div className="flex-1 overflow-y-auto px-5 py-4 font-mono bg-black select-none" style={fs}>
+      {regular.length === 0 && wash.length === 0 && (
+        <div className="text-zinc-500 text-xs">Nothing to summarise yet. Switch to Text and add a (+) or (-) section.</div>
+      )}
+      {regular.map((b, i) => (
+        <Group key={i} b={b} />
+      ))}
+      {wash.length > 0 && (
+        <div className="mt-6 pt-2 border-t border-zinc-800">
+          <div className="text-[10px] uppercase tracking-widest text-zinc-600 mt-2">Pass-through · not counted</div>
+          {wash.map((b, i) => (
+            <Group key={i} b={b} tone="text-zinc-500" />
+          ))}
+        </div>
+      )}
+      {regular.length > 0 && (
+        <div className="mt-6 pt-3 border-t border-zinc-700">
+          <Row label="Sub incoming" value={parsed.subIncoming} tone="text-emerald-400" />
+          <Row label="Sub outgoing" value={parsed.subOutgoing} tone="text-rose-400" />
+          <Row label="Balance" value={parsed.balance} bold tone="text-teal-400" />
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SectionTotals({ parsed }) {
   return (
     <div>
@@ -3708,6 +3809,18 @@ function SectionTotals({ parsed }) {
         </div>
       )}
 
+      {parsed.passthrough.length > 0 && (
+        <div className="rounded-lg bg-zinc-800/60 text-zinc-300 font-mono text-[11px] px-3 py-2 mb-2 leading-relaxed">
+          {parsed.passthrough.length} section(s) are marked (=) pass-through, so they're intentionally excluded from Sub
+          incoming/outgoing, Balance, and the Aggregate report:
+          {parsed.passthrough.map((b, i) => (
+            <div key={i} className="opacity-80">
+              {b.title}
+            </div>
+          ))}
+        </div>
+      )}
+
       <h2 className="font-mono text-[11px] uppercase tracking-widest text-zinc-500 mt-4 mb-2">Sections</h2>
       {parsed.blocks.length === 0 && (
         <div className="rounded-lg border border-zinc-800 bg-zinc-800/60 px-3 py-2 font-mono text-[11px] text-zinc-400 leading-relaxed">
@@ -3729,10 +3842,20 @@ function SectionTotals({ parsed }) {
                     ? "bg-emerald-950/60 text-emerald-300"
                     : b.sign === "-"
                     ? "bg-rose-950/60 text-rose-300"
+                    : b.sign === "="
+                    ? "bg-zinc-700/60 text-zinc-300"
                     : "bg-amber-950/60 text-amber-300")
                 }
               >
-                {normLabel(b.title) === "outstandingloans" ? "report only" : b.sign === "+" ? "credit" : b.sign === "-" ? "debit" : "unmarked"}
+                {normLabel(b.title) === "outstandingloans"
+                  ? "report only"
+                  : b.sign === "+"
+                  ? "credit"
+                  : b.sign === "-"
+                  ? "debit"
+                  : b.sign === "="
+                  ? "pass-through"
+                  : "unmarked"}
               </span>
             </div>
             <div className="px-3 py-1.5 font-mono text-xs flex justify-between text-zinc-400">
