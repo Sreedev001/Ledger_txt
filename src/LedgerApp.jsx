@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.14.0";
+const APP_VERSION = "1.15.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -3384,7 +3384,7 @@ export default function LedgerApp() {
       {/* status pill: backup notifier + restore lock message (feature #41) */}
       <StatusToastPill toast={toast} toastVisible={toastVisible} />
 
-      {viewMode === "summary" && <SummaryView parsed={parsed} fontSize={fontSize} />}
+      {viewMode === "summary" && <SummaryView parsed={parsed} fontSize={fontSize} account={activeAccount} month={activeMonth} showToast={showToast} />}
 
       {/* blank editor */}
       {viewMode === "text" && <textarea
@@ -3704,19 +3704,54 @@ function Stat({ label, value, accent }) {
 }
 
 /* =========================================================================
-   SUMMARY VIEW (1.14.0) — totals only, strictly read-only.
-   Pure render of `parsed`: no inputs, no handlers, no writes anywhere.
-   Every number shown is the *computed* sum, so it can never drift from
-   the entries. Categories appear in typed order; (=) pass-through
-   categories are listed last, muted, and clearly labelled as excluded.
+   SUMMARY VIEW (1.14.0, organiser + PDF in 1.15.0) — totals only,
+   strictly read-only. Pure render of `parsed`: no text inputs, no writes to
+   the ledger. The only controls are view-only: the sort organiser (Typed /
+   High→Low / Low→High) and PDF export. Every number is the *computed* sum.
+   Order is always: all incomings, then all outgoings, then pass-through
+   (muted, not counted), then the grand totals. Sort applies to the
+   categories within each group AND to the subheads within each category.
    ========================================================================= */
-function SummaryView({ parsed, fontSize }) {
-  const shown = parsed.blocks.filter(
+const SORT_MODES = [["typed", "Typed"], ["desc", "High → Low"], ["asc", "Low → High"]];
+
+function sortBy(list, mode, getVal) {
+  if (mode === "typed") return list;
+  const dir = mode === "desc" ? -1 : 1;
+  // stable: Array.prototype.sort is stable, ties keep typed order
+  return [...list].sort((x, y) => dir * (getVal(x) - getVal(y)));
+}
+
+function buildSummaryModel(parsed, mode) {
+  const usable = parsed.blocks.filter(
     (b) => (b.sign === "+" || b.sign === "-" || b.sign === "=") && normLabel(b.title) !== "outstandingloans"
   );
-  const regular = shown.filter((b) => b.sign !== "=");
-  const wash = shown.filter((b) => b.sign === "=");
+  const toGroup = (b) => {
+    const other = b.subs.length > 0 ? b.entries.reduce((a, e) => a + e.amount, 0) : 0;
+    const subs = sortBy(
+      b.subs.map((sb) => ({ title: sb.title, total: sb.computedSum })),
+      mode,
+      (x) => x.total
+    );
+    if (other !== 0) subs.push({ title: "Other entries", total: other });
+    return { title: b.title, total: b.computedSum, subs };
+  };
+  const section = (sign) => sortBy(usable.filter((b) => b.sign === sign).map(toGroup), mode, (g) => g.total);
+  return {
+    incoming: section("+"),
+    outgoing: section("-"),
+    passthrough: section("="),
+    subIncoming: parsed.subIncoming,
+    subOutgoing: parsed.subOutgoing,
+    balance: parsed.balance,
+  };
+}
+
+function SummaryView({ parsed, fontSize, account, month, showToast }) {
+  const [sortMode, setSortMode] = useState("typed");
+  const [exporting, setExporting] = useState(false);
+  const model = useMemo(() => buildSummaryModel(parsed, sortMode), [parsed, sortMode]);
   const fs = { fontSize: `${Math.max(12, fontSize)}px` };
+  const empty = model.incoming.length === 0 && model.outgoing.length === 0 && model.passthrough.length === 0;
 
   const Row = ({ label, value, indent, bold, tone }) => (
     <div className={"flex items-baseline justify-between gap-3 " + (bold ? "mt-3 font-semibold " : "") + (tone || "text-zinc-300")}>
@@ -3724,45 +3759,185 @@ function SummaryView({ parsed, fontSize }) {
       <span className="shrink-0 tabular-nums">{formatNum(value) || "0"}</span>
     </div>
   );
+  const Group = ({ g, tone, subTone }) => (
+    <>
+      <Row label={g.title} value={g.total} bold tone={tone} />
+      {g.subs.map((sb, i) => (
+        <Row key={i} label={sb.title} value={sb.total} indent tone={subTone} />
+      ))}
+    </>
+  );
+  const Heading = ({ children }) => (
+    <div className="text-[10px] uppercase tracking-widest text-zinc-500 mt-6 mb-1 pt-2 border-t border-zinc-800">{children}</div>
+  );
 
-  const Group = ({ b, tone }) => {
-    const other = b.subs.length > 0 ? b.entries.reduce((a, e) => a + e.amount, 0) : 0;
-    return (
-      <>
-        <Row label={b.title} value={b.computedSum} bold tone={tone || (b.sign === "+" ? "text-emerald-300" : "text-rose-300")} />
-        {b.subs.map((sb, i) => (
-          <Row key={i} label={sb.title} value={sb.computedSum} indent tone={tone ? "text-zinc-500" : undefined} />
-        ))}
-        {other !== 0 && <Row label="Other entries" value={other} indent tone={tone ? "text-zinc-500" : undefined} />}
-      </>
-    );
-  };
+  async function handleExport() {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      await exportSummaryPdf(account, month, model, sortMode);
+    } catch (err) {
+      showToast && showToast("PDF export failed", { tone: "error", autoHideMs: 2500 });
+    } finally {
+      setExporting(false);
+    }
+  }
 
   return (
     <div className="flex-1 overflow-y-auto px-5 py-4 font-mono bg-black select-none" style={fs}>
-      {regular.length === 0 && wash.length === 0 && (
-        <div className="text-zinc-500 text-xs">Nothing to summarise yet. Switch to Text and add a (+) or (-) section.</div>
-      )}
-      {regular.map((b, i) => (
-        <Group key={i} b={b} />
-      ))}
-      {wash.length > 0 && (
-        <div className="mt-6 pt-2 border-t border-zinc-800">
-          <div className="text-[10px] uppercase tracking-widest text-zinc-600 mt-2">Pass-through · not counted</div>
-          {wash.map((b, i) => (
-            <Group key={i} b={b} tone="text-zinc-500" />
+      {/* view-only controls: organiser + export */}
+      <div className="flex items-center justify-between gap-2 mb-2 text-[11px]">
+        <div className="flex items-center rounded-md bg-zinc-800 p-0.5">
+          {SORT_MODES.map(([m, label]) => (
+            <button
+              key={m}
+              onClick={() => setSortMode(m)}
+              className={"px-2 py-1 rounded whitespace-nowrap " + (sortMode === m ? "bg-zinc-600 text-white font-semibold" : "text-zinc-400")}
+            >
+              {label}
+            </button>
           ))}
         </div>
+        <button
+          onClick={handleExport}
+          disabled={exporting || empty}
+          className="px-2.5 py-1.5 rounded-md bg-zinc-800 text-zinc-200 flex items-center gap-1 disabled:opacity-40 shrink-0"
+        >
+          <Download size={13} /> {exporting ? "…" : "PDF"}
+        </button>
+      </div>
+
+      {empty && <div className="text-zinc-500 text-xs mt-4">Nothing to summarise yet. Switch to Text and add a (+) or (-) section.</div>}
+
+      {model.incoming.length > 0 && (
+        <>
+          <Heading>Incoming</Heading>
+          {model.incoming.map((g, i) => (
+            <Group key={i} g={g} tone="text-emerald-300" />
+          ))}
+        </>
       )}
-      {regular.length > 0 && (
+      {model.outgoing.length > 0 && (
+        <>
+          <Heading>Outgoing</Heading>
+          {model.outgoing.map((g, i) => (
+            <Group key={i} g={g} tone="text-rose-300" />
+          ))}
+        </>
+      )}
+      {model.passthrough.length > 0 && (
+        <>
+          <Heading>Pass-through · not counted</Heading>
+          {model.passthrough.map((g, i) => (
+            <Group key={i} g={g} tone="text-zinc-500" subTone="text-zinc-600" />
+          ))}
+        </>
+      )}
+      {(model.incoming.length > 0 || model.outgoing.length > 0) && (
         <div className="mt-6 pt-3 border-t border-zinc-700">
-          <Row label="Sub incoming" value={parsed.subIncoming} tone="text-emerald-400" />
-          <Row label="Sub outgoing" value={parsed.subOutgoing} tone="text-rose-400" />
-          <Row label="Balance" value={parsed.balance} bold tone="text-teal-400" />
+          <Row label="Sub incoming" value={model.subIncoming} tone="text-emerald-400" />
+          <Row label="Sub outgoing" value={model.subOutgoing} tone="text-rose-400" />
+          <Row label="Balance" value={model.balance} bold tone="text-teal-400" />
         </div>
       )}
     </div>
   );
+}
+
+// PDF of the Summary exactly as organised on screen. Same save/share path
+// as exportStatementPdf (native: write to cache + Share sheet; browser:
+// doc.save), because doc.save() silently no-ops in Android's WebView.
+function buildSummaryPdfDoc(account, month, model, sortMode) {
+  const doc = new jsPDF({ unit: "mm", format: "a4" });
+  const mx = 16;
+  const W = doc.internal.pageSize.getWidth();
+  const H = doc.internal.pageSize.getHeight();
+  const right = W - mx;
+  let y = 22;
+
+  const num = (n) => formatNum(n) || "0";
+  const need = (h) => {
+    if (y + h > H - 16) {
+      doc.addPage();
+      y = 22;
+    }
+  };
+  const row = (label, value, { indent = 0, bold = false, size = 10, color = [30, 30, 30] } = {}) => {
+    need(7);
+    doc.setFont("helvetica", bold ? "bold" : "normal");
+    doc.setFontSize(size);
+    doc.setTextColor(...color);
+    const lines = doc.splitTextToSize(String(label), right - mx - indent - 34);
+    doc.text(lines, mx + indent, y);
+    doc.text(num(value), right, y, { align: "right" });
+    y += 5.2 * lines.length + (bold ? 1 : 0.3);
+  };
+  const heading = (text) => {
+    need(14);
+    y += 4;
+    doc.setDrawColor(190);
+    doc.setLineWidth(0.2);
+    doc.line(mx, y - 4, right, y - 4);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(8);
+    doc.setTextColor(120, 120, 120);
+    doc.text(text.toUpperCase(), mx, y);
+    y += 6;
+  };
+
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(15);
+  doc.setTextColor(20, 20, 20);
+  doc.text(`${account} — ${monthLabel(month)}`, mx, y);
+  y += 6;
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(9);
+  doc.setTextColor(120, 120, 120);
+  const sortLabel = sortMode === "desc" ? "highest first" : sortMode === "asc" ? "lowest first" : "as typed";
+  doc.text(`Summary (totals only) · ordered ${sortLabel}`, mx, y);
+  y += 4;
+
+  const emit = (title, groups, color, subColor) => {
+    if (groups.length === 0) return;
+    heading(title);
+    groups.forEach((g) => {
+      y += 1.5;
+      row(g.title, g.total, { bold: true, size: 11, color });
+      g.subs.forEach((sb) => row(sb.title, sb.total, { indent: 5, size: 9.5, color: subColor }));
+    });
+  };
+  emit("Incoming", model.incoming, [4, 120, 87], [60, 60, 60]);
+  emit("Outgoing", model.outgoing, [190, 18, 60], [60, 60, 60]);
+  emit("Pass-through · not counted", model.passthrough, [130, 130, 130], [150, 150, 150]);
+
+  need(30);
+  y += 4;
+  doc.setDrawColor(60);
+  doc.setLineWidth(0.4);
+  doc.line(mx, y, right, y);
+  y += 7;
+  row("Sub incoming", model.subIncoming, { color: [4, 120, 87], size: 11 });
+  row("Sub outgoing", model.subOutgoing, { color: [190, 18, 60], size: 11 });
+  y += 1;
+  row("Balance", model.balance, { bold: true, size: 13, color: [15, 118, 110] });
+  return doc;
+}
+
+async function exportSummaryPdf(account, month, model, sortMode) {
+  const doc = buildSummaryPdfDoc(account, month, model, sortMode);
+  const filename = `${account.replace(/\s+/g, "_")}_${month}_summary.pdf`;
+  if (Capacitor.isNativePlatform()) {
+    const base64 = doc.output("datauristring").split(",")[1];
+    const written = await Filesystem.writeFile({ path: filename, data: base64, directory: Directory.Cache });
+    await Share.share({
+      title: filename,
+      text: `${account} — ${monthLabel(month)} summary`,
+      url: written.uri,
+      dialogTitle: "Save or share summary PDF",
+    });
+    return;
+  }
+  doc.save(filename);
 }
 
 function SectionTotals({ parsed }) {
