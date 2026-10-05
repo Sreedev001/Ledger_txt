@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.18.0";
+const APP_VERSION = "1.19.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -642,8 +642,24 @@ function parseLedger(text) {
 // full-history live state. Pass null (the default) for the live state used
 // to write annotations, which should always reflect everything ever
 // recorded, regardless of when.
-function computeLoanAllocations(accounts, cutoffMonth = null) {
+// `kind` picks which pair is tracked:
+//   "loan"   -> "(+): Loan"   matched by "(-): Loan repayment"   (money you took)
+//   "lended" -> "(-): Lended" matched by "(+): Lended repayment"  (money you lent;
+//               "Lent" / "Lent repayment" are accepted as aliases)
+// Both pairs are report-only and use the identical allocation logic.
+const LOAN_KINDS = {
+  loan: { loanSign: "+", loanTitles: ["loan"], repSign: "-", repTitles: ["loanrepayment"] },
+  lended: {
+    loanSign: "-",
+    loanTitles: ["lended", "lent"],
+    repSign: "+",
+    repTitles: ["lendedrepayment", "lentrepayment"],
+  },
+};
+
+function computeLoanAllocations(accounts, cutoffMonth = null, kind = "loan") {
   const loanEntries = [];
+  const cfg = LOAN_KINDS[kind] || LOAN_KINDS.loan;
 
   for (const account of Object.keys(accounts)) {
     const months = Object.keys(accounts[account])
@@ -662,7 +678,7 @@ function computeLoanAllocations(accounts, cutoffMonth = null) {
     for (const month of months) {
       const parsed = parseLedger(accounts[account][month]);
       for (const b of parsed.blocks) {
-        if (b.sign !== "-" || normLabel(b.title) !== "loanrepayment") continue;
+        if (b.sign !== cfg.repSign || !cfg.repTitles.includes(normLabel(b.title))) continue;
         const chunks = [...b.entries.map((e) => ({ label: e.label, amount: e.amount, lineIndex: e.lineIndex }))];
         for (const sub of b.subs) {
           for (const e of sub.entries) {
@@ -687,7 +703,7 @@ function computeLoanAllocations(accounts, cutoffMonth = null) {
     for (const month of months) {
       const parsed = parseLedger(accounts[account][month]);
       for (const b of parsed.blocks) {
-        if (b.sign !== "+" || normLabel(b.title) !== "loan") continue;
+        if (b.sign !== cfg.loanSign || !cfg.loanTitles.includes(normLabel(b.title))) continue;
         const candidates = [...b.entries.map((e) => ({ label: e.label.trim(), amount: e.amount, lineIndex: e.lineIndex }))];
         for (const sub of b.subs) {
           const lastEntryIdx = sub.entries.length ? sub.entries[sub.entries.length - 1].lineIndex : null;
@@ -3468,7 +3484,7 @@ export default function LedgerApp() {
     return (
       <div className="h-screen flex flex-col bg-black text-zinc-100">
         <StatusToastPill toast={toast} toastVisible={toastVisible} />
-        <ScreenHeader title="Outstanding Loans" onBack={() => setShowingLoans(false)} />
+        <ScreenHeader title="Loans / Lended" onBack={() => setShowingLoans(false)} />
         <LoansView accounts={accounts} defaultCutoff={activeMonth} />
       </div>
     );
@@ -3679,7 +3695,7 @@ export default function LedgerApp() {
         <div className="grid grid-cols-2 gap-2">
           {[
             [<Layers size={18} key="a" />, "Aggregate", () => setShowingAgg(true)],
-            [<Landmark size={18} key="l" />, "Loans", () => setShowingLoans(true)],
+            [<Landmark size={18} key="l" />, "Loans/Lended", () => setShowingLoans(true)],
             [<Receipt size={18} key="s" />, "Statement", () => setShowingStatement(true)],
             [
               <FileText size={18} key="i" />,
@@ -3914,6 +3930,14 @@ export default function LedgerApp() {
               your workbook text or counted toward Sub incoming/outgoing/Balance. See Accounts (tap the account name at the top left) →
               Loans to view every account's remaining balances and repayment history, and to combine two or
               more accounts' loans into one summed view.
+              <br />
+              <br />
+              <strong>Lended:</strong> money you lent to someone is the mirror image. Record it under <code>(-): Lended</code>{" "}
+              (e.g. <code>Rahul - 3000</code>) in the account it left, and record it coming back under{" "}
+              <code>(+): Lended repayment</code> with the same name, in that same account. Partial and multi-month
+              repayments are applied oldest-first, exactly like Loans. Both lines are normal entries (they count in
+              Sub outgoing / Sub incoming as usual); who still owes you what appears under Accounts → Loans/Lended →
+              Lended. <code>Lent</code> / <code>Lent repayment</code> also work as category names.
               <br />
               <br />
               <strong>Months:</strong> every account is now a set of monthly pages — switch months with the ◀ / ▶ arrows
@@ -4348,6 +4372,11 @@ function AggregateView({ accounts }) {
 }
 
 function LoansView({ accounts, defaultCutoff }) {
+  const [kind, setKind] = useState("loan"); // "loan" (taken) | "lended" (given)
+  const isLended = kind === "lended";
+  const T = isLended
+    ? { noun: "lended", none: "Nothing outstanding", settledHead: "Received back", verb: "received", repName: "Lended repayment", intro: "Money you lent out, computed live from every account and matched against that same account's \"Lended repayment\" entries (money received back) — including partial repayments in a later month. " }
+    : { noun: "loans", none: "No outstanding loans", settledHead: "Repaid", verb: "paid", repName: "Loan repayment", intro: "Outstanding loans computed live from every account, cross-checked against that same account's \"Loan repayment\" entries — including partial repayments made in a later month — so remaining balances and repayment history stay accurate. " };
   const [combined, setCombined] = useState(() => new Set());
   const [cutoff, setCutoff] = useState(defaultCutoff || monthKeyNow());
 
@@ -4358,7 +4387,7 @@ function LoansView({ accounts, defaultCutoff }) {
   // live, even mid-keystroke on whichever page is currently being typed
   // in. Passing `cutoff` restricts the snapshot to entries dated on or
   // before that month.
-  const allLoans = useMemo(() => computeLoanAllocations(accounts, cutoff), [accounts, cutoff]);
+  const allLoans = useMemo(() => computeLoanAllocations(accounts, cutoff, kind), [accounts, cutoff, kind]);
 
   const perAccount = useMemo(() => {
     return Object.keys(accounts).map((name) => {
@@ -4396,10 +4425,20 @@ function LoansView({ accounts, defaultCutoff }) {
 
   return (
     <div className="flex-1 overflow-y-auto px-5 py-5">
+      <div className="flex rounded-lg border border-zinc-800 p-0.5 mb-3 font-mono text-xs">
+        {[["loan", "Loans"], ["lended", "Lended"]].map(([k, label]) => (
+          <button
+            key={k}
+            onClick={() => { setKind(k); setCombined(new Set()); }}
+            className={"flex-1 py-1.5 rounded-md " + (kind === k ? "bg-teal-700 text-white" : "text-zinc-400")}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
       <p className="font-mono text-[11px] text-zinc-500 mb-3 leading-relaxed">
-        Outstanding loans computed live from every account, cross-checked against that same account's "Loan repayment"
-        entries — including partial repayments made in a later month — so remaining balances and repayment history stay
-        accurate. Tap two or more accounts below to combine their loans into one summed view.
+        {T.intro}Tap two or more accounts below to combine them into one summed view.
       </p>
 
       <div className="flex items-center justify-center gap-3 mb-4 rounded-lg border border-zinc-800 py-2">
@@ -4434,7 +4473,7 @@ function LoansView({ accounts, defaultCutoff }) {
         <div className="mb-6">
           <h2 className="font-mono text-[11px] uppercase tracking-widest text-zinc-500 mb-2">Combined — {[...combined].join(" + ")}</h2>
           {combinedRows.length === 0 ? (
-            <div className="rounded-lg border border-zinc-800 bg-zinc-800/60 px-3 py-2 font-mono text-[11px] text-zinc-400">No outstanding loans</div>
+            <div className="rounded-lg border border-zinc-800 bg-zinc-800/60 px-3 py-2 font-mono text-[11px] text-zinc-400">{T.none}</div>
           ) : (
             <table className="w-full border-collapse font-mono text-xs">
               <tbody>
@@ -4463,7 +4502,7 @@ function LoansView({ accounts, defaultCutoff }) {
               <span className="text-zinc-400">{formatNum(acc.total) || "0"}</span>
             </div>
             {acc.outstanding.length === 0 ? (
-              <div className="px-3 py-2 font-mono text-[11px] text-zinc-500">No outstanding loans</div>
+              <div className="px-3 py-2 font-mono text-[11px] text-zinc-500">{T.none}</div>
             ) : (
               <div className="divide-y divide-zinc-800/70">
                 {acc.outstanding.map((le, i) => (
@@ -4476,7 +4515,7 @@ function LoansView({ accounts, defaultCutoff }) {
                     </div>
                     {le.used.length > 0 && (
                       <div className="text-zinc-500 mt-0.5">
-                        of {formatNum(le.amount)} — paid {le.used.map((u) => `${formatNum(u.amount)} (${monthLabel(u.month)})`).join(", ")}
+                        of {formatNum(le.amount)} — {T.verb} {le.used.map((u) => `${formatNum(u.amount)} (${monthLabel(u.month)})`).join(", ")}
                       </div>
                     )}
                   </div>
@@ -4485,7 +4524,7 @@ function LoansView({ accounts, defaultCutoff }) {
             )}
             {acc.settled.length > 0 && (
               <div className="border-t border-zinc-800 divide-y divide-zinc-800/70">
-                <div className="px-3 py-1 font-mono text-[10px] uppercase tracking-widest text-zinc-600">Repaid</div>
+                <div className="px-3 py-1 font-mono text-[10px] uppercase tracking-widest text-zinc-600">{T.settledHead}</div>
                 {acc.settled.map((le, i) => (
                   <div key={i} className="px-3 py-1.5 font-mono text-[11px] text-zinc-500">
                     <div className="flex items-center justify-between">
@@ -4494,7 +4533,7 @@ function LoansView({ accounts, defaultCutoff }) {
                       </span>
                       <span>{formatNum(le.amount)}</span>
                     </div>
-                    <div className="mt-0.5">paid {le.used.map((u) => `${formatNum(u.amount)} (${monthLabel(u.month)})`).join(", ")}</div>
+                    <div className="mt-0.5">{T.verb} {le.used.map((u) => `${formatNum(u.amount)} (${monthLabel(u.month)})`).join(", ")}</div>
                   </div>
                 ))}
               </div>
