@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.17.0";
+const APP_VERSION = "1.18.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -1739,7 +1739,83 @@ function runAttachTx(db, mode, fn) {
 // Saves one PDF against a specific account+month page. `blob` can be the
 // `File` straight off the upload input (a File already IS a Blob) — no
 // conversion needed. Returns the new record's id.
-async function saveStatementAttachment({ account, month, filename, bankName, periodLabel, blob }) {
+// Tells the main component "the set of stored attachments changed" so the
+// Drive backup (which lists them) can re-run even when no ledger text changed.
+function notifyAttachmentsChanged() {
+  try {
+    window.dispatchEvent(new Event("ledger-attachments-changed"));
+  } catch {}
+}
+
+// ---- redundant-attachment detection (1.18.0) -----------------------------
+// A month can collect several statement PDFs whose periods overlap, e.g.
+//   1 Sep–10 Sep, 1 Sep–15 Sep, 1 Sep–30 Sep.
+// Everything in the first two is contained in the third, so they are
+// redundant. Newer records store startISO/endISO; older ones only have the
+// text periodLabel ("1 Sep – 10 Sep 2026"), which is parsed as a fallback.
+function parsePeriodLabel(label) {
+  if (!label) return null;
+  const parts = String(label).split(/\s*[–-]\s*/);
+  if (parts.length !== 2) return null;
+  const rx = /^(\d{1,2})\s+([A-Za-z]{3})[a-z]*(?:\s+(\d{4}))?$/;
+  const a = parts[0].trim().match(rx);
+  const b = parts[1].trim().match(rx);
+  if (!a || !b || !b[3]) return null;
+  const mi = (m) => MONTHS_SHORT.findIndex((x) => x.toLowerCase() === m.toLowerCase());
+  const am = mi(a[2]);
+  const bm = mi(b[2]);
+  if (am < 0 || bm < 0) return null;
+  const pad = (n) => String(n).padStart(2, "0");
+  const endY = Number(b[3]);
+  const startY = a[3] ? Number(a[3]) : am > bm ? endY - 1 : endY;
+  return {
+    startISO: `${startY}-${pad(am + 1)}-${pad(Number(a[1]))}`,
+    endISO: `${endY}-${pad(bm + 1)}-${pad(Number(b[1]))}`,
+  };
+}
+
+function attachmentRange(rec) {
+  if (rec.startISO && rec.endISO) return { startISO: rec.startISO, endISO: rec.endISO };
+  return parsePeriodLabel(rec.periodLabel);
+}
+
+// Returns [{ rec, coveredBy }] for every attachment in `items` (one page) whose
+// period lies fully inside another attachment's period from the same bank
+// account. Attachments with an unknown period are never flagged. For exact
+// duplicates of the same period the most recently imported one is kept.
+function findRedundantAttachments(items) {
+  const bankOf = (r) => String(r.bankKey || r.bankName || "").toLowerCase();
+  const info = (items || []).map((rec) => ({ rec, range: attachmentRange(rec), bank: bankOf(rec) }));
+  const out = [];
+  for (const a of info) {
+    if (!a.range) continue;
+    let best = null;
+    for (const b of info) {
+      if (b === a || !b.range || b.bank !== a.bank) continue;
+      const contains = b.range.startISO <= a.range.startISO && b.range.endISO >= a.range.endISO;
+      if (!contains) continue;
+      const same = b.range.startISO === a.range.startISO && b.range.endISO === a.range.endISO;
+      if (same && b.rec.importedAt < a.rec.importedAt) continue; // keep the newer of two identical periods
+      if (same && b.rec.importedAt === a.rec.importedAt && b.rec.id < a.rec.id) continue;
+      if (!best || b.range.endISO > best.range.endISO || b.range.startISO < best.range.startISO) best = b;
+    }
+    if (best) out.push({ rec: a.rec, coveredBy: best.rec });
+  }
+  return out;
+}
+
+async function deleteStatementAttachments(ids) {
+  if (!ids.length) return;
+  const db = await openAttachDb();
+  try {
+    await runAttachTx(db, "readwrite", (store) => ids.forEach((id) => store.delete(id)));
+  } finally {
+    db.close();
+  }
+  notifyAttachmentsChanged();
+}
+
+async function saveStatementAttachment({ account, month, filename, bankName, bankKey, periodLabel, startISO, endISO, blob }) {
   const db = await openAttachDb();
   try {
     const id = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -1750,12 +1826,16 @@ async function saveStatementAttachment({ account, month, filename, bankName, per
       month,
       filename,
       bankName: bankName || "",
+      bankKey: bankKey || "",
       periodLabel: periodLabel || "",
+      startISO: startISO || "",
+      endISO: endISO || "",
       size: blob.size,
       importedAt: new Date().toISOString(),
       blob,
     };
     await runAttachTx(db, "readwrite", (store) => store.put(record));
+    notifyAttachmentsChanged();
     return id;
   } finally {
     db.close();
@@ -1783,6 +1863,7 @@ async function deleteStatementAttachment(id) {
   } finally {
     db.close();
   }
+  notifyAttachmentsChanged();
 }
 
 // Used when a month's page (or a whole account identity) is deleted, so
@@ -2028,6 +2109,24 @@ async function syncAttachmentsToDrive(token, folderId) {
     attachMap[a.id] = await uploadAttachmentToDrive(token, folderId, a);
     changed = true;
   }
+  // Attachments deleted locally (e.g. redundant overlapping statements):
+  // remove their Drive copies too so they don't pile up. Only ids THIS
+  // device knows about (the map) are ever touched, so a fresh install with
+  // an empty map can never delete anything from Drive here.
+  const liveIds = new Set(rawAttachments.map((a) => a.id));
+  for (const id of Object.keys(attachMap)) {
+    if (liveIds.has(id)) continue;
+    try {
+      await driveApiFetch(token, `${DRIVE_API}/files/${attachMap[id]}`, { method: "DELETE" });
+    } catch (err) {
+      if (!/Drive API 404/.test(String(err.message))) {
+        console.warn("Couldn't delete orphaned Drive attachment:", err);
+        continue; // keep it in the map; retry on the next backup
+      }
+    }
+    delete attachMap[id];
+    changed = true;
+  }
   if (changed) saveDriveAttachIdMap(attachMap);
   return { rawAttachments, attachMap };
 }
@@ -2042,7 +2141,7 @@ async function syncAttachmentsToDrive(token, folderId) {
 // stmtPasswords' plaintext... no wait, it does — see the note in
 // restoreBackupPayload for why that's an accepted tradeoff, not an
 // oversight.
-async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, rawAttachments, attachMap }) {
+async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, settings, rawAttachments, attachMap }) {
   const attachments = rawAttachments.map((a) => ({
     id: a.id,
     pageKey: a.pageKey,
@@ -2051,6 +2150,9 @@ async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBan
     filename: a.filename,
     bankName: a.bankName,
     periodLabel: a.periodLabel,
+    bankKey: a.bankKey || "",
+    startISO: a.startISO || "",
+    endISO: a.endISO || "",
     size: a.size,
     importedAt: a.importedAt,
     blobType: a.blob.type || "application/pdf",
@@ -2066,6 +2168,8 @@ async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBan
     stmtBankMap: stmtBankMap || {},
     stmtCatMap: stmtCatMap || {},
     stmtImported: stmtImported || {},
+    // App settings (1.18.0): text size + line spacing.
+    settings: settings || {},
     attachments,
   };
 }
@@ -2081,13 +2185,20 @@ async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBan
 // the bar, but it does mean anyone with access to the backup file (i.e.
 // anyone with access to this Drive folder) can read them. Worth knowing.
 async function restoreBackupPayload(payload, setters, token) {
-  const { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported } = setters;
+  const { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported, setFontSize, setLineSpacing } = setters;
   if (payload.accounts) setAccounts(payload.accounts);
   if (payload.entryOrder) setEntryOrder(payload.entryOrder);
   if (payload.stmtPasswords) setStmtPasswords(payload.stmtPasswords);
   if (payload.stmtBankMap) setStmtBankMap(payload.stmtBankMap);
   if (payload.stmtCatMap) setStmtCatMap(payload.stmtCatMap);
   if (payload.stmtImported) setStmtImported(payload.stmtImported);
+  // Settings: older backups have none (leave the device's values alone).
+  // Values are clamped so a hand-edited/odd backup can't break the editor.
+  const st = payload.settings || {};
+  const fs = parseFloat(st.fontSize);
+  if (!isNaN(fs) && setFontSize) setFontSize(Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, fs)));
+  const ls = parseFloat(st.lineSpacing);
+  if (!isNaN(ls) && setLineSpacing) setLineSpacing(Math.min(LINE_SPACING_MAX, Math.max(LINE_SPACING_MIN, ls)));
   const attachMap = loadDriveAttachIdMap();
   for (const a of payload.attachments || []) {
     const { blobBase64, blobType, driveFileId, ...rest } = a;
@@ -2522,6 +2633,14 @@ export default function LedgerApp() {
     } catch {}
     return 1.75;
   });
+  // Bumped whenever a statement attachment is added/removed, so the Drive
+  // backup re-runs even though no ledger text changed (1.18.0).
+  const [attachmentsRev, setAttachmentsRev] = useState(0);
+  useEffect(() => {
+    const bump = () => setAttachmentsRev((n) => n + 1);
+    window.addEventListener("ledger-attachments-changed", bump);
+    return () => window.removeEventListener("ledger-attachments-changed", bump);
+  }, []);
   const textareaRef = useRef(null);
   const pendingCursor = useRef(null);
   const historyRef = useRef({}); // { [account::month]: { past: [], future: [] } }
@@ -2960,7 +3079,7 @@ export default function LedgerApp() {
       // any save that isn't a fresh statement import, so this stays fast
       // no matter how many statements have piled up over time.
       const { rawAttachments, attachMap } = await syncAttachmentsToDrive(token, folderId);
-      const payload = await buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, rawAttachments, attachMap });
+      const payload = await buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, settings: { fontSize, lineSpacing }, rawAttachments, attachMap });
       await uploadBackupToDrive(token, JSON.stringify(payload));
       setLastBackupAt(new Date().toISOString());
       setBackupStatus("idle");
@@ -2992,7 +3111,7 @@ export default function LedgerApp() {
         showAlert("No backup found in Google Drive yet — nothing to restore.");
         return;
       }
-      await restoreBackupPayload(payload, { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported }, token);
+      await restoreBackupPayload(payload, { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported, setFontSize, setLineSpacing }, token);
       setBackupStatus("idle");
       showToast("Restored from Google Drive", { tone: "success", autoHideMs: 2000 });
     } catch (err) {
@@ -3073,7 +3192,7 @@ export default function LedgerApp() {
     }, 3000);
     return () => clearTimeout(backupDebounceRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, googleConnected]);
+  }, [accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, fontSize, lineSpacing, attachmentsRev, googleConnected]);
 
   useEffect(() => {
     if (!googleConnected) return undefined;
@@ -4458,7 +4577,59 @@ function useStatementAttachments(account, month, onCountChange, onOpenAttachment
     }
   }
 
-  return { items, busyId, openAttachment, removeAttachment };
+  // Redundant = fully inside another attachment's period (same bank account).
+  const redundant = useMemo(() => findRedundantAttachments(items), [items]);
+  const redundantById = useMemo(() => Object.fromEntries(redundant.map((r) => [r.rec.id, r.coveredBy])), [redundant]);
+  const [confirmClean, setConfirmClean] = useState(false);
+  useEffect(() => {
+    if (!confirmClean) return undefined;
+    const t = setTimeout(() => setConfirmClean(false), 4000);
+    return () => clearTimeout(t);
+  }, [confirmClean]);
+
+  async function removeRedundant() {
+    if (!confirmClean) {
+      setConfirmClean(true); // first tap arms it, second tap deletes
+      return;
+    }
+    setConfirmClean(false);
+    const ids = redundant.map((r) => r.rec.id);
+    setBusyId("__clean__");
+    try {
+      await deleteStatementAttachments(ids);
+      setItems((prev) => {
+        const next = (prev || []).filter((x) => !ids.includes(x.id));
+        if (onCountChange) onCountChange(next.length);
+        return next;
+      });
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  return { items, busyId, openAttachment, removeAttachment, redundant, redundantById, confirmClean, removeRedundant };
+}
+
+// "N overlapping statements are already covered by a longer one" strip with a
+// two-tap confirm button. Renders nothing when there is nothing redundant.
+function RedundantAttachmentsBar({ redundant, confirmClean, removeRedundant, busy }) {
+  if (!redundant.length) return null;
+  return (
+    <div className="flex items-center gap-2 px-3 py-2 bg-amber-500/10 border border-amber-500/30 rounded-lg mb-2">
+      <div className="flex-1 min-w-0 font-mono text-[11px] text-amber-200 leading-snug">
+        {redundant.length} statement{redundant.length > 1 ? "s are" : " is"} fully covered by a longer one.
+      </div>
+      <button
+        onClick={removeRedundant}
+        disabled={busy}
+        className={`shrink-0 px-2.5 py-1.5 rounded-md font-mono text-[11px] disabled:opacity-40 ${
+          confirmClean ? "bg-rose-600 text-white" : "bg-amber-500/20 text-amber-100"
+        }`}
+      >
+        {confirmClean ? "Tap again to delete" : "Remove duplicates"}
+      </button>
+    </div>
+  );
 }
 
 // Lists whatever PDFs have been attached to this exact account+month page
@@ -4468,12 +4639,14 @@ function useStatementAttachments(account, month, onCountChange, onOpenAttachment
 // import involved. (Embedded in the Statement report; see
 // AttachmentsSheetBody below for the always-visible top-bar version.)
 function StatementAttachments({ account, month, onOpenAttachment }) {
-  const { items, busyId, openAttachment, removeAttachment } = useStatementAttachments(account, month, null, onOpenAttachment);
+  const { items, busyId, openAttachment, removeAttachment, redundant, redundantById, confirmClean, removeRedundant } = useStatementAttachments(account, month, null, onOpenAttachment);
 
   if (!items || items.length === 0) return null;
 
   return (
-    <div className="mb-4 rounded-lg border border-zinc-800 divide-y divide-zinc-800 overflow-hidden">
+    <div className="mb-4">
+    <RedundantAttachmentsBar redundant={redundant} confirmClean={confirmClean} removeRedundant={removeRedundant} busy={busyId === "__clean__"} />
+    <div className="rounded-lg border border-zinc-800 divide-y divide-zinc-800 overflow-hidden">
       <div className="px-3 py-1.5 font-mono text-[10px] text-zinc-500 uppercase tracking-widest bg-zinc-900/60">
         Attached statement{items.length > 1 ? "s" : ""} ({items.length})
       </div>
@@ -4483,8 +4656,9 @@ function StatementAttachments({ account, month, onOpenAttachment }) {
           <button onClick={() => openAttachment(rec)} className="flex-1 min-w-0 text-left">
             <div className="font-mono text-xs text-zinc-200 truncate">{rec.filename}</div>
             <div className="font-mono text-[10px] text-zinc-500 truncate">
-              {[rec.bankName, new Date(rec.importedAt).toLocaleDateString()].filter(Boolean).join(" · ")}
+              {[rec.bankName, rec.periodLabel, new Date(rec.importedAt).toLocaleDateString()].filter(Boolean).join(" · ")}
             </div>
+            {redundantById[rec.id] && <div className="font-mono text-[10px] text-amber-400 truncate">covered by {redundantById[rec.id].periodLabel || redundantById[rec.id].filename}</div>}
           </button>
           <button
             onClick={() => removeAttachment(rec)}
@@ -4497,6 +4671,7 @@ function StatementAttachments({ account, month, onOpenAttachment }) {
         </div>
       ))}
     </div>
+    </div>
   );
 }
 
@@ -4508,7 +4683,7 @@ function StatementAttachments({ account, month, onOpenAttachment }) {
 // count up to the parent via onCountChange, which drives the small badge
 // on the top-bar paperclip button.
 function AttachmentsSheetBody({ account, month, onCountChange, onOpenAttachment }) {
-  const { items, busyId, openAttachment, removeAttachment } = useStatementAttachments(account, month, onCountChange, onOpenAttachment);
+  const { items, busyId, openAttachment, removeAttachment, redundant, redundantById, confirmClean, removeRedundant } = useStatementAttachments(account, month, onCountChange, onOpenAttachment);
 
   if (!items) {
     return <div className="px-1 py-6 text-center font-mono text-xs text-zinc-500">Loading…</div>;
@@ -4526,6 +4701,7 @@ function AttachmentsSheetBody({ account, month, onCountChange, onOpenAttachment 
 
   return (
     <div className="flex flex-col gap-1 mt-1">
+      <RedundantAttachmentsBar redundant={redundant} confirmClean={confirmClean} removeRedundant={removeRedundant} busy={busyId === "__clean__"} />
       {items.map((rec) => (
         <div key={rec.id} className="flex items-center gap-2 px-1 py-2 rounded-lg hover:bg-zinc-800/60">
           <FileText size={16} className="text-zinc-500 shrink-0" />
@@ -4534,6 +4710,7 @@ function AttachmentsSheetBody({ account, month, onCountChange, onOpenAttachment 
             <div className="font-mono text-[11px] text-zinc-500 truncate">
               {[rec.bankName, rec.periodLabel, new Date(rec.importedAt).toLocaleDateString()].filter(Boolean).join(" · ")}
             </div>
+            {redundantById[rec.id] && <div className="font-mono text-[10px] text-amber-400 truncate">covered by {redundantById[rec.id].periodLabel || redundantById[rec.id].filename}</div>}
           </button>
           <button
             onClick={() => removeAttachment(rec)}
@@ -5169,7 +5346,10 @@ function ImportStatementView({
           month: targetMonth,
           filename: file.name,
           bankName: meta?.bankName,
+          bankKey: meta?.bkey || "",
           periodLabel: meta?.period?.label || "",
+          startISO: meta?.period?.startISO || "",
+          endISO: meta?.period?.endISO || "",
           blob: file,
         });
       }
