@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.15.0";
+const APP_VERSION = "1.16.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -65,6 +65,15 @@ function formatNum(n) {
   if (n === null || n === undefined || isNaN(n)) return "";
   const rounded = Math.round(n * 100) / 100;
   return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+// The optional trailing "(...)" on an entry line (ENTRY_RE group 3) is the
+// entry's REMARK -- e.g. "5 - 2700 (via Rahul)". It has always parsed fine and
+// been ignored; as of 1.16.0 it is surfaced as `entry.remark` so the Statement
+// report can show it in a Remarks column. Returns "" when there is none.
+function remarkFromAnnotation(annotation) {
+  if (!annotation) return "";
+  return annotation.slice(1, -1).trim();
 }
 
 function isTotalLabel(label) {
@@ -196,6 +205,7 @@ function statementEntryRows(parsed, monthKey) {
         sub: subTitle || null,
         label: e.label,
         amount: e.amount,
+        remark: e.remark || "",
         sign: b.sign,
         sig: `${base}#${sigCounts[base]}`,
       });
@@ -271,7 +281,7 @@ function reserveSlots(pageOrder, txns) {
 // A no-op (returns changed: false) if there was no reservation for this
 // transaction (e.g. a page from before this feature shipped) or the
 // target sig somehow already has a slot.
-function claimSlot(pageOrder, priorSigSet, newText, monthKey, txnSignature) {
+function claimSlot(pageOrder, priorSigSet, newText, monthKey, txnSignature, offset = 0) {
   const { rows } = statementEntryRows(parseLedger(newText), monthKey);
   const newSig = rows.map((r) => r.sig).find((s) => !priorSigSet.has(s));
   if (newSig) priorSigSet.add(newSig);
@@ -279,9 +289,15 @@ function claimSlot(pageOrder, priorSigSet, newText, monthKey, txnSignature) {
   if (!newSig || reserved === undefined || pageOrder.seq[newSig] !== undefined) {
     return { pageOrder, changed: false, newSig };
   }
+  // `offset` (1.16.0, split entries): one bank transaction can now write
+  // SEVERAL ledger lines. The first takes the reserved slot itself (offset 0);
+  // each further line takes a tiny fractional step after it, so the whole
+  // split stays together, in order, exactly where the transaction sat in the
+  // statement -- without disturbing any other row's integer slot.
+  const slotValue = reserved + offset;
   const counter = Math.max(pageOrder.counter || 0, reserved);
   return {
-    pageOrder: { ...pageOrder, counter, seq: { ...pageOrder.seq, [newSig]: reserved } },
+    pageOrder: { ...pageOrder, counter, seq: { ...pageOrder.seq, [newSig]: slotValue } },
     changed: true,
     newSig,
   };
@@ -408,7 +424,7 @@ function parseLedger(text) {
           sign,
           title: m[1].trim(),
           subs: [],
-          entries: [{ label: m[1].trim(), amount, lineIndex: firstIdx }],
+          entries: [{ label: m[1].trim(), amount, lineIndex: firstIdx, remark: remarkFromAnnotation(m[3]) }],
           computedSum: amount,
           totalLineIndex: null,
           declaredTotal: null,
@@ -459,7 +475,7 @@ function parseLedger(text) {
             categoryDeclaredTotal = value;
           }
         } else {
-          (currentSub || direct).entries.push({ label: label.trim(), amount: value, lineIndex: i });
+          (currentSub || direct).entries.push({ label: label.trim(), amount: value, lineIndex: i, remark: remarkFromAnnotation(entryM ? entryM[3] : null) });
         }
       } else if (trimmed !== "") {
         // plain label, no dash at all -> starts a new subcategory
@@ -1431,13 +1447,16 @@ function dayLabelFromISO(dateISO) {
 // Personal Incoming/Outgoing sync used to use. This is the single write-path
 // statement import uses, so it's also the one most worth Node-simulating
 // before trust.
-function insertLedgerEntry(text, { categoryTitle, sign, subTitle, label, amount }) {
+function insertLedgerEntry(text, { categoryTitle, sign, subTitle, label, amount, remark }) {
   const parsed = parseLedger(text);
   const catNorm = normLabel(categoryTitle);
   const block = parsed.blocks.find((b) => normLabel(b.title) === catNorm && (b.sign === sign || b.sign === null));
   const lines = text.split("\n");
   const amountStr = formatNum(amount);
   const subTitleTrim = (subTitle || "").trim();
+  // Optional remark (1.16.0): written as the entry's trailing "(...)" so it
+  // round-trips through ENTRY_RE and shows in the Statement's Remarks column.
+  const entryLine = `${label} - ${amountStr}${cleanRemark(remark) ? ` (${cleanRemark(remark)})` : ""}`;
 
   if (block) {
     if (subTitleTrim) {
@@ -1445,19 +1464,19 @@ function insertLedgerEntry(text, { categoryTitle, sign, subTitle, label, amount 
       const sub = block.subs.find((s) => normLabel(s.title) === subNorm);
       if (sub) {
         const insertAt = sub.totalLineIndex !== null ? sub.totalLineIndex : sub.entries.length ? sub.entries[sub.entries.length - 1].lineIndex + 1 : block.lineIndices[block.lineIndices.length - 1] + 1;
-        lines.splice(insertAt, 0, `${label} - ${amountStr}`);
+        lines.splice(insertAt, 0, entryLine);
       } else {
         const insertAt = block.totalLineIndex !== null ? block.totalLineIndex : block.lineIndices[block.lineIndices.length - 1] + 1;
-        lines.splice(insertAt, 0, subTitleTrim, `${label} - ${amountStr}`, `${subTitleTrim} Total -`);
+        lines.splice(insertAt, 0, subTitleTrim, entryLine, `${subTitleTrim} Total -`);
       }
     } else {
       const insertAt = block.totalLineIndex !== null ? block.totalLineIndex : block.lineIndices[block.lineIndices.length - 1] + 1;
-      lines.splice(insertAt, 0, `${label} - ${amountStr}`);
+      lines.splice(insertAt, 0, entryLine);
     }
   } else {
     const newBlockLines = [`(${sign}): ${categoryTitle}`];
-    if (subTitleTrim) newBlockLines.push(subTitleTrim, `${label} - ${amountStr}`, `${subTitleTrim} Total -`);
-    else newBlockLines.push(`${label} - ${amountStr}`);
+    if (subTitleTrim) newBlockLines.push(subTitleTrim, entryLine, `${subTitleTrim} Total -`);
+    else newBlockLines.push(entryLine);
     newBlockLines.push(`${categoryTitle} Total -`);
 
     const summaryIdxs = Object.values(parsed.summary).filter(Boolean).map((s) => s.lineIndex).sort((a, b) => a - b);
@@ -1485,6 +1504,108 @@ function categoryOptionsFor(text) {
   return parsed.blocks
     .filter((b) => b.sign === "+" || b.sign === "-")
     .map((b) => ({ title: b.title, sign: b.sign, subs: b.subs.map((s) => s.title) }));
+}
+
+/* =========================================================================
+   COMBINE / SPLIT / REMARKS  (1.16.0)
+   Pure helpers behind the import entry form's Combine + Split controls and
+   the Remarks column. Kept free of React so they can be exercised in a
+   throwaway-Node simulation like the other engines.
+
+   - REMARK: stored as the entry's trailing "(...)" -- "5 - 2700 (via Rahul)".
+     ENTRY_RE already accepts it (one level of nested parens), so no format
+     change; cleanRemark() strips newlines and swaps any parentheses for
+     brackets so a remark can never break that parse.
+   - COMBINE: several bank rows (same direction) become ONE pending entry at
+     the summed amount, dated as the FIRST row. Nothing is written until that
+     entry is saved; every member's transaction signature is then logged so a
+     re-import skips all of them.
+   - SPLIT: one entry becomes several ledger lines (any categories /
+     subcategories). The parts must add up EXACTLY to the entry amount or the
+     save is refused (checkSplit).
+   ========================================================================= */
+function cleanRemark(s) {
+  return String(s || "")
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\(/g, "[")
+    .replace(/\)/g, "]")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function joinRemarks(...parts) {
+  return parts.map(cleanRemark).filter(Boolean).join(" · ");
+}
+
+function toCents(n) {
+  return Math.round((parseFloat(n) || 0) * 100);
+}
+
+// The automatic note a combined entry carries into its Remarks column.
+function comboNote(amounts) {
+  return `Combined ${amounts.map((a) => formatNum(a)).join(" + ")}`;
+}
+
+// Validates a split. Returns { ok, error, sum } -- `error` is a message ready
+// to show the user. Compared in whole paise so 0.1 + 0.2 style float noise
+// can never make a correct split look wrong (or a wrong one look right).
+function checkSplit(total, splits) {
+  const list = splits || [];
+  if (list.length < 2) {
+    return { ok: false, sum: 0, error: "A split needs at least two parts." };
+  }
+  let sumCents = 0;
+  for (let i = 0; i < list.length; i++) {
+    const c = toCents(list[i].amount);
+    if (!(parseFloat(list[i].amount) > 0) || c <= 0) {
+      return { ok: false, sum: sumCents / 100, error: `Split part ${i + 1} needs an amount greater than 0.` };
+    }
+    if (!(list[i].category || "").trim()) {
+      return { ok: false, sum: sumCents / 100, error: `Split part ${i + 1} needs a category.` };
+    }
+    sumCents += c;
+  }
+  const totalCents = toCents(total);
+  if (sumCents !== totalCents) {
+    const diff = (totalCents - sumCents) / 100;
+    return {
+      ok: false,
+      sum: sumCents / 100,
+      error:
+        `Split is incorrect: the parts add up to ${formatNum(sumCents / 100)} but the entry is ${formatNum(totalCents / 100)} ` +
+        `(${diff > 0 ? formatNum(diff) + " short" : formatNum(-diff) + " over"}). The entry was not made.`,
+    };
+  }
+  return { ok: true, sum: sumCents / 100, error: "" };
+}
+
+// Turns one SAVED review result into the ledger line(s) it stands for: a
+// single entry normally, one line per part when it was split. This is the
+// single place that decides what a result writes, used by
+// rebuildLedgerFromResults (and by the simulation that tests it).
+function resultToEntries(r) {
+  const sign = r.eType === "credit" ? "+" : "-";
+  const label = (r.eDate && dayLabelFromISO(r.eDate)) || (r.eDesc || "").slice(0, 20) || "Entry";
+  if (r.split && Array.isArray(r.splits) && r.splits.length) {
+    return r.splits.map((s) => ({
+      categoryTitle: (s.category || "").trim(),
+      sign,
+      subTitle: (s.sub || "").trim(),
+      label,
+      amount: parseFloat(s.amount),
+      remark: joinRemarks(s.remark, r.eRemark),
+    }));
+  }
+  return [
+    {
+      categoryTitle: (r.eCategory || "").trim(),
+      sign,
+      subTitle: (r.eSub || "").trim(),
+      label,
+      amount: parseFloat(r.eAmount),
+      remark: cleanRemark(r.eRemark),
+    },
+  ];
 }
 
 // Reconstructs visual text rows from a PDF.js getTextContent() item list by
@@ -3665,6 +3786,15 @@ export default function LedgerApp() {
               entries under them the same way as any other category. Nothing auto-mirrors between accounts.
               <br />
               <br />
+              <strong>Remarks, combine and split (bank-statement import):</strong> an entry can carry a remark in
+              parentheses at the end — <code>5 - 2700 (via Rahul)</code> — and it shows in the Statement's Remarks column
+              (and its PDF). While reviewing an imported transaction you can type a remark, tap{" "}
+              <em>Combine with next entries…</em> to fold several same-direction bank rows into one entry (it takes the
+              first row's date and adds a "Combined 10000 + 2500" remark), and tick <em>Split into several categories</em> to
+              spread one entry across categories and subcategories. A split must add up exactly to the entry amount or
+              the entry isn't made.
+              <br />
+              <br />
               <strong>Loans:</strong> record a loan as an entry under <code>(+): Loan</code> (e.g. <code>Saneesh - 2000</code>).
               Record repaying it as an entry with the same name under <code>(-): Loan repayment</code> — in that same account
               (a loan is always repaid from the account it was taken in), and it doesn't have to be the full amount:
@@ -4438,12 +4568,18 @@ function buildStatementPdfDoc(account, month, statement) {
   const marginX = 14;
   const pageWidth = doc.internal.pageSize.getWidth();
   const pageHeight = doc.internal.pageSize.getHeight();
+  const hasRemarks = statement.rows.some((r) => r.remark);
   const colDay = marginX;
   const colDesc = marginX + 14;
   const colDebitRight = pageWidth - marginX - 46;
   const colCreditRight = pageWidth - marginX - 24;
   const colBalanceRight = pageWidth - marginX;
-  const descWidth = colDebitRight - colDesc - 4;
+  // With a Remarks column the space between Description and Debit is shared:
+  // ~56% description, ~44% remarks. Without one, Description keeps it all.
+  const textSpan = colDebitRight - colDesc - 24; // leave room for the Debit figures
+  const descWidth = hasRemarks ? textSpan * 0.56 : colDebitRight - colDesc - 4;
+  const colRemark = colDesc + descWidth + 3;
+  const remarkWidth = hasRemarks ? textSpan - descWidth - 3 : 0;
 
   let y = 20;
 
@@ -4452,6 +4588,7 @@ function buildStatementPdfDoc(account, month, statement) {
     doc.setFontSize(9);
     doc.text("Day", colDay, y);
     doc.text("Description", colDesc, y);
+    if (hasRemarks) doc.text("Remarks", colRemark, y);
     doc.text("Debit", colDebitRight, y, { align: "right" });
     doc.text("Credit", colCreditRight, y, { align: "right" });
     doc.text("Balance", colBalanceRight, y, { align: "right" });
@@ -4470,10 +4607,11 @@ function buildStatementPdfDoc(account, month, statement) {
     }
   }
 
-  function drawRow({ day, desc, debit, credit, balance, bold, topBorder }) {
+  function drawRow({ day, desc, remark, debit, credit, balance, bold, topBorder }) {
     doc.setFont("courier", bold ? "bold" : "normal");
     const descLines = doc.splitTextToSize(desc, descWidth);
-    const rowHeight = Math.max(5, descLines.length * 4.2);
+    const remarkLines = hasRemarks && remark ? doc.splitTextToSize(remark, remarkWidth) : [];
+    const rowHeight = Math.max(5, Math.max(descLines.length, remarkLines.length) * 4.2);
     ensureSpace(rowHeight + (topBorder ? 3 : 0));
     if (topBorder) {
       doc.setLineWidth(0.3);
@@ -4481,6 +4619,7 @@ function buildStatementPdfDoc(account, month, statement) {
     }
     doc.text(String(day), colDay, y);
     doc.text(descLines, colDesc, y);
+    if (remarkLines.length) doc.text(remarkLines, colRemark, y);
     if (debit) doc.text(debit, colDebitRight, y, { align: "right" });
     if (credit) doc.text(credit, colCreditRight, y, { align: "right" });
     doc.text(balance, colBalanceRight, y, { align: "right" });
@@ -4513,6 +4652,7 @@ function buildStatementPdfDoc(account, month, statement) {
     drawRow({
       day: statementDateCell(r.date),
       desc,
+      remark: r.remark,
       debit: r.sign === "-" ? formatNum(r.amount) : "",
       credit: r.sign === "+" ? formatNum(r.amount) : "",
       balance: formatNum(r.balance) || "0",
@@ -4584,6 +4724,10 @@ function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, set
   const pageKey = `${account}::${month}`;
   const pageOrder = entryOrder[pageKey];
   const statement = useMemo(() => buildStatement(parsed, month, pageOrder), [parsed, month, pageOrder]);
+  // The Remarks column (1.16.0) only appears when at least one entry on this
+  // page carries a remark, so pages without any keep the compact 5-column
+  // layout on a phone.
+  const hasRemarks = statement.rows.some((r) => r.remark);
 
   // Covers pages the live editor hasn't touched since this feature shipped
   // (or hasn't been opened at all): the first time Statement is viewed for
@@ -4664,11 +4808,13 @@ function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, set
           No entry for {account} this month.
         </div>
       ) : (
+        <div className="overflow-x-auto">
         <table className="w-full border-collapse font-mono text-xs">
           <thead>
             <tr>
               <th className="text-left border border-zinc-800 bg-zinc-800/60 text-zinc-300 px-2 py-2 w-10">Day</th>
               <th className="text-left border border-zinc-800 bg-zinc-800/60 text-zinc-300 px-3 py-2">Description</th>
+              {hasRemarks && <th className="text-left border border-zinc-800 bg-zinc-800/60 text-zinc-300 px-3 py-2">Remarks</th>}
               <th className="text-right border border-zinc-800 bg-zinc-800/60 text-zinc-300 px-3 py-2">Debit</th>
               <th className="text-right border border-zinc-800 bg-zinc-800/60 text-zinc-300 px-3 py-2">Credit</th>
               <th className="text-right border border-zinc-800 bg-zinc-800/60 text-zinc-300 px-3 py-2">Balance</th>
@@ -4678,6 +4824,7 @@ function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, set
             <tr>
               <td className="border border-zinc-800 text-zinc-500 px-2 py-2">—</td>
               <td className="border border-zinc-800 text-zinc-400 px-3 py-2">Opening balance</td>
+              {hasRemarks && <td className="border border-zinc-800 px-3 py-2"></td>}
               <td className="text-right border border-zinc-800 text-zinc-600 px-3 py-2"></td>
               <td className="text-right border border-zinc-800 text-zinc-600 px-3 py-2"></td>
               <td className="text-right border border-zinc-800 text-zinc-200 px-3 py-2">{formatNum(statement.openingBalance) || "0"}</td>
@@ -4689,6 +4836,7 @@ function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, set
                   {r.label}
                   <span className="text-zinc-600"> · {r.sub ? `${r.category} — ${r.sub}` : r.category}</span>
                 </td>
+                {hasRemarks && <td className="border border-zinc-800 text-amber-200/90 px-3 py-2 min-w-[7em]">{r.remark}</td>}
                 <td className="text-right border border-zinc-800 text-rose-300 px-3 py-2">{r.sign === "-" ? formatNum(r.amount) : ""}</td>
                 <td className="text-right border border-zinc-800 text-emerald-300 px-3 py-2">{r.sign === "+" ? formatNum(r.amount) : ""}</td>
                 <td className="text-right border border-zinc-800 text-zinc-200 px-3 py-2">{formatNum(r.balance) || "0"}</td>
@@ -4697,12 +4845,14 @@ function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, set
             <tr className="font-bold border-t-2 border-zinc-600">
               <td className="border border-zinc-800"></td>
               <td className="border border-zinc-800 text-zinc-100 px-3 py-2">Closing balance</td>
+              {hasRemarks && <td className="border border-zinc-800"></td>}
               <td className="border border-zinc-800"></td>
               <td className="border border-zinc-800"></td>
               <td className="text-right border border-zinc-800 text-zinc-100 px-3 py-2">{formatNum(statement.closingBalance) || "0"}</td>
             </tr>
           </tbody>
         </table>
+        </div>
       )}
     </div>
   );
@@ -4790,6 +4940,7 @@ function ImportStatementView({
 
   const savedCount = results.filter((r) => r?.status === "saved").length;
   const skippedCount = results.filter((r) => r?.status === "skipped").length;
+  const combinedCount = results.filter((r) => r?.status === "combined").length;
 
   const [eDate, setEDate] = useState("");
   const [eDesc, setEDesc] = useState("");
@@ -4797,6 +4948,25 @@ function ImportStatementView({
   const [eType, setEType] = useState("debit");
   const [eCategory, setECategory] = useState("");
   const [eSub, setESub] = useState("");
+  // ---- Remarks / Split / Combine (1.16.0) ----
+  // eRemark: optional free-text note, written as the entry's trailing "(...)"
+  //   and shown in the Statement's Remarks column.
+  // eSplit / eSplits: the "Split" checkbox and its parts, [{amount, category,
+  //   sub, remark}]. A split is only accepted if the parts add up EXACTLY to
+  //   the entry amount (checkSplit).
+  // eCombo: when this row is a COMBINED entry, the queue indexes of every
+  //   statement row folded into it (head first); null otherwise.
+  // combine: the live "pick rows to combine" session, null when not combining:
+  //   { head: queueIndex, members: [queueIndex, ...] }. While it is active the
+  //   editor fields above are left untouched (they still hold the head row), and
+  //   the candidate rows are shown read-only straight from queue/results.
+  // eCheck: the per-candidate "Combine this entry" checkbox.
+  const [eRemark, setERemark] = useState("");
+  const [eSplit, setESplit] = useState(false);
+  const [eSplits, setESplits] = useState([]);
+  const [eCombo, setECombo] = useState(null);
+  const [combine, setCombine] = useState(null);
+  const [eCheck, setECheck] = useState(false);
 
   const passwordAttemptedOnce = useRef(false);
 
@@ -4902,6 +5072,10 @@ function ImportStatementView({
     setEType(t.guessedType === "credit" ? "credit" : "debit");
     setECategory("");
     setESub("");
+    setERemark("");
+    setESplit(false);
+    setESplits([]);
+    setECombo(null);
   }
 
   // Populates the editor for a given queue index — from that row's stored
@@ -4913,6 +5087,9 @@ function ImportStatementView({
   function loadIndex(i, resultsArr) {
     setQIndex(i);
     const r = (resultsArr || results)[i];
+    // A row folded into a combined entry has nothing of its own to edit; the
+    // review step shows a small notice for it instead (see below).
+    if (r && r.status === "combined") return;
     if (r) {
       setEDate(r.eDate);
       setEDesc(r.eDesc);
@@ -4920,6 +5097,10 @@ function ImportStatementView({
       setEType(r.eType);
       setECategory(r.eCategory);
       setESub(r.eSub);
+      setERemark(r.eRemark || "");
+      setESplit(!!r.split);
+      setESplits(r.splits || []);
+      setECombo(r.combo || null);
     } else {
       loadIntoEditor(queue[i]);
     }
@@ -4942,26 +5123,30 @@ function ImportStatementView({
     queue.forEach((t, i) => {
       const r = resultsArr[i];
       if (r && r.status === "saved") {
-        const amt = parseFloat(r.eAmount);
-        const label = (r.eDate && dayLabelFromISO(r.eDate)) || (r.eDesc || "").slice(0, 20) || "Entry";
-        text = insertLedgerEntry(text, {
-          categoryTitle: r.eCategory.trim(),
-          sign: r.eType === "credit" ? "+" : "-",
-          subTitle: (r.eSub || "").trim(),
-          label,
-          amount: amt,
+        // One result writes ONE ledger line normally, or one line per part
+        // when it was split (resultToEntries decides). A combined entry is
+        // still one row here -- the head's -- but it logs EVERY member's
+        // transaction signature below so re-importing skips all of them.
+        const entries = resultToEntries(r);
+        entries.forEach((entry, k) => {
+          text = insertLedgerEntry(text, entry);
+          // SLOT SYSTEM (feature #39): this row's position in the queue was
+          // reserved back when the queue itself was built (startReview) — in
+          // real bank-statement order, whatever session that ends up being.
+          // Claim that reserved slot for the ledger line just written above
+          // instead of leaving it to be assigned a fresh "first seen in
+          // text" number the next time the page is parsed. Parts of a split
+          // after the first take a tiny fractional step after the slot
+          // (k * 0.001) so the whole split stays together, in order.
+          const claim = claimSlot(order, claimedSigs, text, targetMonth, t.signature, k * 0.001);
+          if (claim.changed) {
+            order = claim.pageOrder;
+            orderChanged = true;
+          }
         });
         sigs.push(t.signature);
-        // SLOT SYSTEM (feature #39): this row's position in the queue was
-        // reserved back when the queue itself was built (startReview) — in
-        // real bank-statement order, whatever session that ends up being.
-        // Claim that reserved slot for the ledger line just written above
-        // instead of leaving it to be assigned a fresh "first seen in
-        // text" number the next time the page is parsed.
-        const claim = claimSlot(order, claimedSigs, text, targetMonth, t.signature);
-        if (claim.changed) {
-          order = claim.pageOrder;
-          orderChanged = true;
+        if (Array.isArray(r.combo)) {
+          for (const m of r.combo) if (m !== i && queue[m]) sigs.push(queue[m].signature);
         }
       }
     });
@@ -5154,11 +5339,17 @@ function ImportStatementView({
     }
     if (resultsArr.every(Boolean)) {
       setStep("done");
-    } else if (qIndex + 1 < queue.length) {
-      loadIndex(qIndex + 1, resultsArr);
-    } else {
-      setStep("done");
+      return;
     }
+    // Some earlier row is still open; step forward to the next row that has
+    // its own form (rows folded into a combined entry have none).
+    for (let i = qIndex + 1; i < queue.length; i++) {
+      if (resultsArr[i]?.status !== "combined") {
+        loadIndex(i, resultsArr);
+        return;
+      }
+    }
+    setStep("done");
   }
 
   function goBack() {
@@ -5171,23 +5362,51 @@ function ImportStatementView({
     loadIndex(qIndex + 1);
   }
 
+  // Snapshot of every editor field for the current row (used for both Save
+  // and Skip, so a skipped combined/split row keeps its combine + split setup).
+  function makeSnapshot(status) {
+    return {
+      status,
+      eDate,
+      eDesc,
+      eAmount,
+      eType,
+      eCategory: eCategory.trim(),
+      eSub: eSub.trim(),
+      eRemark,
+      split: eSplit,
+      splits: eSplit ? eSplits : [],
+      combo: eCombo,
+    };
+  }
+
   function saveCurrentAndAdvance(remember) {
-    if (!eCategory.trim()) {
-      showAlert("Pick or create a category first.");
-      return;
-    }
     const amt = parseFloat(eAmount);
     if (isNaN(amt) || amt <= 0) {
       showAlert("Enter a valid amount.");
       return;
     }
+    if (eSplit) {
+      // The split must add up EXACTLY to the entry amount. If it doesn't,
+      // nothing is written -- the user is told and stays on this row.
+      const chk = checkSplit(eAmount, eSplits);
+      if (!chk.ok) {
+        showAlert(chk.error);
+        return;
+      }
+    } else if (!eCategory.trim()) {
+      showAlert("Pick or create a category first.");
+      return;
+    }
     const t = queue[qIndex];
-    const snapshot = { status: "saved", eDate, eDesc, eAmount, eType, eCategory: eCategory.trim(), eSub: eSub.trim() };
+    const snapshot = makeSnapshot("saved");
     const newResults = [...results];
     newResults[qIndex] = snapshot;
     setResults(newResults);
     rebuildLedgerFromResults(newResults);
-    if (remember) {
+    // "Remember this description" only makes sense for a plain one-category
+    // entry -- a split or a combined entry isn't a repeatable mapping.
+    if (remember && !eSplit && !eCombo) {
       setStmtCatMap((prev) => ({
         ...prev,
         [targetAccount]: {
@@ -5201,11 +5420,208 @@ function ImportStatementView({
 
   function skipCurrent() {
     const newResults = [...results];
-    newResults[qIndex] = { status: "skipped", eDate, eDesc, eAmount, eType, eCategory, eSub };
+    newResults[qIndex] = makeSnapshot("skipped");
     setResults(newResults);
     rebuildLedgerFromResults(newResults);
     goToNextUndecided(newResults);
   }
+
+  /* ---- SPLIT editing (1.16.0) ---- */
+  function blankSplit() {
+    return { amount: "", category: "", sub: "", remark: "" };
+  }
+  function toggleSplit(on) {
+    setESplit(on);
+    if (on && eSplits.length === 0) {
+      // First part inherits whatever category was already chosen above.
+      setESplits([{ ...blankSplit(), category: eCategory, sub: eSub }, blankSplit()]);
+    }
+  }
+  function updateSplit(k, patch) {
+    setESplits((prev) => prev.map((sp, i) => (i === k ? { ...sp, ...patch } : sp)));
+  }
+  function addSplit() {
+    setESplits((prev) => [...prev, blankSplit()]);
+  }
+  function removeSplit(k) {
+    setESplits((prev) => prev.filter((_, i) => i !== k));
+  }
+  function pickNewSplitCategory(k) {
+    askPrompt("New category name:", "", (name) => {
+      if (name && name.trim()) updateSplit(k, { category: name.trim(), sub: "" });
+    });
+  }
+  function pickNewSplitSub(k) {
+    askPrompt("New subcategory name:", "", (name) => updateSplit(k, { sub: (name || "").trim() }));
+  }
+  // Puts whatever is still unassigned into part k.
+  function fillSplitRemaining(k) {
+    const others = eSplits.reduce((a, sp, i) => (i === k ? a : a + toCents(sp.amount)), 0);
+    const rest = (toCents(eAmount) - others) / 100;
+    if (rest > 0) updateSplit(k, { amount: String(rest) });
+  }
+  // Category / subcategory choices for one split part: what the ledger page
+  // already has for this direction, plus anything a sibling part just created
+  // (so a brand-new category typed once can be reused by another part).
+  function splitCategoryNames(k) {
+    const names = matchingCategories.map((c) => c.title);
+    for (const sp of eSplits) {
+      const c = (sp.category || "").trim();
+      if (c && !names.some((n) => normLabel(n) === normLabel(c))) names.push(c);
+    }
+    return names;
+  }
+  function splitSubNames(k) {
+    const cat = eSplits[k]?.category || "";
+    const subs = [...(matchingCategories.find((c) => normLabel(c.title) === normLabel(cat))?.subs || [])];
+    for (const sp of eSplits) {
+      const sb = (sp.sub || "").trim();
+      if (sb && normLabel(sp.category || "") === normLabel(cat) && !subs.some((x) => normLabel(x) === normLabel(sb))) subs.push(sb);
+    }
+    return subs;
+  }
+
+  /* ---- COMBINE (1.16.0) ----
+     Flow: on a row's form tap "Combine". The review then walks FORWARD through
+     the later rows, each shown with a "Combine this entry" checkbox plus
+     Next / Finish:
+       - tick + Finish  -> combine this one and finish
+       - tick + Next    -> combine this one and keep going
+       - untick + Next  -> skip this one (not combined) and look at the next
+     Finishing with two or more rows folds them into ONE pending entry on the
+     first row (its date), at the summed amount, with a "Combined a + b"
+     remark. Nothing is written to the ledger until that entry is saved. */
+  function effectiveAmount(i, resultsArr) {
+    const r = resultsArr[i];
+    return parseFloat(r ? r.eAmount : queue[i].amount) || 0;
+  }
+  function effectiveType(i, resultsArr) {
+    const r = resultsArr[i];
+    if (r && r.eType) return r.eType;
+    return queue[i].guessedType === "credit" ? "credit" : "debit";
+  }
+  // Rows that can still be pulled into a combine: not yet decided, or
+  // skipped and left open -- but never a row that is already a combined entry.
+  function nextCombineCandidate(from, resultsArr) {
+    for (let i = from + 1; i < queue.length; i++) {
+      const r = resultsArr[i];
+      if (!r) return i;
+      if (r.status === "skipped" && !r.combo) return i;
+    }
+    return -1;
+  }
+  function startCombine() {
+    const amt = parseFloat(eAmount);
+    if (isNaN(amt) || amt <= 0) {
+      showAlert("Enter a valid amount first.");
+      return;
+    }
+    const next = nextCombineCandidate(qIndex, results);
+    if (next === -1) {
+      showAlert("There is no later entry in this statement to combine with.");
+      return;
+    }
+    setCombine({ head: qIndex, members: [qIndex], type: eType });
+    setECheck(false);
+    setQIndex(next);
+  }
+  function cancelCombine() {
+    if (!combine) return;
+    const head = combine.head;
+    setCombine(null);
+    setECheck(false);
+    setQIndex(head); // editor fields were never touched, so the head row is exactly as left
+  }
+  function combineAdvance() {
+    const sameType = effectiveType(qIndex, results) === combine.type;
+    const members = eCheck && sameType ? [...combine.members, qIndex] : combine.members;
+    const next = nextCombineCandidate(qIndex, results);
+    if (next === -1) return;
+    setCombine({ ...combine, members });
+    setECheck(false);
+    setQIndex(next);
+  }
+  function combineFinish() {
+    const sameType = effectiveType(qIndex, results) === combine.type;
+    const members = eCheck && sameType ? [...combine.members, qIndex] : combine.members;
+    const head = combine.head;
+    if (members.length < 2) {
+      cancelCombine();
+      showAlert("Nothing was combined — no other entry was ticked.");
+      return;
+    }
+    const amounts = members.map((m) => (m === head ? parseFloat(eAmount) : effectiveAmount(m, results)));
+    const sum = amounts.reduce((a, x) => a + toCents(x), 0) / 100;
+    const note = joinRemarks(eRemark, comboNote(amounts));
+    const newResults = [...results];
+    for (const m of members) if (m !== head) newResults[m] = { status: "combined", into: head };
+    // The combined entry is NOT written yet -- it sits as an open (skipped)
+    // slot carrying its combine info until the user picks category/splits
+    // and saves it. Its date is the first row's date (the head's), unchanged.
+    newResults[head] = {
+      status: "skipped",
+      eDate,
+      eDesc,
+      eAmount: String(sum),
+      eType,
+      eCategory: "",
+      eSub: "",
+      eRemark: note,
+      split: false,
+      splits: [],
+      combo: members,
+    };
+    setResults(newResults);
+    rebuildLedgerFromResults(newResults);
+    setCombine(null);
+    setECheck(false);
+    setQIndex(head);
+    setEAmount(String(sum));
+    setERemark(note);
+    setECategory("");
+    setESub("");
+    setESplit(false);
+    setESplits([]);
+    setECombo(members);
+  }
+  function doUncombine(headIdx) {
+    const head = results[headIdx];
+    if (!head || !Array.isArray(head.combo)) return;
+    const newResults = [...results];
+    for (const m of head.combo) newResults[m] = null; // every member (head included) goes back to its original, undecided state
+    setResults(newResults);
+    rebuildLedgerFromResults(newResults);
+    loadIndex(headIdx, newResults);
+  }
+  function uncombine(headIdx) {
+    askConfirm(
+      "Uncombine these entries? They return to separate rows. If the combined entry was already saved, it is removed from the ledger.",
+      () => doUncombine(headIdx),
+      { confirmLabel: "Uncombine" }
+    );
+  }
+
+  // View-model for the "pick rows to combine" screen (null when not combining).
+  let cv = null;
+  if (combine && queue[qIndex]) {
+    const r = results[qIndex];
+    const headAmt = parseFloat(eAmount) || 0; // editor fields still hold the head row while combining
+    const memberAmts = combine.members.map((m) => (m === combine.head ? headAmt : effectiveAmount(m, results)));
+    const candAmt = effectiveAmount(qIndex, results);
+    const totalNow = memberAmts.reduce((a, x) => a + toCents(x), 0) / 100;
+    cv = {
+      sameType: effectiveType(qIndex, results) === combine.type,
+      type: effectiveType(qIndex, results),
+      memberAmts,
+      candAmt,
+      totalNow,
+      totalIfTicked: totalNow + candAmt,
+      hasNext: nextCombineCandidate(qIndex, results) !== -1,
+      date: r ? r.eDate : queue[qIndex].dateISO,
+      desc: r ? r.eDesc : queue[qIndex].description,
+    };
+  }
+  const canCombine = !eCombo && step === "review" && !combine && nextCombineCandidate(qIndex, results) !== -1;
 
   return (
     <div className="flex-1 overflow-y-auto">
@@ -5319,12 +5735,105 @@ function ImportStatementView({
         </div>
       )}
 
-      {step === "review" && queue[qIndex] && (
+      {step === "review" && combine && cv && (
+        <div className="p-4 flex flex-col gap-2">
+          <div className="rounded-lg border border-teal-800 bg-teal-950/40 p-2.5 font-mono text-[11px] text-teal-200 leading-relaxed">
+            Combining into entry {combine.head + 1}
+            {queue[combine.head]?.description ? ` (${queue[combine.head].description})` : ""}. So far{" "}
+            {cv.memberAmts.map((a) => formatNum(a)).join(" + ")} = <strong>{formatNum(cv.totalNow)}</strong>
+          </div>
+          <div className="font-mono text-[11px] text-zinc-500">
+            Entry {qIndex + 1} of {queue.length}
+          </div>
+          <div className="rounded-lg border border-zinc-700 p-3 font-mono text-sm text-zinc-100 flex flex-col gap-1">
+            <div className="flex justify-between gap-3">
+              <span className="text-zinc-400">{cv.date || "no date"}</span>
+              <span className={cv.type === "credit" ? "text-emerald-300" : "text-rose-300"}>
+                {cv.type === "credit" ? "Money in" : "Money out"} {formatNum(cv.candAmt)}
+              </span>
+            </div>
+            <div className="text-zinc-200 break-words">{cv.desc || "(no description)"}</div>
+            {queue[qIndex].raw && <div className="text-[10px] text-zinc-600 truncate">{queue[qIndex].raw}</div>}
+          </div>
+          <label className="flex items-center gap-3 font-mono text-sm text-zinc-100 py-1">
+            <input
+              type="checkbox"
+              checked={eCheck && cv.sameType}
+              disabled={!cv.sameType}
+              onChange={(e) => setECheck(e.target.checked)}
+              className="w-5 h-5 accent-teal-500"
+            />
+            Combine this entry
+          </label>
+          {!cv.sameType && (
+            <div className="font-mono text-[11px] text-amber-300 leading-relaxed">
+              This one is {cv.type === "credit" ? "money in" : "money out"}, but the combined entry is{" "}
+              {combine.type === "credit" ? "money in" : "money out"} — only same-direction entries can be combined.
+            </div>
+          )}
+          {eCheck && cv.sameType && (
+            <div className="font-mono text-[11px] text-teal-300">Total with this entry: {formatNum(cv.totalIfTicked)}</div>
+          )}
+          <div className="flex gap-2 mt-2">
+            <button onClick={cancelCombine} className="py-3 px-4 rounded-lg bg-zinc-800 hover:bg-zinc-700 font-mono text-sm text-zinc-300">
+              Cancel
+            </button>
+            <button
+              onClick={combineAdvance}
+              disabled={!cv.hasNext}
+              className="flex-1 py-3 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-30 font-mono text-sm text-zinc-200 flex items-center justify-center gap-1.5"
+            >
+              Next <ChevronRight size={15} />
+            </button>
+            <button
+              onClick={combineFinish}
+              className="flex-1 py-3 rounded-lg bg-teal-700 hover:bg-teal-600 font-mono text-sm text-white flex items-center justify-center gap-1.5"
+            >
+              <Check size={15} /> Finish
+            </button>
+          </div>
+          <div className="font-mono text-[10px] text-zinc-600 leading-relaxed">
+            Tick + Finish: combine this one and stop · Tick + Next: combine this one and keep going · Untick + Next: skip
+            this one and look at the next. The combined entry takes the first entry's date and isn't saved until you
+            save it.
+          </div>
+        </div>
+      )}
+
+      {step === "review" && !combine && queue[qIndex] && results[qIndex]?.status === "combined" && (
+        <div className="p-4 flex flex-col gap-2">
+          <div className="font-mono text-[11px] text-zinc-500">
+            {qIndex + 1} of {queue.length}
+          </div>
+          <div className="rounded-lg border border-teal-800 bg-teal-950/40 p-3 font-mono text-xs text-teal-200 leading-relaxed">
+            This entry ({formatNum(queue[qIndex].amount)} · {queue[qIndex].description || "no description"}) is part of the
+            combined entry {results[qIndex].into + 1}.
+          </div>
+          <div className="flex gap-2 mt-2">
+            <button onClick={goBack} disabled={qIndex === 0} className="py-3 px-3 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-30 font-mono text-sm text-zinc-300 flex items-center justify-center">
+              <ChevronLeft size={15} />
+            </button>
+            <button onClick={goForward} disabled={qIndex >= queue.length - 1} className="py-3 px-3 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-30 font-mono text-sm text-zinc-300 flex items-center justify-center">
+              <ChevronRight size={15} />
+            </button>
+            <button onClick={() => loadIndex(results[qIndex].into)} className="flex-1 py-3 rounded-lg bg-teal-700 hover:bg-teal-600 font-mono text-sm text-white">
+              Go to combined entry
+            </button>
+          </div>
+          <button onClick={() => uncombine(results[qIndex].into)} className="font-mono text-[11px] text-zinc-500 underline text-center">
+            Uncombine
+          </button>
+        </div>
+      )}
+
+      {step === "review" && !combine && queue[qIndex] && results[qIndex]?.status !== "combined" && (
         <div className="p-4 flex flex-col gap-1">
           <div className="font-mono text-[11px] text-zinc-500 mb-1">
             {qIndex + 1} of {queue.length}
+            {eCombo && <span className="text-teal-400"> · combined from {eCombo.length} entries</span>}
             {results[qIndex]?.status === "saved" && <span className="text-teal-500"> · already saved (editing)</span>}
-            {results[qIndex]?.status === "skipped" && <span className="text-amber-400"> · skipped (empty slot — fill in and Save to add it)</span>}
+            {results[qIndex]?.status === "skipped" && !eCombo && <span className="text-amber-400"> · skipped (empty slot — fill in and Save to add it)</span>}
+            {results[qIndex]?.status === "skipped" && eCombo && <span className="text-amber-400"> · not saved yet — pick a category (or split it) and Save</span>}
             {autoCount > 0 && <> · {autoCount} auto-categorized</>}
             {dupCount > 0 && <> · {dupCount} already entered</>}
           </div>
@@ -5354,73 +5863,218 @@ function ImportStatementView({
           <input type="text" value={eDesc} onChange={(e) => setEDesc(e.target.value)} className={stmtInputCls} />
 
           <label className={stmtLabelCls}>Amount</label>
-          <input type="number" inputMode="decimal" value={eAmount} onChange={(e) => setEAmount(e.target.value)} className={stmtInputCls} />
+          <input
+            type="number"
+            inputMode="decimal"
+            value={eAmount}
+            onChange={(e) => setEAmount(e.target.value)}
+            readOnly={!!eCombo}
+            className={stmtInputCls + (eCombo ? " opacity-70" : "")}
+          />
+
+          <label className={stmtLabelCls}>Remarks (optional)</label>
+          <input
+            type="text"
+            value={eRemark}
+            onChange={(e) => setERemark(e.target.value)}
+            placeholder="e.g. via Rahul"
+            className={stmtInputCls}
+          />
+
+          {eCombo && (
+            <div className="mt-2 rounded-lg border border-teal-800 bg-teal-950/40 p-2.5 font-mono text-[11px] text-teal-200 leading-relaxed">
+              Combined entry — {eCombo.length} bank rows:
+              {eCombo.map((m) => (
+                <div key={m} className="text-teal-100/90 truncate">
+                  {queue[m]?.dateISO || "?"} · {queue[m]?.description || "entry"} · {formatNum(m === qIndex ? queue[m]?.amount : effectiveAmount(m, results))}
+                </div>
+              ))}
+              <div className="text-teal-300/80">Not in the ledger until you save it. Amount is the sum and can't be edited.</div>
+              <button onClick={() => uncombine(qIndex)} className="mt-1 text-teal-300 underline">
+                Uncombine
+              </button>
+            </div>
+          )}
+          {canCombine && (
+            <button
+              onClick={startCombine}
+              className="mt-2 self-start px-3 py-1.5 rounded-lg border border-zinc-700 hover:border-teal-600 font-mono text-xs text-zinc-300 hover:text-white"
+            >
+              Combine with next entries…
+            </button>
+          )}
 
           <div className="flex gap-2 mt-2">
             <button
+              disabled={!!eCombo}
               onClick={() => {
                 setEType("debit");
                 setECategory("");
                 setESub("");
+                setESplits((prev) => prev.map((sp) => ({ ...sp, category: "", sub: "" })));
               }}
-              className={"flex-1 py-2 rounded-lg font-mono text-xs " + (eType === "debit" ? "bg-rose-800/60 text-rose-200" : "bg-zinc-800 text-zinc-400")}
+              className={"flex-1 py-2 rounded-lg font-mono text-xs disabled:opacity-60 " + (eType === "debit" ? "bg-rose-800/60 text-rose-200" : "bg-zinc-800 text-zinc-400")}
             >
               Money out
             </button>
             <button
+              disabled={!!eCombo}
               onClick={() => {
                 setEType("credit");
                 setECategory("");
                 setESub("");
+                setESplits((prev) => prev.map((sp) => ({ ...sp, category: "", sub: "" })));
               }}
-              className={"flex-1 py-2 rounded-lg font-mono text-xs " + (eType === "credit" ? "bg-emerald-800/60 text-emerald-200" : "bg-zinc-800 text-zinc-400")}
+              className={"flex-1 py-2 rounded-lg font-mono text-xs disabled:opacity-60 " + (eType === "credit" ? "bg-emerald-800/60 text-emerald-200" : "bg-zinc-800 text-zinc-400")}
             >
               Money in
             </button>
           </div>
 
-          <label className={stmtLabelCls}>Category</label>
-          <select
-            value={eCategory}
-            onChange={(e) => {
-              if (e.target.value === "__new__") pickNewCategory();
-              else {
-                setECategory(e.target.value);
-                setESub("");
-              }
-            }}
-            className={stmtInputCls}
-          >
-            <option value="">Select…</option>
-            {matchingCategories.map((c) => (
-              <option key={c.title} value={c.title}>
-                {c.title}
-              </option>
-            ))}
-            {eCategory && !matchingCategories.some((c) => normLabel(c.title) === normLabel(eCategory)) && (
-              <option value={eCategory}>{eCategory} (new)</option>
-            )}
-            <option value="__new__">+ New category…</option>
-          </select>
+          <label className="flex items-center gap-3 mt-3 font-mono text-sm text-zinc-100">
+            <input type="checkbox" checked={eSplit} onChange={(e) => toggleSplit(e.target.checked)} className="w-5 h-5 accent-teal-500" />
+            Split into several categories
+          </label>
 
-          <label className={stmtLabelCls}>Subcategory (optional)</label>
-          <select
-            value={eSub}
-            onChange={(e) => {
-              if (e.target.value === "__new__") pickNewSub();
-              else setESub(e.target.value);
-            }}
-            className={stmtInputCls}
-          >
-            <option value="">None</option>
-            {currentCatSubs.map((s) => (
-              <option key={s} value={s}>
-                {s}
-              </option>
-            ))}
-            {eSub && !currentCatSubs.includes(eSub) && <option value={eSub}>{eSub} (new)</option>}
-            <option value="__new__">+ New subcategory…</option>
-          </select>
+          {!eSplit && (
+            <>
+            <label className={stmtLabelCls}>Category</label>
+            <select
+              value={eCategory}
+              onChange={(e) => {
+                if (e.target.value === "__new__") pickNewCategory();
+                else {
+                  setECategory(e.target.value);
+                  setESub("");
+                }
+              }}
+              className={stmtInputCls}
+            >
+              <option value="">Select…</option>
+              {matchingCategories.map((c) => (
+                <option key={c.title} value={c.title}>
+                  {c.title}
+                </option>
+              ))}
+              {eCategory && !matchingCategories.some((c) => normLabel(c.title) === normLabel(eCategory)) && (
+                <option value={eCategory}>{eCategory} (new)</option>
+              )}
+              <option value="__new__">+ New category…</option>
+            </select>
+
+            <label className={stmtLabelCls}>Subcategory (optional)</label>
+            <select
+              value={eSub}
+              onChange={(e) => {
+                if (e.target.value === "__new__") pickNewSub();
+                else setESub(e.target.value);
+              }}
+              className={stmtInputCls}
+            >
+              <option value="">None</option>
+              {currentCatSubs.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+              {eSub && !currentCatSubs.includes(eSub) && <option value={eSub}>{eSub} (new)</option>}
+              <option value="__new__">+ New subcategory…</option>
+            </select>
+            </>
+          )}
+
+          {eSplit && (
+            <div className="flex flex-col gap-1">
+              {(() => {
+                const sumC = eSplits.reduce((a, sp) => a + toCents(sp.amount), 0);
+                const totC = toCents(eAmount);
+                const left = (totC - sumC) / 100;
+                const exact = sumC === totC && totC > 0;
+                return (
+                  <div className={"font-mono text-[11px] mt-1 " + (exact ? "text-teal-300" : "text-amber-300")}>
+                    Parts add up to {formatNum(sumC / 100) || "0"} of {formatNum(totC / 100) || "0"}
+                    {exact ? " ✓" : left > 0 ? ` · ${formatNum(left)} left` : ` · ${formatNum(-left)} over`}
+                  </div>
+                );
+              })()}
+              {eSplits.map((sp, k) => {
+                const catNames = splitCategoryNames(k);
+                const subNames = splitSubNames(k);
+                return (
+                  <div key={k} className="rounded-lg border border-zinc-700 p-2.5 mt-1 flex flex-col gap-1">
+                    <div className="flex items-center justify-between">
+                      <span className="font-mono text-[10px] text-zinc-500 uppercase tracking-widest">Part {k + 1}</span>
+                      {eSplits.length > 2 && (
+                        <button onClick={() => removeSplit(k)} className="p-1 text-zinc-500 hover:text-rose-400" title="Remove this part">
+                          <X size={14} />
+                        </button>
+                      )}
+                    </div>
+                    <div className="flex gap-2">
+                      <input
+                        type="number"
+                        inputMode="decimal"
+                        value={sp.amount}
+                        onChange={(e) => updateSplit(k, { amount: e.target.value })}
+                        placeholder="Amount"
+                        className={stmtInputCls}
+                      />
+                      <button
+                        onClick={() => fillSplitRemaining(k)}
+                        title="Put whatever is still unassigned into this part"
+                        className="px-2.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 font-mono text-[10px] text-zinc-300 whitespace-nowrap"
+                      >
+                        rest
+                      </button>
+                    </div>
+                    <select
+                      value={sp.category}
+                      onChange={(e) => {
+                        if (e.target.value === "__new__") pickNewSplitCategory(k);
+                        else updateSplit(k, { category: e.target.value, sub: "" });
+                      }}
+                      className={stmtInputCls}
+                    >
+                      <option value="">Category…</option>
+                      {catNames.map((n) => (
+                        <option key={n} value={n}>
+                          {n}
+                        </option>
+                      ))}
+                      <option value="__new__">+ New category…</option>
+                    </select>
+                    <select
+                      value={sp.sub}
+                      onChange={(e) => {
+                        if (e.target.value === "__new__") pickNewSplitSub(k);
+                        else updateSplit(k, { sub: e.target.value });
+                      }}
+                      className={stmtInputCls}
+                    >
+                      <option value="">No subcategory</option>
+                      {subNames.map((n) => (
+                        <option key={n} value={n}>
+                          {n}
+                        </option>
+                      ))}
+                      {sp.sub && !subNames.includes(sp.sub) && <option value={sp.sub}>{sp.sub} (new)</option>}
+                      <option value="__new__">+ New subcategory…</option>
+                    </select>
+                    <input
+                      type="text"
+                      value={sp.remark}
+                      onChange={(e) => updateSplit(k, { remark: e.target.value })}
+                      placeholder="Remark for this part (optional), e.g. via Anil"
+                      className={stmtInputCls}
+                    />
+                  </div>
+                );
+              })}
+              <button onClick={addSplit} className="mt-1 self-start font-mono text-xs text-teal-400 underline">
+                + Add another part
+              </button>
+            </div>
+          )}
 
           <div className="flex gap-2 mt-4">
             <button
@@ -5449,9 +6103,11 @@ function ImportStatementView({
               <Check size={15} /> Save
             </button>
           </div>
-          <button onClick={() => saveCurrentAndAdvance(true)} className="mt-2 font-mono text-[11px] text-zinc-500 underline text-center">
-            Save &amp; auto-apply to future matches of this description
-          </button>
+          {!eSplit && !eCombo && (
+            <button onClick={() => saveCurrentAndAdvance(true)} className="mt-2 font-mono text-[11px] text-zinc-500 underline text-center">
+              Save &amp; auto-apply to future matches of this description
+            </button>
+          )}
         </div>
       )}
 
@@ -5461,6 +6117,7 @@ function ImportStatementView({
           <div className="font-mono text-sm text-zinc-100">Import complete</div>
           <div className="font-mono text-xs text-zinc-400 max-w-xs leading-relaxed">
             {savedCount + autoCount} entered ({autoCount} auto-categorized, {savedCount} reviewed) · {dupCount} already entered before, skipped · {skippedCount} skipped by you.
+            {combinedCount > 0 && <> {combinedCount} row(s) were merged into combined entries.</>}
           </div>
           {attachStatus === "saved" && (
             <div className="font-mono text-[11px] text-zinc-500 flex items-center gap-1.5">
