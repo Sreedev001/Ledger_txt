@@ -1,5 +1,5 @@
 import React, { useState, useRef, useMemo, useEffect } from "react";
-import { Undo2, Redo2, Plus, AlignLeft, MoreVertical, X, Download, Pencil, Trash2, Layers, HelpCircle, Type, AlignJustify, Landmark, ChevronLeft, ChevronRight, CalendarDays, Receipt, FileText, Check, SkipForward, Loader2, Paperclip, Cloud, CloudOff } from "lucide-react";
+import { Undo2, Redo2, Plus, AlignLeft, MoreVertical, X, Download, Pencil, Trash2, Layers, HelpCircle, Type, AlignJustify, Landmark, ChevronLeft, ChevronRight, CalendarDays, Receipt, FileText, Check, SkipForward, Loader2, Paperclip, Cloud, CloudOff, ChevronDown, Settings2 } from "lucide-react";
 import * as pdfjsLib from "pdfjs-dist";
 // NOTE: requires "pdfjs-dist" added to package.json dependencies (not part of
 // the previously-generated scaffold — see CONTEXT.md's package list, which
@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.16.0";
+const APP_VERSION = "1.17.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -2277,17 +2277,40 @@ function StatusToastPill({ toast, toastVisible }) {
   );
 }
 
-function SheetRow({ icon, label, onClick, danger }) {
+// Shared header for every full-screen view (Aggregate, Loans, Statement,
+// Import): one back chevron + one title, same look everywhere (1.17.0).
+function ScreenHeader({ title, onBack }) {
+  return (
+    <div
+      className="flex items-center gap-1 px-2 py-2 bg-[#151517] border-b border-zinc-800/80 shrink-0"
+      style={{ paddingTop: "calc(0.5rem + env(safe-area-inset-top))" }}
+    >
+      <button onClick={onBack} title="Back" className="flex items-center gap-0.5 pl-1 pr-2 py-1.5 rounded-md text-zinc-300 hover:text-white active:bg-zinc-800">
+        <ChevronLeft size={20} />
+        <span className="font-mono text-xs">Back</span>
+      </button>
+      <span className="flex-1 min-w-0 truncate text-center font-mono text-xs uppercase tracking-widest text-zinc-400 pr-14">{title}</span>
+    </div>
+  );
+}
+
+// Small group label used inside bottom sheets (1.17.0).
+function SheetSection({ children }) {
+  return <div className="px-1 pt-3 pb-1.5 font-mono text-[10px] uppercase tracking-widest text-zinc-500">{children}</div>;
+}
+
+function SheetRow({ icon, label, onClick, danger, hint }) {
   return (
     <button
       onClick={onClick}
       className={
-        "w-full flex items-center gap-3 px-3 py-3 rounded-lg font-mono text-sm text-left " +
+        "w-full flex items-center gap-3 px-3 py-2.5 rounded-lg font-mono text-sm text-left " +
         (danger ? "text-rose-400 hover:bg-rose-950/40" : "text-zinc-200 hover:bg-zinc-800")
       }
     >
       {icon}
-      {label}
+      <span className="flex-1 min-w-0 truncate">{label}</span>
+      {hint != null && hint !== "" && <span className="shrink-0 text-[11px] text-zinc-500">{hint}</span>}
     </button>
   );
 }
@@ -3316,13 +3339,7 @@ export default function LedgerApp() {
     return (
       <div className="h-screen flex flex-col bg-black text-zinc-100">
         <StatusToastPill toast={toast} toastVisible={toastVisible} />
-        <div className="flex items-center gap-3 px-4 py-3 bg-[#151517] shrink-0">
-          <button onClick={() => setShowingAgg(false)} className="flex items-center gap-1 -ml-1 px-1 py-1 text-zinc-300 hover:text-white">
-            <X size={20} />
-            <span className="font-mono text-xs">Close</span>
-          </button>
-          <span className="font-mono text-xs uppercase tracking-widest text-zinc-400">Aggregate — {monthLabel(activeMonth)}</span>
-        </div>
+        <ScreenHeader title={`Aggregate — ${monthLabel(activeMonth)}`} onBack={() => setShowingAgg(false)} />
         <AggregateView accounts={monthSlice(accounts, activeMonth)} />
       </div>
     );
@@ -3332,13 +3349,7 @@ export default function LedgerApp() {
     return (
       <div className="h-screen flex flex-col bg-black text-zinc-100">
         <StatusToastPill toast={toast} toastVisible={toastVisible} />
-        <div className="flex items-center gap-3 px-4 py-3 bg-[#151517] shrink-0">
-          <button onClick={() => setShowingLoans(false)} className="flex items-center gap-1 -ml-1 px-1 py-1 text-zinc-300 hover:text-white">
-            <X size={20} />
-            <span className="font-mono text-xs">Close</span>
-          </button>
-          <span className="font-mono text-xs uppercase tracking-widest text-zinc-400">Outstanding Loans</span>
-        </div>
+        <ScreenHeader title="Outstanding Loans" onBack={() => setShowingLoans(false)} />
         <LoansView accounts={accounts} defaultCutoff={activeMonth} />
       </div>
     );
@@ -3348,13 +3359,7 @@ export default function LedgerApp() {
     return (
       <div className="h-screen flex flex-col bg-black text-zinc-100">
         <StatusToastPill toast={toast} toastVisible={toastVisible} />
-        <div className="flex items-center gap-3 px-4 py-3 bg-[#151517] shrink-0">
-          <button onClick={() => setShowingStatement(false)} className="flex items-center gap-1 -ml-1 px-1 py-1 text-zinc-300 hover:text-white">
-            <X size={20} />
-            <span className="font-mono text-xs">Close</span>
-          </button>
-          <span className="font-mono text-xs uppercase tracking-widest text-zinc-400">Statement</span>
-        </div>
+        <ScreenHeader title="Statement" onBack={() => setShowingStatement(false)} />
         <StatementView
           accounts={accounts}
           defaultAccount={activeAccount}
@@ -3372,19 +3377,10 @@ export default function LedgerApp() {
     return (
       <div className="h-screen flex flex-col bg-black text-zinc-100">
         <StatusToastPill toast={toast} toastVisible={toastVisible} />
-        <div className="flex items-center gap-3 px-4 py-3 bg-[#151517] shrink-0">
-          <button
-            onClick={() => {
+        <ScreenHeader title="Import Statement" onBack={() => {
               setShowingImport(false);
               setPendingImportAttachment(null);
-            }}
-            className="flex items-center gap-1 -ml-1 px-1 py-1 text-zinc-300 hover:text-white"
-          >
-            <X size={20} />
-            <span className="font-mono text-xs">Close</span>
-          </button>
-          <span className="font-mono text-xs uppercase tracking-widest text-zinc-400">Import Statement</span>
-        </div>
+            }} />
         <ImportStatementView
           accounts={accounts}
           setAccounts={setAccounts}
@@ -3418,88 +3414,51 @@ export default function LedgerApp() {
 
   return (
     <div className="h-screen flex flex-col bg-black">
-      {/* top bar */}
+      {/* top bar (1.17.0): only the essentials — account, month, one menu.
+          Undo/Redo and the Text|Summary switch moved to the bottom dock;
+          Totals + Statements moved into the menu. */}
       <div
-        className="flex items-center px-3 py-2.5 bg-[#151517] shrink-0 overflow-x-auto"
+        className="flex items-center gap-2 px-3 py-2 bg-[#151517] border-b border-zinc-800/80 shrink-0"
         style={{
           paddingLeft: "calc(0.75rem + env(safe-area-inset-left))",
           paddingRight: "calc(0.75rem + env(safe-area-inset-right))",
+          paddingTop: "calc(0.5rem + env(safe-area-inset-top))",
         }}
       >
-        <div className="flex items-center gap-1 shrink-0">
+        <button
+          onClick={() => openSheet("accounts")}
+          title="Switch account"
+          className="flex items-center gap-2 min-w-0 max-w-[48%] pl-1.5 pr-2 py-1.5 rounded-lg bg-zinc-800/70 active:bg-zinc-800"
+        >
+          <span className={"h-5 w-5 shrink-0 rounded-md text-[11px] font-bold text-zinc-900 flex items-center justify-center " + avatarColor(activeAccount)}>
+            {(activeAccount || "?").trim().charAt(0).toUpperCase()}
+          </span>
+          <span className="truncate font-mono text-sm font-semibold text-zinc-100">{activeAccount}</span>
+          <ChevronDown size={14} className="shrink-0 text-zinc-500" />
+        </button>
+
+        <div className="flex-1 min-w-0" />
+
+        <div className="flex items-center shrink-0">
           <button onClick={() => setActiveMonth((m) => addMonths(m, -1))} title="Previous month" className="p-1.5 text-zinc-500 hover:text-white active:text-white">
             <ChevronLeft size={18} />
           </button>
           <button
             onClick={() => openSheet("month")}
             title="Switch month"
-            className="px-3 py-1.5 rounded-md bg-zinc-800 text-zinc-100 font-mono text-sm font-semibold min-w-[86px] text-center"
+            className="px-1.5 py-1.5 rounded-md text-zinc-100 font-mono text-sm font-semibold min-w-[76px] text-center active:bg-zinc-800"
           >
             {monthLabel(activeMonth)}
           </button>
           <button onClick={() => setActiveMonth((m) => addMonths(m, 1))} title="Next month" className="p-1.5 text-zinc-500 hover:text-white active:text-white">
             <ChevronRight size={18} />
           </button>
-          <button
-            onClick={() => openSheet("accounts")}
-            title="Switch account"
-            className={"px-2.5 py-1.5 rounded-md flex items-center justify-center font-mono text-sm font-bold text-zinc-900 shrink-0 ml-1.5 leading-tight text-center " + avatarColor(activeAccount)}
-          >
-            {activeAccount}
-          </button>
         </div>
 
-        {/* flexible spacer — keeps the two groups pinned to opposite ends
-            when everything fits, but (unlike justify-between) never forces
-            the right group off the edge of the scroll container if the
-            content is ever wider than the screen (narrow devices, large
-            system font scaling, a display cutout eating into the safe
-            width, etc.) — the row just becomes horizontally scrollable
-            instead of clipping the rightmost button (e.g. the "More" menu)
-            out of reach. */}
-        <div className="flex-1 min-w-[8px]" />
-
-        {/* Text | Summary toggle (1.14.0) */}
-        <div className="flex items-center shrink-0 rounded-md bg-zinc-800 p-0.5 mr-1 font-mono text-[11px]">
-          {[["text", "Text"], ["summary", "Summary"]].map(([mode, label]) => (
-            <button
-              key={mode}
-              onClick={() => {
-                setViewMode(mode);
-                if (mode === "summary") setIsEditable(false);
-              }}
-              className={
-                "px-2 py-1 rounded " +
-                (viewMode === mode ? "bg-zinc-600 text-white font-semibold" : "text-zinc-400")
-              }
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-
-        <div className="flex items-center gap-1 shrink-0">
-          <button onClick={runUndo} title="Undo" className="p-2 text-zinc-400 hover:text-white active:text-white">
-            <Undo2 size={19} />
-          </button>
-          <button onClick={runRedo} title="Redo" className="p-2 text-zinc-400 hover:text-white active:text-white">
-            <Redo2 size={19} />
-          </button>
-          <button onClick={() => openSheet("attachments")} title="Attached statements" className="relative p-2 text-zinc-400 hover:text-white active:text-white">
-            <Paperclip size={19} />
-            {attachCount > 0 && (
-              <span className="absolute top-0.5 right-0.5 min-w-[13px] h-[13px] px-[3px] rounded-full bg-teal-600 text-white text-[9px] font-mono leading-[13px] text-center">
-                {attachCount}
-              </span>
-            )}
-          </button>
-          <button onClick={() => openSheet("totals")} title="Totals" className="p-2 text-zinc-400 hover:text-white active:text-white">
-            <AlignLeft size={19} />
-          </button>
-          <button onClick={() => openSheet("menu")} title="More" className="p-2 text-zinc-400 hover:text-white active:text-white">
-            <MoreVertical size={19} />
-          </button>
-        </div>
+        <button onClick={() => openSheet("menu")} title="Menu" className="relative p-2 -mr-1 text-zinc-300 hover:text-white active:text-white shrink-0">
+          <MoreVertical size={20} />
+          {attachCount > 0 && <span className="absolute top-1.5 right-1.5 h-2 w-2 rounded-full bg-teal-500" />}
+        </button>
       </div>
 
       {/* status pill: backup notifier + restore lock message (feature #41) */}
@@ -3517,88 +3476,113 @@ export default function LedgerApp() {
         spellCheck={false}
         style={{ fontSize: `${fontSize}px`, lineHeight: lineSpacing }}
         className={
-          "flex-1 w-full resize-none outline-none px-5 py-4 font-mono bg-black text-zinc-100 placeholder-zinc-700 caret-white " +
+          "flex-1 w-full resize-none outline-none px-5 pt-4 pb-28 font-mono bg-black text-zinc-100 placeholder-zinc-700 caret-white " +
           (!isEditable || restoreInProgress ? "opacity-80" : "")
         }
       />}
 
-      {/* read-only hint (Google-Docs-style): visible whenever the editor
-          is locked, tells the person how to unlock it. Hidden during a
-          restore, since the toast above already explains that lock. */}
-      {viewMode === "text" && !isEditable && !restoreInProgress && (
-        <div
-          className="pointer-events-none fixed left-1/2 -translate-x-1/2 z-40 px-3 py-1 rounded-full font-mono text-[10px] bg-zinc-800/90 text-zinc-400 shadow"
-          style={{ bottom: "calc(0.75rem + env(safe-area-inset-bottom))" }}
-        >
-          Double-tap to edit
-        </div>
-      )}
-
-      {/* accounts sheet */}
-      <BottomSheet open={sheet === "accounts"} onClose={closeSheet} title="Accounts">
-        <div className="flex flex-col gap-1 mt-1">
-          {Object.keys(accounts)
-            .filter((name) => accounts[name]?.[activeMonth] !== undefined || name === activeAccount)
-            .map((name) => (
+      {/* bottom dock (1.17.0): Text|Summary switch, plus Undo/Redo in Text view.
+          Also carries the "Double-tap to edit" hint while the editor is locked. */}
+      <div
+        className="pointer-events-none fixed left-0 right-0 z-40 flex flex-col items-center gap-1.5"
+        style={{ bottom: "calc(0.75rem + env(safe-area-inset-bottom))" }}
+      >
+        {viewMode === "text" && !isEditable && !restoreInProgress && (
+          <div className="px-3 py-1 rounded-full font-mono text-[10px] bg-zinc-800/90 text-zinc-400 shadow">Double-tap to edit</div>
+        )}
+        <div className="pointer-events-auto flex items-center gap-0.5 rounded-full bg-zinc-900/95 border border-zinc-800 shadow-lg p-1 font-mono text-xs backdrop-blur">
+          {viewMode === "text" && (
+            <>
+              <button onClick={runUndo} title="Undo" className="h-8 w-8 rounded-full flex items-center justify-center text-zinc-300 active:bg-zinc-700">
+                <Undo2 size={16} />
+              </button>
+              <button onClick={runRedo} title="Redo" className="h-8 w-8 rounded-full flex items-center justify-center text-zinc-300 active:bg-zinc-700">
+                <Redo2 size={16} />
+              </button>
+              <div className="h-4 w-px bg-zinc-700 mx-1" />
+            </>
+          )}
+          {[["text", "Text"], ["summary", "Summary"]].map(([mode, label]) => (
             <button
-              key={name}
+              key={mode}
               onClick={() => {
-                setActiveAccount(name);
-                closeSheet();
+                setViewMode(mode);
+                if (mode === "summary") setIsEditable(false);
               }}
-              className={
-                "flex items-center gap-3 px-3 py-2.5 rounded-lg font-mono text-sm text-left " +
-                (name === activeAccount ? "bg-zinc-800 text-white" : "text-zinc-300 hover:bg-zinc-800/60")
-              }
+              className={"px-3.5 h-8 rounded-full " + (viewMode === mode ? "bg-zinc-600 text-white font-semibold" : "text-zinc-400")}
             >
-              <span
-                className={
-                  "h-12 min-w-[3.25rem] shrink-0 rounded-lg flex items-center justify-center text-center px-1.5 py-1 text-[11px] font-semibold leading-tight break-words text-zinc-900 " +
-                  avatarColor(name)
-                }
-              >
-                {name}
-              </span>
-              {accounts[name]?.[activeMonth] === undefined && (
-                <span className="text-[10px] text-zinc-600 font-normal">no entry this month</span>
-              )}
+              {label}
             </button>
           ))}
-          <SheetRow icon={<Plus size={17} />} label="New account" onClick={addAccount} />
-          <div className="h-px bg-zinc-800 my-1" />
-          <SheetRow
-            icon={<Layers size={17} />}
-            label={`Aggregate — ${monthLabel(activeMonth)}`}
-            onClick={() => {
-              setShowingAgg(true);
-              closeSheet();
-            }}
-          />
-          <SheetRow
-            icon={<Landmark size={17} />}
-            label="Outstanding loans"
-            onClick={() => {
-              setShowingLoans(true);
-              closeSheet();
-            }}
-          />
-          <SheetRow
-            icon={<Receipt size={17} />}
-            label="Statement"
-            onClick={() => {
-              setShowingStatement(true);
-              closeSheet();
-            }}
-          />
-          <SheetRow
-            icon={<FileText size={17} />}
-            label="Import bank statement"
-            onClick={() => {
-              setPendingImportAttachment(null);
-              setShowingImport(true);
-              closeSheet();
-            }}
-          />
+        </div>
+      </div>
+
+      {/* accounts sheet (1.17.0): compact 2-column chips + a tidy tools grid */}
+      <BottomSheet open={sheet === "accounts"} onClose={closeSheet} title="Accounts">
+        <div className="grid grid-cols-2 gap-2 mt-1">
+          {Object.keys(accounts)
+            .filter((name) => accounts[name]?.[activeMonth] !== undefined || name === activeAccount)
+            .map((name) => {
+              const isActive = name === activeAccount;
+              const empty = accounts[name]?.[activeMonth] === undefined;
+              return (
+                <button
+                  key={name}
+                  onClick={() => {
+                    setActiveAccount(name);
+                    closeSheet();
+                  }}
+                  className={
+                    "flex items-center gap-2.5 min-w-0 px-2.5 py-2 rounded-xl font-mono text-sm text-left border " +
+                    (isActive ? "bg-zinc-800 border-teal-700 text-white" : "border-zinc-800 text-zinc-300 active:bg-zinc-800/60")
+                  }
+                >
+                  <span className={"h-7 w-7 shrink-0 rounded-lg flex items-center justify-center text-xs font-bold text-zinc-900 " + avatarColor(name)}>
+                    {name.trim().charAt(0).toUpperCase()}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate leading-tight">{name}</span>
+                    {empty && <span className="block text-[10px] text-zinc-500 leading-tight">no entry yet</span>}
+                  </span>
+                  {isActive && <Check size={14} className="shrink-0 text-teal-400" />}
+                </button>
+              );
+            })}
+          <button
+            onClick={addAccount}
+            className="flex items-center justify-center gap-2 px-2.5 py-2 rounded-xl border border-dashed border-zinc-700 text-zinc-400 font-mono text-sm active:bg-zinc-800/60"
+          >
+            <Plus size={16} /> New account
+          </button>
+        </div>
+
+        <SheetSection>Reports & tools</SheetSection>
+        <div className="grid grid-cols-2 gap-2">
+          {[
+            [<Layers size={18} key="a" />, "Aggregate", () => setShowingAgg(true)],
+            [<Landmark size={18} key="l" />, "Loans", () => setShowingLoans(true)],
+            [<Receipt size={18} key="s" />, "Statement", () => setShowingStatement(true)],
+            [
+              <FileText size={18} key="i" />,
+              "Import",
+              () => {
+                setPendingImportAttachment(null);
+                setShowingImport(true);
+              },
+            ],
+          ].map(([icon, label, fn]) => (
+            <button
+              key={label}
+              onClick={() => {
+                fn();
+                closeSheet();
+              }}
+              className="flex items-center gap-2.5 px-3 py-2.5 rounded-xl bg-zinc-800/50 text-zinc-200 font-mono text-sm active:bg-zinc-800"
+            >
+              <span className="text-zinc-400">{icon}</span>
+              {label}
+            </button>
+          ))}
         </div>
       </BottomSheet>
 
@@ -3692,32 +3676,38 @@ export default function LedgerApp() {
         />
       </BottomSheet>
 
-      {/* menu sheet */}
+      {/* menu sheet (1.17.0): grouped — View / Text / Backup / Account / Help */}
       <BottomSheet open={sheet === "menu"} onClose={closeSheet} title="Menu">
-        <div className="flex flex-col gap-1 mt-1">
-          <SheetRow icon={<CalendarDays size={17} />} label={`Change month — ${monthLabel(activeMonth)}`} onClick={() => setSheet("month")} />
-          <div className="h-px bg-zinc-800 my-1" />
-          <Stepper
-            icon={<Type size={17} />}
-            label="Text size"
-            display={`${fontSize}px`}
-            onDecrease={() => adjustFontSize(-1)}
-            onIncrease={() => adjustFontSize(1)}
-            disabledDec={fontSize <= FONT_SIZE_MIN}
-            disabledInc={fontSize >= FONT_SIZE_MAX}
-          />
-          <Stepper
-            icon={<AlignJustify size={17} />}
-            label="Line spacing"
-            display={`${lineSpacing.toFixed(1)}×`}
-            onDecrease={() => adjustLineSpacing(-0.1)}
-            onIncrease={() => adjustLineSpacing(0.1)}
-            disabledDec={lineSpacing <= LINE_SPACING_MIN}
-            disabledInc={lineSpacing >= LINE_SPACING_MAX}
-          />
-          <div className="h-px bg-zinc-800 my-1" />
+        <div className="flex flex-col gap-0.5">
+          <SheetSection>View</SheetSection>
+          <SheetRow icon={<AlignLeft size={17} />} label="Totals" onClick={() => setSheet("totals")} />
+          <SheetRow icon={<Paperclip size={17} />} label="Attached statements" hint={attachCount > 0 ? attachCount : ""} onClick={() => setSheet("attachments")} />
+
+          <SheetSection>Text</SheetSection>
+          <div className="rounded-xl bg-zinc-800/40 py-0.5">
+            <Stepper
+              icon={<Type size={17} />}
+              label="Text size"
+              display={`${fontSize}px`}
+              onDecrease={() => adjustFontSize(-1)}
+              onIncrease={() => adjustFontSize(1)}
+              disabledDec={fontSize <= FONT_SIZE_MIN}
+              disabledInc={fontSize >= FONT_SIZE_MAX}
+            />
+            <Stepper
+              icon={<AlignJustify size={17} />}
+              label="Line spacing"
+              display={`${lineSpacing.toFixed(1)}×`}
+              onDecrease={() => adjustLineSpacing(-0.1)}
+              onIncrease={() => adjustLineSpacing(0.1)}
+              disabledDec={lineSpacing <= LINE_SPACING_MIN}
+              disabledInc={lineSpacing >= LINE_SPACING_MAX}
+            />
+          </div>
+
+          <SheetSection>Backup</SheetSection>
           {googleConnected ? (
-            <div className="px-3 py-2.5 rounded-lg font-mono text-sm text-zinc-200">
+            <div className="px-3 py-2.5 rounded-xl bg-zinc-800/40 font-mono text-sm text-zinc-200">
               <div className="flex items-center gap-3 text-zinc-300">
                 <Cloud size={17} className={backupStatus === "working" ? "animate-pulse text-teal-400" : "text-teal-500"} />
                 <div className="flex-1 min-w-0">
@@ -3756,10 +3746,10 @@ export default function LedgerApp() {
           ) : (
             <SheetRow icon={<CloudOff size={17} />} label="Back up to Google Drive" onClick={signInToGoogle} />
           )}
-          <div className="h-px bg-zinc-800 my-1" />
+          <SheetSection>{activeAccount}</SheetSection>
           <SheetRow icon={<Pencil size={17} />} label="Rename account" onClick={renameAccount} />
           <SheetRow icon={<Trash2 size={17} />} label={`Delete ${monthLabel(activeMonth)} entries`} onClick={deleteAccount} danger />
-          <div className="h-px bg-zinc-800 my-1" />
+          <SheetSection>Help</SheetSection>
           <SheetRow icon={<HelpCircle size={17} />} label={showHelp ? "Hide format guide" : "Format guide"} onClick={() => setShowHelp((s) => !s)} />
           {showHelp && (
             <div className="mx-3 mb-1 p-3 rounded-lg border border-teal-900 bg-teal-950/40 font-mono text-[11px] leading-relaxed text-teal-200">
@@ -3802,8 +3792,8 @@ export default function LedgerApp() {
               order against that person's loan(s) automatically. Both entries are left exactly as you typed them — the app
               never writes anything back onto the Loan line itself. All loan tracking (who still owes what, and the
               repayment history behind it) lives in the Outstanding Loans report, computed live and never written into
-              your workbook text or counted toward Sub incoming/outgoing/Balance. See Accounts (tap your avatar) →
-              Outstanding loans to view every account's remaining balances and repayment history, and to combine two or
+              your workbook text or counted toward Sub incoming/outgoing/Balance. See Accounts (tap the account name at the top left) →
+              Loans to view every account's remaining balances and repayment history, and to combine two or
               more accounts' loans into one summed view.
               <br />
               <br />
@@ -3914,7 +3904,7 @@ function SummaryView({ parsed, fontSize, account, month, showToast }) {
   }
 
   return (
-    <div className="flex-1 overflow-y-auto px-5 py-4 font-mono bg-black select-none" style={fs}>
+    <div className="flex-1 overflow-y-auto px-5 pt-4 pb-28 font-mono bg-black select-none" style={fs}>
       {/* view-only controls: organiser + export */}
       <div className="flex items-center justify-between gap-2 mb-2 text-[11px]">
         <div className="flex items-center rounded-md bg-zinc-800 p-0.5">
