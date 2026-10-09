@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.20.0";
+const APP_VERSION = "1.21.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -1623,6 +1623,42 @@ function resultToEntries(r) {
       remark: cleanRemark(r.eRemark),
     },
   ];
+}
+
+// PASS-THROUGH BALANCE (1.21.0). A (=) category is money received and paid
+// straight back out. The ledger text keeps no direction on its lines, so the
+// import tracks it itself: per (category, subcategory) it adds up what came IN
+// (credit rows) and what went OUT (debit rows) from this import -- both the
+// auto-applied rows (`autoItems`: {category, sub, amount, type, label}) and the
+// saved review results (whole entry or split parts ticked Pass-through). Any
+// non-zero difference is real money and the user is asked to enter it.
+// Amounts are compared in paise. netC > 0: more came in than went out.
+function passBalances(autoItems, resultsArr) {
+  const map = {};
+  const add = (cat, sub, amount, type, label) => {
+    const c = (cat || "").trim();
+    if (!c) return;
+    const sb = (sub || "").trim();
+    const key = `${normLabel(c)}::${normLabel(sb)}`;
+    const g = map[key] || (map[key] = { key, title: c, sub: sb, inC: 0, outC: 0, label: "" });
+    const cents = toCents(amount);
+    if (type === "credit") g.inC += cents;
+    else g.outC += cents;
+    if (label) g.label = label;
+  };
+  (autoItems || []).forEach((a) => add(a.category, a.sub, a.amount, a.type, a.label));
+  (resultsArr || []).forEach((r) => {
+    if (!r || r.status !== "saved") return;
+    const label = (r.eDate && dayLabelFromISO(r.eDate)) || "";
+    if (r.split && Array.isArray(r.splits)) {
+      r.splits.forEach((sp) => {
+        if (sp.pass) add(sp.category, sp.sub, sp.amount, r.eType, label);
+      });
+    } else if (r.ePass) {
+      add(r.eCategory, r.eSub, r.eAmount, r.eType, label);
+    }
+  });
+  return Object.values(map).map((g) => ({ ...g, netC: g.inC - g.outC }));
 }
 
 // Reconstructs visual text rows from a PDF.js getTextContent() item list by
@@ -3899,7 +3935,8 @@ export default function LedgerApp() {
               added some of your own), only that leftover/gap is real money — record that part separately as a
               normal <code>(+)</code> or <code>(-)</code> entry.{" "}
               When importing a bank statement, tick <strong>Pass-through (=)</strong> on an entry's form (or on a
-              single part of a split) to file it under a <code>(=):</code> category.
+              single part of a split) to file it under a <code>(=):</code> category. If the money in and money out of a pass-through
+              don't match, the import asks you to enter the leftover balance as a normal entry.
               <br />
               Entries look like <code>Label - amount</code>; chain several with <code>+</code>.
               <br />
@@ -5146,6 +5183,13 @@ function ImportStatementView({
   // so the rebuild is deterministic no matter what order rows were edited.
   const [reviewBaseText, setReviewBaseText] = useState("");
   const [reviewBaseSignatures, setReviewBaseSignatures] = useState([]);
+  // Pass-through balance check (1.21.0): auto-applied (=) rows of this import,
+  // the balance entries the user made, groups they chose to leave, and the
+  // balance-entry form being filled in (or null).
+  const [autoPass, setAutoPass] = useState([]);
+  const [balanceEntries, setBalanceEntries] = useState([]);
+  const [balSkipped, setBalSkipped] = useState([]);
+  const [balForm, setBalForm] = useState(null);
 
   const savedCount = results.filter((r) => r?.status === "saved").length;
   const skippedCount = results.filter((r) => r?.status === "skipped").length;
@@ -5327,7 +5371,7 @@ function ImportStatementView({
   // rather than action order, editing an earlier row — or finally filling
   // in a row that was skipped — lands that row back in its correct
   // position instead of at the end, and never disturbs any other row.
-  function rebuildLedgerFromResults(resultsArr) {
+  function rebuildLedgerFromResults(resultsArr, balArr = balanceEntries) {
     const pageKey = `${targetAccount}::${targetMonth}`;
     let text = reviewBaseText;
     let order = entryOrder[pageKey] || { counter: 0, seq: {}, slot: {} };
@@ -5363,6 +5407,11 @@ function ImportStatementView({
           for (const m of r.combo) if (m !== i && queue[m]) sigs.push(queue[m].signature);
         }
       }
+    });
+    // Balance entries the user made for leftover pass-through money (1.21.0):
+    // plain (+)/(-) lines, replayed last so every rebuild keeps them.
+    balArr.forEach((b) => {
+      text = insertLedgerEntry(text, b);
     });
     setAccounts((prev) => ({ ...prev, [targetAccount]: { ...prev[targetAccount], [targetMonth]: text } }));
     setStmtImported((prev) => ({ ...prev, [targetAccount]: [...reviewBaseSignatures, ...sigs] }));
@@ -5438,9 +5487,19 @@ function ImportStatementView({
     let auto = 0;
     let workingText = pageText;
     const newSignatures = [];
+    const autoPassItems = [];
     for (const t of fresh) {
       const learned = catMap[normalizeDesc(t.description)];
       if (learned) {
+        if (learned.sign === "=") {
+          autoPassItems.push({
+            category: learned.category,
+            sub: learned.sub,
+            amount: t.amount,
+            type: t.guessedType === "credit" ? "credit" : "debit",
+            label: dayLabelFromISO(t.dateISO),
+          });
+        }
         workingText = insertLedgerEntry(workingText, {
           categoryTitle: learned.category,
           sign: learned.sign,
@@ -5462,6 +5521,10 @@ function ImportStatementView({
       setStmtImported((prev) => ({ ...prev, [targetAccount]: [...(prev[targetAccount] || []), ...newSignatures] }));
     }
     setEntryOrder((prev) => ({ ...prev, [pageKey]: order }));
+    setAutoPass(autoPassItems);
+    setBalanceEntries([]);
+    setBalSkipped([]);
+    setBalForm(null);
     setAutoCount(auto);
     setQueue(toReview);
     setResults(toReview.map(() => null));
@@ -5644,6 +5707,61 @@ function ImportStatementView({
     rebuildLedgerFromResults(newResults);
     goToNextUndecided(newResults);
   }
+
+  /* ---- PASS-THROUGH BALANCE CHECK (1.21.0) ---- */
+  const passGroups = passBalances(autoPass, results).map((g) => {
+    const made = balanceEntries.filter((b) => b.key === g.key);
+    const resolvedC = made.reduce((a, b) => a + b.resolveC, 0);
+    return { ...g, made, remainC: g.netC - resolvedC };
+  });
+  const passOpen = passGroups.filter((g) => g.remainC !== 0 && !balSkipped.includes(g.key));
+  function openBalForm(g) {
+    const sign = g.remainC > 0 ? "+" : "-";
+    setBalForm({
+      key: g.key,
+      sign,
+      category: "",
+      sub: "",
+      amount: String(Math.abs(g.remainC) / 100),
+      remark: cleanRemark(`Pass-through balance${g.sub ? " - " + g.sub : ""}`),
+      label: g.label || "Balance",
+      dir: g.remainC > 0 ? 1 : -1,
+    });
+  }
+  function saveBalForm() {
+    const f = balForm;
+    if (!f) return;
+    const amt = parseFloat(f.amount);
+    if (isNaN(amt) || amt <= 0) {
+      showAlert("Enter a valid amount.");
+      return;
+    }
+    if (!f.category.trim()) {
+      showAlert("Pick or create a category for this balance entry.");
+      return;
+    }
+    const entry = {
+      key: f.key,
+      categoryTitle: f.category.trim(),
+      sign: f.sign,
+      subTitle: f.sub.trim(),
+      label: f.label,
+      amount: amt,
+      remark: cleanRemark(f.remark),
+      resolveC: f.dir * toCents(amt),
+    };
+    const next = [...balanceEntries, entry];
+    setBalanceEntries(next);
+    rebuildLedgerFromResults(results, next);
+    setBalForm(null);
+  }
+  function removeBalanceEntry(idx) {
+    const next = balanceEntries.filter((_, i) => i !== idx);
+    setBalanceEntries(next);
+    rebuildLedgerFromResults(results, next);
+  }
+  const balFormCats = balForm ? categoryChoices.filter((c) => c.sign === balForm.sign) : [];
+  const balFormSubs = balForm ? balFormCats.find((c) => normLabel(c.title) === normLabel(balForm.category))?.subs || [] : [];
 
   /* ---- SPLIT editing (1.16.0) ---- */
   function blankSplit() {
@@ -6371,6 +6489,113 @@ function ImportStatementView({
             {savedCount + autoCount} entered ({autoCount} auto-categorized, {savedCount} reviewed) · {dupCount} already entered before, skipped · {skippedCount} skipped by you.
             {combinedCount > 0 && <> {combinedCount} row(s) were merged into combined entries.</>}
           </div>
+          {passGroups.some((g) => g.remainC !== 0 || g.made.length > 0) && (
+            <div className="w-full max-w-sm mt-3 text-left flex flex-col gap-2">
+              {passGroups
+                .filter((g) => g.remainC !== 0 || g.made.length > 0)
+                .map((g) => {
+                  const name = g.sub ? `${g.title} → ${g.sub}` : g.title;
+                  const open = g.remainC !== 0;
+                  const skipped = balSkipped.includes(g.key);
+                  const editing = balForm && balForm.key === g.key;
+                  return (
+                    <div key={g.key} className={"rounded-lg border p-3 " + (open && !skipped ? "border-amber-700 bg-amber-950/30" : "border-zinc-700 bg-zinc-900")}>
+                      <div className="font-mono text-xs text-zinc-100">Pass-through · {name}</div>
+                      <div className="font-mono text-[11px] text-zinc-400 mt-0.5">
+                        Money in {formatNum(g.inC / 100) || "0"} · money out {formatNum(g.outC / 100) || "0"}
+                      </div>
+                      {open ? (
+                        <div className={"font-mono text-[11px] mt-1 " + (skipped ? "text-zinc-500" : "text-amber-300")}>
+                          {formatNum(Math.abs(g.remainC) / 100)} {g.remainC > 0 ? "more came in than went out" : "more went out than came in"} — that balance is real money. Make an entry for it.
+                        </div>
+                      ) : (
+                        <div className="font-mono text-[11px] mt-1 text-teal-300">Balanced ✓</div>
+                      )}
+                      {g.made.map((b) => (
+                        <div key={balanceEntries.indexOf(b)} className="flex items-center justify-between font-mono text-[11px] text-zinc-300 mt-1">
+                          <span>
+                            Entered {b.sign === "+" ? "income" : "expense"} {formatNum(b.amount)} · {b.categoryTitle}
+                            {b.subTitle ? ` → ${b.subTitle}` : ""}
+                          </span>
+                          <button onClick={() => removeBalanceEntry(balanceEntries.indexOf(b))} className="p-1 text-zinc-500 hover:text-rose-400" title="Remove this balance entry">
+                            <X size={13} />
+                          </button>
+                        </div>
+                      ))}
+                      {open && !editing && (
+                        <div className="flex gap-2 mt-2">
+                          <button onClick={() => { setBalSkipped((p) => p.filter((k) => k !== g.key)); openBalForm(g); }} className="flex-1 py-2 rounded-lg bg-amber-700 hover:bg-amber-600 font-mono text-xs text-white">
+                            Enter {formatNum(Math.abs(g.remainC) / 100)}
+                          </button>
+                          {!skipped && (
+                            <button onClick={() => setBalSkipped((p) => [...p, g.key])} className="px-3 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 font-mono text-xs text-zinc-300">
+                              Not now
+                            </button>
+                          )}
+                        </div>
+                      )}
+                      {editing && (
+                        <div className="flex flex-col gap-1 mt-2">
+                          <div className="flex gap-2">
+                            {[["+", "Income (+)"], ["-", "Expense (−)"]].map(([sg, lb]) => (
+                              <button
+                                key={sg}
+                                onClick={() => setBalForm((f) => ({ ...f, sign: sg, category: "", sub: "" }))}
+                                className={"flex-1 py-2 rounded-lg font-mono text-xs " + (balForm.sign === sg ? (sg === "+" ? "bg-emerald-800/60 text-emerald-200" : "bg-rose-800/60 text-rose-200") : "bg-zinc-800 text-zinc-400")}
+                              >
+                                {lb}
+                              </button>
+                            ))}
+                          </div>
+                          <label className={stmtLabelCls}>Amount</label>
+                          <input type="number" inputMode="decimal" value={balForm.amount} onChange={(e) => setBalForm((f) => ({ ...f, amount: e.target.value }))} className={stmtInputCls} />
+                          <label className={stmtLabelCls}>Category</label>
+                          <select
+                            value={balForm.category}
+                            onChange={(e) => {
+                              if (e.target.value === "__new__") askPrompt("New category name:", "", (name) => { if (name && name.trim()) setBalForm((f) => ({ ...f, category: name.trim(), sub: "" })); });
+                              else setBalForm((f) => ({ ...f, category: e.target.value, sub: "" }));
+                            }}
+                            className={stmtInputCls}
+                          >
+                            <option value="">Select…</option>
+                            {balFormCats.map((c) => (
+                              <option key={c.title} value={c.title}>{c.title}</option>
+                            ))}
+                            {balForm.category && !balFormCats.some((c) => normLabel(c.title) === normLabel(balForm.category)) && (
+                              <option value={balForm.category}>{balForm.category} (new)</option>
+                            )}
+                            <option value="__new__">+ New category…</option>
+                          </select>
+                          <label className={stmtLabelCls}>Subcategory (optional)</label>
+                          <select
+                            value={balForm.sub}
+                            onChange={(e) => {
+                              if (e.target.value === "__new__") askPrompt("New subcategory name:", "", (name) => setBalForm((f) => ({ ...f, sub: (name || "").trim() })));
+                              else setBalForm((f) => ({ ...f, sub: e.target.value }));
+                            }}
+                            className={stmtInputCls}
+                          >
+                            <option value="">None</option>
+                            {balFormSubs.map((n) => (
+                              <option key={n} value={n}>{n}</option>
+                            ))}
+                            {balForm.sub && !balFormSubs.includes(balForm.sub) && <option value={balForm.sub}>{balForm.sub} (new)</option>}
+                            <option value="__new__">+ New subcategory…</option>
+                          </select>
+                          <label className={stmtLabelCls}>Remarks</label>
+                          <input type="text" value={balForm.remark} onChange={(e) => setBalForm((f) => ({ ...f, remark: e.target.value }))} className={stmtInputCls} />
+                          <div className="flex gap-2 mt-2">
+                            <button onClick={saveBalForm} className="flex-1 py-2 rounded-lg bg-teal-700 hover:bg-teal-600 font-mono text-xs text-white">Save entry</button>
+                            <button onClick={() => setBalForm(null)} className="px-3 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 font-mono text-xs text-zinc-300">Cancel</button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+            </div>
+          )}
           {attachStatus === "saved" && (
             <div className="font-mono text-[11px] text-zinc-500 flex items-center gap-1.5">
               <FileText size={12} /> PDF saved to {targetAccount} · {monthLabel(targetMonth)} — find it under Statement any time.
