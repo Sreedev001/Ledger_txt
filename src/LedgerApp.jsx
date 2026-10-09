@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.19.0";
+const APP_VERSION = "1.20.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -1518,7 +1518,7 @@ function insertLedgerEntry(text, { categoryTitle, sign, subTitle, label, amount,
 function categoryOptionsFor(text) {
   const parsed = parseLedger(text);
   return parsed.blocks
-    .filter((b) => b.sign === "+" || b.sign === "-")
+    .filter((b) => b.sign === "+" || b.sign === "-" || b.sign === "=") // "=" (1.20.0): pass-through, offered only when the form's Pass-through box is ticked
     .map((b) => ({ title: b.title, sign: b.sign, subs: b.subs.map((s) => s.title) }));
 }
 
@@ -1600,12 +1600,13 @@ function checkSplit(total, splits) {
 // single place that decides what a result writes, used by
 // rebuildLedgerFromResults (and by the simulation that tests it).
 function resultToEntries(r) {
-  const sign = r.eType === "credit" ? "+" : "-";
+  const dirSign = r.eType === "credit" ? "+" : "-";
+  const sign = r.ePass ? "=" : dirSign; // 1.20.0: Pass-through box -> (=) category
   const label = (r.eDate && dayLabelFromISO(r.eDate)) || (r.eDesc || "").slice(0, 20) || "Entry";
   if (r.split && Array.isArray(r.splits) && r.splits.length) {
     return r.splits.map((s) => ({
       categoryTitle: (s.category || "").trim(),
-      sign,
+      sign: s.pass ? "=" : dirSign,
       subTitle: (s.sub || "").trim(),
       label,
       amount: parseFloat(s.amount),
@@ -3896,7 +3897,9 @@ export default function LedgerApp() {
               it's a record you can read back, without it ever landing in a number that's supposed to reflect only
               your own money. If the amount you actually spent ever differs from what you were given (you kept or
               added some of your own), only that leftover/gap is real money — record that part separately as a
-              normal <code>(+)</code> or <code>(-)</code> entry.
+              normal <code>(+)</code> or <code>(-)</code> entry.{" "}
+              When importing a bank statement, tick <strong>Pass-through (=)</strong> on an entry's form (or on a
+              single part of a split) to file it under a <code>(=):</code> category.
               <br />
               Entries look like <code>Label - amount</code>; chain several with <code>+</code>.
               <br />
@@ -5154,6 +5157,9 @@ function ImportStatementView({
   const [eType, setEType] = useState("debit");
   const [eCategory, setECategory] = useState("");
   const [eSub, setESub] = useState("");
+  // ePass (1.20.0): "Pass-through" box -- the entry is written under a (=)
+  // category (money received and paid straight back out for someone else).
+  const [ePass, setEPass] = useState(false);
   // ---- Remarks / Split / Combine (1.16.0) ----
   // eRemark: optional free-text note, written as the entry's trailing "(...)"
   //   and shown in the Statement's Remarks column.
@@ -5278,6 +5284,7 @@ function ImportStatementView({
     setEType(t.guessedType === "credit" ? "credit" : "debit");
     setECategory("");
     setESub("");
+    setEPass(false);
     setERemark("");
     setESplit(false);
     setESplits([]);
@@ -5303,6 +5310,7 @@ function ImportStatementView({
       setEType(r.eType);
       setECategory(r.eCategory);
       setESub(r.eSub);
+      setEPass(!!r.ePass);
       setERemark(r.eRemark || "");
       setESplit(!!r.split);
       setESplits(r.splits || []);
@@ -5519,7 +5527,8 @@ function ImportStatementView({
   const pageTextNow = accounts[targetAccount]?.[targetMonth] ?? "";
   const categoryChoices = useMemo(() => categoryOptionsFor(pageTextNow), [pageTextNow]);
   const wantedSign = eType === "credit" ? "+" : "-";
-  const matchingCategories = categoryChoices.filter((c) => c.sign === wantedSign);
+  const entrySign = ePass ? "=" : wantedSign; // sign the whole entry is written under
+  const matchingCategories = categoryChoices.filter((c) => c.sign === entrySign);
   const currentCatSubs = matchingCategories.find((c) => normLabel(c.title) === normLabel(eCategory))?.subs || [];
 
   function pickNewCategory() {
@@ -5582,6 +5591,7 @@ function ImportStatementView({
       eType,
       eCategory: eCategory.trim(),
       eSub: eSub.trim(),
+      ePass,
       eRemark,
       split: eSplit,
       splits: eSplit ? eSplits : [],
@@ -5620,7 +5630,7 @@ function ImportStatementView({
         ...prev,
         [targetAccount]: {
           ...(prev[targetAccount] || {}),
-          [normalizeDesc(t.description)]: { category: snapshot.eCategory, sign: wantedSign, sub: snapshot.eSub },
+          [normalizeDesc(t.description)]: { category: snapshot.eCategory, sign: entrySign, sub: snapshot.eSub },
         },
       }));
     }
@@ -5637,13 +5647,13 @@ function ImportStatementView({
 
   /* ---- SPLIT editing (1.16.0) ---- */
   function blankSplit() {
-    return { amount: "", category: "", sub: "", remark: "" };
+    return { amount: "", category: "", sub: "", remark: "", pass: false };
   }
   function toggleSplit(on) {
     setESplit(on);
     if (on && eSplits.length === 0) {
       // First part inherits whatever category was already chosen above.
-      setESplits([{ ...blankSplit(), category: eCategory, sub: eSub }, blankSplit()]);
+      setESplits([{ ...blankSplit(), category: eCategory, sub: eSub, pass: ePass }, blankSplit()]);
     }
   }
   function updateSplit(k, patch) {
@@ -5672,9 +5682,13 @@ function ImportStatementView({
   // Category / subcategory choices for one split part: what the ledger page
   // already has for this direction, plus anything a sibling part just created
   // (so a brand-new category typed once can be reused by another part).
+  function splitSignFor(k) {
+    return eSplits[k]?.pass ? "=" : wantedSign;
+  }
   function splitCategoryNames(k) {
-    const names = matchingCategories.map((c) => c.title);
+    const names = categoryChoices.filter((c) => c.sign === splitSignFor(k)).map((c) => c.title);
     for (const sp of eSplits) {
+      if (!!sp.pass !== !!eSplits[k]?.pass) continue;
       const c = (sp.category || "").trim();
       if (c && !names.some((n) => normLabel(n) === normLabel(c))) names.push(c);
     }
@@ -5682,8 +5696,9 @@ function ImportStatementView({
   }
   function splitSubNames(k) {
     const cat = eSplits[k]?.category || "";
-    const subs = [...(matchingCategories.find((c) => normLabel(c.title) === normLabel(cat))?.subs || [])];
+    const subs = [...(categoryChoices.find((c) => c.sign === splitSignFor(k) && normLabel(c.title) === normLabel(cat))?.subs || [])];
     for (const sp of eSplits) {
+      if (!!sp.pass !== !!eSplits[k]?.pass) continue;
       const sb = (sp.sub || "").trim();
       if (sb && normLabel(sp.category || "") === normLabel(cat) && !subs.some((x) => normLabel(x) === normLabel(sb))) subs.push(sb);
     }
@@ -5775,6 +5790,7 @@ function ImportStatementView({
       eType,
       eCategory: "",
       eSub: "",
+      ePass: false,
       eRemark: note,
       split: false,
       splits: [],
@@ -6147,6 +6163,24 @@ function ImportStatementView({
 
           {!eSplit && (
             <>
+            <label className="flex items-center gap-3 mt-3 font-mono text-sm text-zinc-100">
+              <input
+                type="checkbox"
+                checked={ePass}
+                onChange={(e) => {
+                  setEPass(e.target.checked);
+                  setECategory("");
+                  setESub("");
+                }}
+                className="w-5 h-5 accent-teal-500"
+              />
+              Pass-through (=)
+            </label>
+            {ePass && (
+              <div className="font-mono text-[11px] text-zinc-400 mt-1">
+                Not your income or expense — goes under a (=) category and is left out of Sub incoming/outgoing, Balance and reports.
+              </div>
+            )}
             <label className={stmtLabelCls}>Category</label>
             <select
               value={eCategory}
@@ -6236,6 +6270,15 @@ function ImportStatementView({
                         rest
                       </button>
                     </div>
+                    <label className="flex items-center gap-2 font-mono text-xs text-zinc-300">
+                      <input
+                        type="checkbox"
+                        checked={!!sp.pass}
+                        onChange={(e) => updateSplit(k, { pass: e.target.checked, category: "", sub: "" })}
+                        className="w-4 h-4 accent-teal-500"
+                      />
+                      Pass-through (=)
+                    </label>
                     <select
                       value={sp.category}
                       onChange={(e) => {
