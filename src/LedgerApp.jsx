@@ -1,5 +1,5 @@
 import React, { useState, useRef, useMemo, useEffect } from "react";
-import { Undo2, Redo2, Plus, AlignLeft, MoreVertical, X, Download, Pencil, Trash2, Layers, HelpCircle, Type, AlignJustify, Landmark, ChevronLeft, ChevronRight, CalendarDays, Receipt, FileText, Check, SkipForward, Loader2, Paperclip, Cloud, CloudOff, ChevronDown, Settings2 } from "lucide-react";
+import { Undo2, Redo2, Plus, MoreVertical, X, Download, Pencil, Trash2, HelpCircle, Type, AlignJustify, ChevronLeft, ChevronRight, CalendarDays, FileText, Check, SkipForward, Loader2, Paperclip, Cloud, CloudOff, ChevronDown, Settings2 } from "lucide-react";
 import * as pdfjsLib from "pdfjs-dist";
 // NOTE: requires "pdfjs-dist" added to package.json dependencies (not part of
 // the previously-generated scaffold — see CONTEXT.md's package list, which
@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.21.0";
+const APP_VERSION = "1.22.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -124,15 +124,6 @@ function monthLabel(monthKey) {
 // of an example a user could mistake for their own data.
 function starterLine(accountName, monthKey) {
   return `${accountName} account ${MONTHS_FULL[monthIdxOf(monthKey)]}\n\n`;
-}
-
-// Flattens the nested { account: { month: text } } shape into a single
-// account-name -> text map for one month, filling in "" for any account
-// that has no page in that month yet. Used by the Aggregate report.
-function monthSlice(accounts, month) {
-  const slice = {};
-  for (const acct of Object.keys(accounts)) slice[acct] = accounts[acct]?.[month] ?? "";
-  return slice;
 }
 
 // ---- prep for the planned date-wise (bank-statement-style) report ----
@@ -2073,6 +2064,23 @@ const STORAGE_DRIVE_ATTACH_IDS = "ledger_drive_attach_ids_v1";
 //   opted out on; cleared again on any successful sign-in.
 const STORAGE_GOOGLE_CONNECTED = "ledger_google_connected_v1";
 const STORAGE_GOOGLE_DECLINED = "ledger_google_declined_v1";
+// 1.22.0: the short-lived Drive access token (+ expiry) is kept so an app
+// restart reuses it instead of going back through Google at all.
+const STORAGE_GOOGLE_TOKEN = "ledger_google_token_v1";
+const GOOGLE_TOKEN_TTL_MS = 50 * 60 * 1000;
+function loadCachedGoogleToken() {
+  try {
+    const t = JSON.parse(localStorage.getItem(STORAGE_GOOGLE_TOKEN) || "null");
+    if (t && t.token && t.exp > Date.now()) return t.token;
+  } catch {}
+  return null;
+}
+function saveCachedGoogleToken(token) {
+  try {
+    if (token) localStorage.setItem(STORAGE_GOOGLE_TOKEN, JSON.stringify({ token, exp: Date.now() + GOOGLE_TOKEN_TTL_MS }));
+    else localStorage.removeItem(STORAGE_GOOGLE_TOKEN);
+  } catch {}
+}
 
 /* =========================================================================
    GOOGLE DRIVE BACKUP (feature #40, user-requested)
@@ -2479,6 +2487,23 @@ function SheetRow({ icon, label, onClick, danger, hint }) {
   );
 }
 
+// Collapsible group row for the Menu sheet (1.22.0).
+function DropdownRow({ icon, label, open, onToggle, children }) {
+  return (
+    <div>
+      <button
+        onClick={onToggle}
+        className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg font-mono text-sm text-left text-zinc-200 hover:bg-zinc-800"
+      >
+        {icon}
+        <span className="flex-1 min-w-0 truncate">{label}</span>
+        <ChevronDown size={15} className={"shrink-0 text-zinc-500 transition-transform " + (open ? "rotate-180" : "")} />
+      </button>
+      {open && <div className="ml-3 pl-2 border-l border-zinc-800 flex flex-col gap-0.5 mb-1">{children}</div>}
+    </div>
+  );
+}
+
 function Stepper({ icon, label, display, onDecrease, onIncrease, disabledDec, disabledInc }) {
   return (
     <div className="flex items-center justify-between px-3 py-2.5 rounded-lg font-mono text-sm text-zinc-200">
@@ -2579,9 +2604,6 @@ export default function LedgerApp() {
       return monthKeyNow();
     }
   });
-  const [showingAgg, setShowingAgg] = useState(false);
-  const [showingLoans, setShowingLoans] = useState(false);
-  const [showingStatement, setShowingStatement] = useState(false);
   const [showingImport, setShowingImport] = useState(false);
   // Set when an already-attached statement PDF is reopened via the
   // attachments sheet or the Statement report's attachment list, instead of
@@ -2591,6 +2613,8 @@ export default function LedgerApp() {
   // and on close) so a stale reopen never bleeds into a later normal import.
   const [pendingImportAttachment, setPendingImportAttachment] = useState(null);
   const [showHelp, setShowHelp] = useState(false);
+  // Which dropdown group is open in the Menu sheet: null | "display" | "accounts"
+  const [menuGroup, setMenuGroup] = useState(null);
   const [stmtPasswords, setStmtPasswords] = useState(() => {
     try {
       const saved = localStorage.getItem(STORAGE_STMT_PASSWORDS);
@@ -2656,7 +2680,10 @@ export default function LedgerApp() {
   const backupDebounceRef = useRef(null);
   const googleInitedRef = useRef(false);
 
-  const [sheet, setSheet] = useState(null); // null | 'accounts' | 'totals' | 'menu' | 'attachments'
+  const [sheet, setSheet] = useState(null); // null | 'accounts' | 'month' | 'menu' | 'attachments'
+  useEffect(() => {
+    if (sheet !== "menu") setMenuGroup(null); // dropdowns start collapsed every time the menu opens
+  }, [sheet]);
   const [dialog, setDialog] = useState(null);
   // Mirrors the live count from AttachmentsSheetBody for the currently open
   // account+month, purely to show/hide the small badge on the top-bar
@@ -2954,7 +2981,6 @@ export default function LedgerApp() {
   function openAttachmentInImport(rec, account, month) {
     const file = new File([rec.blob], rec.filename, { type: rec.blob.type || "application/pdf" });
     setPendingImportAttachment({ file, account, month });
-    setShowingStatement(false);
     closeSheet();
     setShowingImport(true);
   }
@@ -3006,7 +3032,7 @@ export default function LedgerApp() {
       if (localStorage.getItem(STORAGE_GOOGLE_DECLINED) === "1") return;
     } catch {}
     try {
-      await getGoogleAccessToken();
+      await getGoogleAccessToken(true); // first-ever connection only (googleConnected is false here)
       backupNow();
     } catch (err) {
       // No account has ever been connected on this device and the silent
@@ -3027,6 +3053,7 @@ export default function LedgerApp() {
       });
       const token = res.result.accessToken?.token;
       accessTokenRef.current = token;
+      saveCachedGoogleToken(token);
       setGoogleAccount({ email: res.result.profile?.email, displayName: res.result.profile?.name });
       setGoogleConnected(true);
       try {
@@ -3049,8 +3076,21 @@ export default function LedgerApp() {
   // session — no UI), and only fall back to the interactive login() if
   // that silent path fails outright (e.g. the user actually revoked access
   // from their Google account, not just an app restart clearing memory).
-  async function getGoogleAccessToken() {
+  //
+  // 1.22.0: `interactive` is false by default. Once an account is connected
+  // the picker is NEVER shown again automatically: the order is in-memory
+  // token -> saved token (still within its lifetime) -> silent refresh. If
+  // all of those fail the call throws, and the Menu's backup card offers a
+  // "Reconnect" button (explicit tap) instead of a surprise account chooser.
+  // Only the first-ever connection and the fresh-install restore pass true.
+  async function getGoogleAccessToken(interactive = false) {
     if (accessTokenRef.current) return accessTokenRef.current;
+    const cached = loadCachedGoogleToken();
+    if (cached) {
+      accessTokenRef.current = cached;
+      setGoogleConnected(true);
+      return cached;
+    }
     try {
       const status = await SocialLogin.isLoggedIn({ provider: "google" });
       if (status?.isLoggedIn) {
@@ -3058,6 +3098,7 @@ export default function LedgerApp() {
         const token = res?.result?.accessToken?.token || res?.accessToken?.token;
         if (token) {
           accessTokenRef.current = token;
+          saveCachedGoogleToken(token);
           setGoogleConnected(true);
           // A silent refresh doesn't always carry profile info back — only
           // update googleAccount if it did, otherwise leave whatever's
@@ -3070,6 +3111,9 @@ export default function LedgerApp() {
     } catch (err) {
       console.warn("Silent Google token refresh failed, falling back to interactive sign-in:", err);
     }
+    if (!interactive) {
+      throw new Error("Google session expired — tap Reconnect in the Menu");
+    }
     // Silent path didn't yield a token — last resort, may show UI. This is
     // also the path a brand-new device/account takes, since there's no
     // prior session to silently refresh — reaching it doesn't require the
@@ -3081,6 +3125,7 @@ export default function LedgerApp() {
     });
     const token = res.result.accessToken?.token;
     accessTokenRef.current = token;
+    saveCachedGoogleToken(token);
     setGoogleConnected(true);
     try {
       localStorage.removeItem(STORAGE_GOOGLE_DECLINED);
@@ -3096,6 +3141,7 @@ export default function LedgerApp() {
       await SocialLogin.logout({ provider: "google" });
     } catch {}
     accessTokenRef.current = null;
+    saveCachedGoogleToken(null);
     setGoogleAccount(null);
     setGoogleConnected(false);
     try {
@@ -3140,6 +3186,7 @@ export default function LedgerApp() {
     } catch (err) {
       console.warn("Google Drive backup failed:", err);
       accessTokenRef.current = null; // force a fresh token next attempt — covers an expired-token 401
+      saveCachedGoogleToken(null);
       setBackupStatus("error");
       setBackupError(String(err.message || err));
       showToast("Backup failed", { tone: "error", autoHideMs: 2500 });
@@ -3150,13 +3197,13 @@ export default function LedgerApp() {
   // required — used both by the menu's "Restore latest" button (wrapped in
   // its own confirm, below) and by the fresh-install prompt (which already
   // got its own confirmation from the user before calling this).
-  async function performRestore() {
+  async function performRestore(interactive = false) {
     setRestoreInProgress(true);
     setBackupStatus("working");
     setBackupError("");
     showToast("Restoring your data…", { autoHideMs: 0 });
     try {
-      let token = await getGoogleAccessToken();
+      let token = await getGoogleAccessToken(interactive);
       const payload = await downloadBackupFromDrive(token);
       if (!payload) {
         setBackupStatus("idle");
@@ -3180,7 +3227,7 @@ export default function LedgerApp() {
   function restoreFromGoogleDrive() {
     askConfirm(
       "Restore from your Google Drive backup? This replaces everything currently on this device — all accounts, months, and statement attachments — with what's in the backup.",
-      performRestore,
+      () => performRestore(false),
       { danger: true, confirmLabel: "Restore" }
     );
   }
@@ -3208,7 +3255,7 @@ export default function LedgerApp() {
   );
   useEffect(() => {
     if (!isFreshInstallRef.current) return;
-    performRestore();
+    performRestore(true); // fresh install: the one place the picker is expected
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -3354,8 +3401,6 @@ export default function LedgerApp() {
           // month. Just switch to it instead of leaving the user stuck.
           showAlert(`"${trimmed}" already has a page for ${monthLabel(activeMonth)} — switching to it.`);
           setActiveAccount(trimmed);
-          setShowingAgg(false);
-          setShowingStatement(false);
           if (sheet === "month-new") closeMonthNewSheet();
           return;
         }
@@ -3369,8 +3414,6 @@ export default function LedgerApp() {
         // typing would.
         setAccounts((prev) => ({ ...prev, [trimmed]: { ...prev[trimmed], [activeMonth]: starterLine(trimmed, activeMonth) } }));
         setActiveAccount(trimmed);
-        setShowingAgg(false);
-        setShowingStatement(false);
         if (sheet === "month-new") closeMonthNewSheet();
         return;
       }
@@ -3381,8 +3424,6 @@ export default function LedgerApp() {
       // blank + placeholder text.
       setAccounts((prev) => ({ ...prev, [trimmed]: { [activeMonth]: starterLine(trimmed, activeMonth) } }));
       setActiveAccount(trimmed);
-      setShowingAgg(false);
-      setShowingStatement(false);
       // the fresh-month nudge is non-dismissible and has no Close button of
       // its own, so creating the account from inside it is what closes it
       if (sheet === "month-new") closeMonthNewSheet();
@@ -3450,53 +3491,73 @@ export default function LedgerApp() {
     });
   }
 
-  // Deletes just the currently viewed month's page for this account, not
-  // the whole account identity — its other months' pages are untouched. If
-  // this was the account's only page, the identity itself is removed too
-  // (an account with zero pages isn't meaningful to keep around), same as
-  // "delete account" used to work back when there was only ever one page.
-  function deleteAccount() {
-    const monthsForAcct = Object.keys(accounts[activeAccount] || {});
-    const wholeIdentityGoes = monthsForAcct.length <= 1;
-    const remainingIdentities = Object.keys(accounts).length - (wholeIdentityGoes ? 1 : 0);
-    if (remainingIdentities < 1) {
+  // Removes the whole account: every month's page, its entry-order tracking,
+  // its import dedupe log and its attached PDFs. Needs at least one other
+  // account to remain.
+  function removeAccount() {
+    const name = activeAccount;
+    const others = Object.keys(accounts).filter((n) => n !== name);
+    if (others.length < 1) {
       showAlert("You need at least one account.");
       return;
     }
     askConfirm(
-      wholeIdentityGoes
-        ? `Delete account "${activeAccount}"? It has no other months, so this removes it entirely.`
-        : `Delete "${activeAccount}"'s ${monthLabel(activeMonth)} entries? Its other months are untouched.`,
+      `Remove account "${name}" and ALL of its months, entries and attached statements? This can't be undone.`,
       () => {
         setAccounts((prev) => {
           const next = { ...prev };
-          const months = { ...next[activeAccount] };
-          delete months[activeMonth];
-          if (Object.keys(months).length === 0) delete next[activeAccount];
-          else next[activeAccount] = months;
+          delete next[name];
           return next;
         });
         setEntryOrder((prev) => {
           const next = { ...prev };
-          if (wholeIdentityGoes) {
-            const prefix = `${activeAccount}::`;
-            for (const key of Object.keys(next)) {
-              if (key.startsWith(prefix)) delete next[key];
-            }
-          } else {
-            delete next[`${activeAccount}::${activeMonth}`];
-          }
+          const prefix = `${name}::`;
+          for (const key of Object.keys(next)) if (key.startsWith(prefix)) delete next[key];
           return next;
         });
-        // Any PDFs attached to the page(s) being removed would otherwise be
-        // orphaned in IndexedDB — unreachable from the UI, just quietly
-        // taking up space forever. Fire-and-forget: the ledger deletion
-        // above already happened and must not wait on/be blocked by this.
-        if (wholeIdentityGoes) deleteAttachmentsForAccount(activeAccount).catch(() => {});
-        else deleteAttachmentsForPage(activeAccount, activeMonth).catch(() => {});
+        setStmtImported((prev) => {
+          const next = { ...prev };
+          delete next[name];
+          return next;
+        });
+        deleteAttachmentsForAccount(name).catch(() => {});
+        setActiveAccount(others.find((n) => accounts[n]?.[activeMonth] !== undefined) || others[0]);
+        setIsEditable(false);
         closeSheet();
       },
-      { danger: true, confirmLabel: "Delete" }
+      { danger: true, confirmLabel: "Remove" }
+    );
+  }
+
+  // Clears the text of every month of this account but keeps the account
+  // itself (each page goes back to its starter line). Statement PDFs stay
+  // attached; the import dedupe log is cleared so those statements can be
+  // imported again.
+  function deleteAllEntries() {
+    const name = activeAccount;
+    askConfirm(
+      `Delete ALL entries in "${name}" (every month)? The account stays, but its pages go blank. This can't be undone.`,
+      () => {
+        setAccounts((prev) => {
+          const months = prev[name] || {};
+          const cleared = {};
+          for (const mk of Object.keys(months)) cleared[mk] = starterLine(name, mk);
+          return { ...prev, [name]: cleared };
+        });
+        setEntryOrder((prev) => {
+          const next = { ...prev };
+          const prefix = `${name}::`;
+          for (const key of Object.keys(next)) if (key.startsWith(prefix)) delete next[key];
+          return next;
+        });
+        setStmtImported((prev) => {
+          const next = { ...prev };
+          delete next[name];
+          return next;
+        });
+        closeSheet();
+      },
+      { danger: true, confirmLabel: "Delete all" }
     );
   }
 
@@ -3505,44 +3566,6 @@ export default function LedgerApp() {
   }
   function adjustLineSpacing(delta) {
     setLineSpacing((s) => Math.min(LINE_SPACING_MAX, Math.max(LINE_SPACING_MIN, Math.round((s + delta) * 10) / 10)));
-  }
-
-  if (showingAgg) {
-    return (
-      <div className="h-screen flex flex-col bg-black text-zinc-100">
-        <StatusToastPill toast={toast} toastVisible={toastVisible} />
-        <ScreenHeader title={`Aggregate — ${monthLabel(activeMonth)}`} onBack={() => setShowingAgg(false)} />
-        <AggregateView accounts={monthSlice(accounts, activeMonth)} />
-      </div>
-    );
-  }
-
-  if (showingLoans) {
-    return (
-      <div className="h-screen flex flex-col bg-black text-zinc-100">
-        <StatusToastPill toast={toast} toastVisible={toastVisible} />
-        <ScreenHeader title="Loans / Lended" onBack={() => setShowingLoans(false)} />
-        <LoansView accounts={accounts} defaultCutoff={activeMonth} />
-      </div>
-    );
-  }
-
-  if (showingStatement) {
-    return (
-      <div className="h-screen flex flex-col bg-black text-zinc-100">
-        <StatusToastPill toast={toast} toastVisible={toastVisible} />
-        <ScreenHeader title="Statement" onBack={() => setShowingStatement(false)} />
-        <StatementView
-          accounts={accounts}
-          defaultAccount={activeAccount}
-          defaultMonth={activeMonth}
-          entryOrder={entryOrder}
-          setEntryOrder={setEntryOrder}
-          onOpenAttachment={openAttachmentInImport}
-          showToast={showToast}
-        />
-      </div>
-    );
   }
 
   if (showingImport) {
@@ -3636,7 +3659,23 @@ export default function LedgerApp() {
       {/* status pill: backup notifier + restore lock message (feature #41) */}
       <StatusToastPill toast={toast} toastVisible={toastVisible} />
 
-      {viewMode === "summary" && <SummaryView parsed={parsed} fontSize={fontSize} account={activeAccount} month={activeMonth} showToast={showToast} />}
+      {viewMode === "summary" && <SummaryView parsed={parsed} fontSize={fontSize} account={activeAccount} month={activeMonth} showToast={showToast} accounts={accounts} />}
+
+      {/* Statement (1.22.0): a third view next to Text and Summary instead of a
+          separate full-screen report. It still has its own account/month pickers. */}
+      {viewMode === "statement" && (
+        <div className="flex-1 min-h-0 flex flex-col pb-24 bg-black">
+          <StatementView
+            accounts={accounts}
+            defaultAccount={activeAccount}
+            defaultMonth={activeMonth}
+            entryOrder={entryOrder}
+            setEntryOrder={setEntryOrder}
+            onOpenAttachment={openAttachmentInImport}
+            showToast={showToast}
+          />
+        </div>
+      )}
 
       {/* blank editor */}
       {viewMode === "text" && <textarea
@@ -3674,12 +3713,12 @@ export default function LedgerApp() {
               <div className="h-4 w-px bg-zinc-700 mx-1" />
             </>
           )}
-          {[["text", "Text"], ["summary", "Summary"]].map(([mode, label]) => (
+          {[["text", "Text"], ["summary", "Summary"], ["statement", "Statement"]].map(([mode, label]) => (
             <button
               key={mode}
               onClick={() => {
                 setViewMode(mode);
-                if (mode === "summary") setIsEditable(false);
+                if (mode !== "text") setIsEditable(false);
               }}
               className={"px-3.5 h-8 rounded-full " + (viewMode === mode ? "bg-zinc-600 text-white font-semibold" : "text-zinc-400")}
             >
@@ -3728,34 +3767,16 @@ export default function LedgerApp() {
           </button>
         </div>
 
-        <SheetSection>Reports & tools</SheetSection>
-        <div className="grid grid-cols-2 gap-2">
-          {[
-            [<Layers size={18} key="a" />, "Aggregate", () => setShowingAgg(true)],
-            [<Landmark size={18} key="l" />, "Loans/Lended", () => setShowingLoans(true)],
-            [<Receipt size={18} key="s" />, "Statement", () => setShowingStatement(true)],
-            [
-              <FileText size={18} key="i" />,
-              "Import",
-              () => {
-                setPendingImportAttachment(null);
-                setShowingImport(true);
-              },
-            ],
-          ].map(([icon, label, fn]) => (
-            <button
-              key={label}
-              onClick={() => {
-                fn();
-                closeSheet();
-              }}
-              className="flex items-center gap-2.5 px-3 py-2.5 rounded-xl bg-zinc-800/50 text-zinc-200 font-mono text-sm active:bg-zinc-800"
-            >
-              <span className="text-zinc-400">{icon}</span>
-              {label}
-            </button>
-          ))}
-        </div>
+        <SheetSection>Tools</SheetSection>
+        <SheetRow
+          icon={<FileText size={17} />}
+          label="Import statement"
+          onClick={() => {
+            setPendingImportAttachment(null);
+            setShowingImport(true);
+            closeSheet();
+          }}
+        />
       </BottomSheet>
 
       {/* new month nudge: no account has a page here yet */}
@@ -3831,11 +3852,6 @@ export default function LedgerApp() {
         />
       </BottomSheet>
 
-      {/* totals sheet */}
-      <BottomSheet open={sheet === "totals"} onClose={closeSheet} title={`${activeAccount} · ${monthLabel(activeMonth)}`}>
-        <SectionTotals parsed={parsed} />
-      </BottomSheet>
-
       {/* attachments sheet — quick access to reopen a statement PDF already
           attached to the account+month currently open, without leaving the
           main editor or touching the file picker again */}
@@ -3848,15 +3864,17 @@ export default function LedgerApp() {
         />
       </BottomSheet>
 
-      {/* menu sheet (1.17.0): grouped — View / Text / Backup / Account / Help */}
+      {/* menu sheet (1.22.0): Attached statements · Display settings ▾ · Accounts ▾ · Backup */}
       <BottomSheet open={sheet === "menu"} onClose={closeSheet} title="Menu">
         <div className="flex flex-col gap-0.5">
-          <SheetSection>View</SheetSection>
-          <SheetRow icon={<AlignLeft size={17} />} label="Totals" onClick={() => setSheet("totals")} />
           <SheetRow icon={<Paperclip size={17} />} label="Attached statements" hint={attachCount > 0 ? attachCount : ""} onClick={() => setSheet("attachments")} />
 
-          <SheetSection>Text</SheetSection>
-          <div className="rounded-xl bg-zinc-800/40 py-0.5">
+          <DropdownRow
+            icon={<Settings2 size={17} />}
+            label="Display settings"
+            open={menuGroup === "display"}
+            onToggle={() => setMenuGroup((g) => (g === "display" ? null : "display"))}
+          >
             <Stepper
               icon={<Type size={17} />}
               label="Text size"
@@ -3875,7 +3893,82 @@ export default function LedgerApp() {
               disabledDec={lineSpacing <= LINE_SPACING_MIN}
               disabledInc={lineSpacing >= LINE_SPACING_MAX}
             />
-          </div>
+            <SheetRow icon={<HelpCircle size={17} />} label={showHelp ? "Hide format guide" : "Format guide"} onClick={() => setShowHelp((x) => !x)} />
+            {showHelp && (
+              <div className="mx-3 mb-1 p-3 rounded-lg border border-teal-900 bg-teal-950/40 font-mono text-[11px] leading-relaxed text-teal-200">
+                Mark a category <code>(+):</code> for credit, <code>(-):</code> for debit, or <code>(=):</code> for a
+                pass-through — money you received and paid straight back out on someone else's behalf (they send it,
+                you spend the exact same amount for them), so it's not really your income or expense. A{" "}
+                <code>(=):</code> category is written and totaled exactly like any other, but is left out of Sub
+                incoming/outgoing, Balance, and anywhere else the app rolls up your real totals —
+                it's a record you can read back, without it ever landing in a number that's supposed to reflect only
+                your own money. If the amount you actually spent ever differs from what you were given (you kept or
+                added some of your own), only that leftover/gap is real money — record that part separately as a
+                normal <code>(+)</code> or <code>(-)</code> entry.{" "}
+                When importing a bank statement, tick <strong>Pass-through (=)</strong> on an entry's form (or on a
+                single part of a split) to file it under a <code>(=):</code> category. If the money in and money out of a pass-through
+                don't match, the import asks you to enter the leftover balance as a normal entry.
+                <br />
+                Entries look like <code>Label - amount</code>; chain several with <code>+</code>.
+                <br />
+                Give a category subcategories by writing a plain label line (no dash) — e.g. <code>Fruits</code> — followed by its
+                entries and a <code>Fruits Total -</code> line. Add as many subcategories as you like, and close the whole category
+                with one more Total line (e.g. <code>Expense Total -</code>). A blank line between subcategories is optional.
+                <br />
+                Leave any Total, <code>Sub incoming -</code>, <code>Sub outgoing -</code>, or <code>Balance -</code> blank (or even a
+                stale number) and it keeps itself synced automatically as you edit.
+                <br />
+                <code>(-): Personal Outgoing</code> and <code>(+): Personal Incoming</code> are just plain categories — write
+                entries under them the same way as any other category. Nothing auto-mirrors between accounts.
+                <br />
+                <br />
+                <strong>Remarks, combine and split (bank-statement import):</strong> an entry can carry a remark in
+                parentheses at the end — <code>5 - 2700 (via Rahul)</code> — and it shows in the Statement's Remarks column
+                (and its PDF). While reviewing an imported transaction you can type a remark, tap{" "}
+                <em>Combine with next entries…</em> to fold several same-direction bank rows into one entry (it takes the
+                first row's date and adds a "Combined 10000 + 2500" remark), and tick <em>Split into several categories</em> to
+                spread one entry across categories and subcategories. A split must add up exactly to the entry amount or
+                the entry isn't made.
+                <br />
+                <br />
+                <strong>Loans:</strong> record a loan as an entry under <code>(+): Loan</code> (e.g. <code>Saneesh - 2000</code>).
+                Record repaying it as an entry with the same name under <code>(-): Loan repayment</code> — in that same account
+                (a loan is always repaid from the account it was taken in), and it doesn't have to be the full amount:
+                repayments can be partial, and split across several entries over several months, and they'll be applied in
+                order against that person's loan(s) automatically. Both entries are left exactly as you typed them — the app
+                never writes anything back onto the Loan line itself. All loan tracking (who still owes what, and the
+                repayment history behind it) lives in the Outstanding Loans report, computed live and never written into
+                your workbook text or counted toward Sub incoming/outgoing/Balance. Open Summary (bottom bar) and scroll down to the Loans / Lended section to view every account's remaining balances and repayment history, and to combine two or
+                more accounts' loans into one summed view.
+                <br />
+                <br />
+                <strong>Lended:</strong> money you lent to someone is the mirror image. Record it under <code>(-): Lended</code>{" "}
+                (e.g. <code>Rahul - 3000</code>) in the account it left, and record it coming back under{" "}
+                <code>(+): Lended repayment</code> with the same name, in that same account. Partial and multi-month
+                repayments are applied oldest-first, exactly like Loans. Both lines are normal entries (they count in
+                Sub outgoing / Sub incoming as usual); who still owes you what appears in Summary → Loans / Lended → Lended. <code>Lent</code> / <code>Lent repayment</code> also work as category names.
+                <br />
+                <br />
+                <strong>Months:</strong> every account is now a set of monthly pages — switch months with the ◀ / ▶ arrows
+                or the month pill in the top bar. An account doesn't need a page in every month; a blank one is created the
+                moment you type in it. Loans are the
+                exception: a loan and its repayment(s) can be in different months (same account only) and will still
+                match up in the Outstanding Loans report, which always reflects the full history. That report can also be
+                pointed at any month to see a snapshot as of that point in time, instead of always "right now."
+              </div>
+            )}
+          </DropdownRow>
+
+          <DropdownRow
+            icon={<Pencil size={17} />}
+            label={`Accounts · ${activeAccount}`}
+            open={menuGroup === "accounts"}
+            onToggle={() => setMenuGroup((g) => (g === "accounts" ? null : "accounts"))}
+          >
+            <SheetRow icon={<Pencil size={17} />} label="Rename account" onClick={renameAccount} />
+            <SheetRow icon={<Trash2 size={17} />} label="Remove account" onClick={removeAccount} danger />
+            <SheetRow icon={<Trash2 size={17} />} label="Delete all entries" onClick={deleteAllEntries} danger />
+          </DropdownRow>
 
           <SheetSection>Backup</SheetSection>
           {googleConnected ? (
@@ -3910,6 +4003,11 @@ export default function LedgerApp() {
                 >
                   Restore latest
                 </button>
+                {backupStatus === "error" && (
+                  <button onClick={signInToGoogle} className="px-2 py-1.5 rounded-md bg-teal-800 text-white text-xs hover:bg-teal-700">
+                    Reconnect
+                  </button>
+                )}
                 <button onClick={signOutOfGoogle} className="px-2 py-1.5 rounded-md bg-zinc-800 text-rose-400 text-xs hover:bg-rose-950/40">
                   Disconnect
                 </button>
@@ -3918,90 +4016,11 @@ export default function LedgerApp() {
           ) : (
             <SheetRow icon={<CloudOff size={17} />} label="Back up to Google Drive" onClick={signInToGoogle} />
           )}
-          <SheetSection>{activeAccount}</SheetSection>
-          <SheetRow icon={<Pencil size={17} />} label="Rename account" onClick={renameAccount} />
-          <SheetRow icon={<Trash2 size={17} />} label={`Delete ${monthLabel(activeMonth)} entries`} onClick={deleteAccount} danger />
-          <SheetSection>Help</SheetSection>
-          <SheetRow icon={<HelpCircle size={17} />} label={showHelp ? "Hide format guide" : "Format guide"} onClick={() => setShowHelp((s) => !s)} />
-          {showHelp && (
-            <div className="mx-3 mb-1 p-3 rounded-lg border border-teal-900 bg-teal-950/40 font-mono text-[11px] leading-relaxed text-teal-200">
-              Mark a category <code>(+):</code> for credit, <code>(-):</code> for debit, or <code>(=):</code> for a
-              pass-through — money you received and paid straight back out on someone else's behalf (they send it,
-              you spend the exact same amount for them), so it's not really your income or expense. A{" "}
-              <code>(=):</code> category is written and totaled exactly like any other, but is left out of Sub
-              incoming/outgoing, Balance, the Aggregate report, and anywhere else the app rolls up your real totals —
-              it's a record you can read back, without it ever landing in a number that's supposed to reflect only
-              your own money. If the amount you actually spent ever differs from what you were given (you kept or
-              added some of your own), only that leftover/gap is real money — record that part separately as a
-              normal <code>(+)</code> or <code>(-)</code> entry.{" "}
-              When importing a bank statement, tick <strong>Pass-through (=)</strong> on an entry's form (or on a
-              single part of a split) to file it under a <code>(=):</code> category. If the money in and money out of a pass-through
-              don't match, the import asks you to enter the leftover balance as a normal entry.
-              <br />
-              Entries look like <code>Label - amount</code>; chain several with <code>+</code>.
-              <br />
-              Give a category subcategories by writing a plain label line (no dash) — e.g. <code>Fruits</code> — followed by its
-              entries and a <code>Fruits Total -</code> line. Add as many subcategories as you like, and close the whole category
-              with one more Total line (e.g. <code>Expense Total -</code>). A blank line between subcategories is optional.
-              <br />
-              Leave any Total, <code>Sub incoming -</code>, <code>Sub outgoing -</code>, or <code>Balance -</code> blank (or even a
-              stale number) and it keeps itself synced automatically as you edit.
-              <br />
-              <code>(-): Personal Outgoing</code> and <code>(+): Personal Incoming</code> are just plain categories — write
-              entries under them the same way as any other category. Nothing auto-mirrors between accounts.
-              <br />
-              <br />
-              <strong>Remarks, combine and split (bank-statement import):</strong> an entry can carry a remark in
-              parentheses at the end — <code>5 - 2700 (via Rahul)</code> — and it shows in the Statement's Remarks column
-              (and its PDF). While reviewing an imported transaction you can type a remark, tap{" "}
-              <em>Combine with next entries…</em> to fold several same-direction bank rows into one entry (it takes the
-              first row's date and adds a "Combined 10000 + 2500" remark), and tick <em>Split into several categories</em> to
-              spread one entry across categories and subcategories. A split must add up exactly to the entry amount or
-              the entry isn't made.
-              <br />
-              <br />
-              <strong>Loans:</strong> record a loan as an entry under <code>(+): Loan</code> (e.g. <code>Saneesh - 2000</code>).
-              Record repaying it as an entry with the same name under <code>(-): Loan repayment</code> — in that same account
-              (a loan is always repaid from the account it was taken in), and it doesn't have to be the full amount:
-              repayments can be partial, and split across several entries over several months, and they'll be applied in
-              order against that person's loan(s) automatically. Both entries are left exactly as you typed them — the app
-              never writes anything back onto the Loan line itself. All loan tracking (who still owes what, and the
-              repayment history behind it) lives in the Outstanding Loans report, computed live and never written into
-              your workbook text or counted toward Sub incoming/outgoing/Balance. See Accounts (tap the account name at the top left) →
-              Loans to view every account's remaining balances and repayment history, and to combine two or
-              more accounts' loans into one summed view.
-              <br />
-              <br />
-              <strong>Lended:</strong> money you lent to someone is the mirror image. Record it under <code>(-): Lended</code>{" "}
-              (e.g. <code>Rahul - 3000</code>) in the account it left, and record it coming back under{" "}
-              <code>(+): Lended repayment</code> with the same name, in that same account. Partial and multi-month
-              repayments are applied oldest-first, exactly like Loans. Both lines are normal entries (they count in
-              Sub outgoing / Sub incoming as usual); who still owes you what appears under Accounts → Loans/Lended →
-              Lended. <code>Lent</code> / <code>Lent repayment</code> also work as category names.
-              <br />
-              <br />
-              <strong>Months:</strong> every account is now a set of monthly pages — switch months with the ◀ / ▶ arrows
-              or the month pill in the top bar. An account doesn't need a page in every month; a blank one is created the
-              moment you type in it. Loans are the
-              exception: a loan and its repayment(s) can be in different months (same account only) and will still
-              match up in the Outstanding Loans report, which always reflects the full history. That report can also be
-              pointed at any month to see a snapshot as of that point in time, instead of always "right now."
-            </div>
-          )}
           <div className="mt-2 pb-1 text-center font-mono text-[10px] text-zinc-600">LedgerApp v{APP_VERSION}</div>
         </div>
       </BottomSheet>
 
       <Dialog dialog={dialog} setDialog={setDialog} />
-    </div>
-  );
-}
-
-function Stat({ label, value, accent }) {
-  return (
-    <div className="rounded-lg border border-zinc-800 bg-zinc-800/60 px-3 py-2">
-      <div className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">{label}</div>
-      <div className={"font-mono text-lg font-semibold mt-0.5 " + (accent || "text-zinc-100")}>{formatNum(value) || "0"}</div>
     </div>
   );
 }
@@ -4049,7 +4068,7 @@ function buildSummaryModel(parsed, mode) {
   };
 }
 
-function SummaryView({ parsed, fontSize, account, month, showToast }) {
+function SummaryView({ parsed, fontSize, account, month, showToast, accounts }) {
   const [sortMode, setSortMode] = useState("typed");
   const [exporting, setExporting] = useState(false);
   const model = useMemo(() => buildSummaryModel(parsed, sortMode), [parsed, sortMode]);
@@ -4143,6 +4162,13 @@ function SummaryView({ parsed, fontSize, account, month, showToast }) {
           <Row label="Balance" value={model.balance} bold tone="text-teal-400" />
         </div>
       )}
+
+      {/* Loans / Lended (1.22.0): its own section below the summary. Report-only,
+          computed live across every account; nothing here is written to the ledger. */}
+      <div className="mt-8 pt-4 border-t-2 border-zinc-700">
+        <div className="text-[10px] uppercase tracking-widest text-zinc-400 mb-1">Loans / Lended</div>
+        <LoansView accounts={accounts} defaultCutoff={month} embedded />
+      </div>
     </div>
   );
 }
@@ -4243,175 +4269,7 @@ async function exportSummaryPdf(account, month, model, sortMode) {
   doc.save(filename);
 }
 
-function SectionTotals({ parsed }) {
-  return (
-    <div>
-      <div className="grid grid-cols-2 gap-2 mb-2 mt-1">
-        <Stat label="Sub incoming" value={parsed.subIncoming} accent="text-emerald-400" />
-        <Stat label="Sub outgoing" value={parsed.subOutgoing} accent="text-rose-400" />
-      </div>
-      <div className="rounded-lg border border-zinc-800 bg-zinc-800/60 px-3 py-2 mb-2">
-        <div className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Balance (computed)</div>
-        <div className="font-mono text-xl font-semibold mt-0.5 text-teal-400">{formatNum(parsed.balance) || "0"}</div>
-      </div>
-
-      {parsed.summaryMismatches.length > 0 && (
-        <div className="rounded-lg bg-rose-950/40 text-rose-300 font-mono text-[11px] px-3 py-2 mb-2 leading-relaxed">
-          {parsed.summaryMismatches.map((m, i) => (
-            <div key={i}>
-              ✗ your written {m.label} ({formatNum(m.value)}) differs from the computed value ({formatNum(m.computed)})
-            </div>
-          ))}
-        </div>
-      )}
-
-      {parsed.unparsedLines.length > 0 && (
-        <div className="rounded-lg bg-amber-950/40 text-amber-300 font-mono text-[11px] px-3 py-2 mb-2 leading-relaxed">
-          {parsed.unparsedLines.length} line(s) didn't match "Label - amount" and were skipped:
-          {parsed.unparsedLines.map((l, i) => (
-            <div key={i} className="opacity-80">
-              {l.trim()}
-            </div>
-          ))}
-        </div>
-      )}
-
-      {parsed.unclassified.length > 0 && (
-        <div className="rounded-lg bg-amber-950/40 text-amber-300 font-mono text-[11px] px-3 py-2 mb-2 leading-relaxed">
-          {parsed.unclassified.length} section(s) have no (+) / (-) marker, so they're excluded from totals:
-          {parsed.unclassified.map((b, i) => (
-            <div key={i} className="opacity-80">
-              {b.title}
-            </div>
-          ))}
-        </div>
-      )}
-
-      {parsed.passthrough.length > 0 && (
-        <div className="rounded-lg bg-zinc-800/60 text-zinc-300 font-mono text-[11px] px-3 py-2 mb-2 leading-relaxed">
-          {parsed.passthrough.length} section(s) are marked (=) pass-through, so they're intentionally excluded from Sub
-          incoming/outgoing, Balance, and the Aggregate report:
-          {parsed.passthrough.map((b, i) => (
-            <div key={i} className="opacity-80">
-              {b.title}
-            </div>
-          ))}
-        </div>
-      )}
-
-      <h2 className="font-mono text-[11px] uppercase tracking-widest text-zinc-500 mt-4 mb-2">Sections</h2>
-      {parsed.blocks.length === 0 && (
-        <div className="rounded-lg border border-zinc-800 bg-zinc-800/60 px-3 py-2 font-mono text-[11px] text-zinc-400 leading-relaxed">
-          Nothing parsed yet. Mark a section <code>(+):</code> or <code>(-):</code>, list entries as <code>Label - amount</code>, and
-          leave <code>Total -</code> blank to have it auto-filled.
-        </div>
-      )}
-      <div className="space-y-2">
-        {parsed.blocks.map((b, i) => (
-          <div key={i} className="rounded-lg border border-zinc-800 overflow-hidden">
-            <div className="flex items-center justify-between px-3 py-1.5 bg-zinc-800/60 font-mono text-xs">
-              <span className="font-semibold text-zinc-100">{b.title}</span>
-              <span
-                className={
-                  "text-[9px] uppercase tracking-wide px-2 py-0.5 rounded-full font-mono " +
-                  (normLabel(b.title) === "outstandingloans"
-                    ? "bg-sky-950/60 text-sky-300"
-                    : b.sign === "+"
-                    ? "bg-emerald-950/60 text-emerald-300"
-                    : b.sign === "-"
-                    ? "bg-rose-950/60 text-rose-300"
-                    : b.sign === "="
-                    ? "bg-zinc-700/60 text-zinc-300"
-                    : "bg-amber-950/60 text-amber-300")
-                }
-              >
-                {normLabel(b.title) === "outstandingloans"
-                  ? "report only"
-                  : b.sign === "+"
-                  ? "credit"
-                  : b.sign === "-"
-                  ? "debit"
-                  : b.sign === "="
-                  ? "pass-through"
-                  : "unmarked"}
-              </span>
-            </div>
-            <div className="px-3 py-1.5 font-mono text-xs flex justify-between text-zinc-400">
-              <span>computed sum</span>
-              <span>{formatNum(b.computedSum) || "0"}</span>
-            </div>
-            {b.declaredTotal !== null && (
-              <div className={"px-3 pb-1.5 font-mono text-xs flex justify-between " + (b.mismatch ? "text-rose-400 font-semibold" : "text-emerald-400")}>
-                <span>your Total line</span>
-                <span>
-                  {formatNum(b.declaredTotal)} {b.mismatch ? "✗" : "✓"}
-                </span>
-              </div>
-            )}
-            {b.subs.length > 0 && (
-              <div className="border-t border-zinc-800 divide-y divide-zinc-800/70">
-                {b.subs.map((s, si) => (
-                  <div key={si} className="px-3 py-1.5 flex items-center justify-between font-mono text-[11px] text-zinc-300">
-                    <span className="pl-2 border-l-2 border-zinc-700">{s.title}</span>
-                    <span className={s.mismatch ? "text-rose-400 font-semibold" : "text-zinc-400"}>
-                      {formatNum(s.computedSum) || "0"}
-                      {s.declaredTotal !== null ? (s.mismatch ? " ✗" : " ✓") : ""}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function AggregateView({ accounts }) {
-  const rows = Object.keys(accounts).map((name) => {
-    const p = parseLedger(accounts[name]);
-    return { name, ...p };
-  });
-  const gi = rows.reduce((a, r) => a + r.subIncoming, 0);
-  const go = rows.reduce((a, r) => a + r.subOutgoing, 0);
-
-  return (
-    <div className="flex-1 overflow-y-auto px-5 py-5">
-      <p className="font-mono text-[11px] text-zinc-500 mb-4 leading-relaxed">
-        Computed live from every account tab. Fix a mismatch in an account and this updates on its own.
-      </p>
-      <table className="w-full border-collapse font-mono text-xs">
-        <thead>
-          <tr>
-            <th className="text-left border border-zinc-800 bg-zinc-800/60 text-zinc-300 px-3 py-2">Account</th>
-            <th className="text-right border border-zinc-800 bg-zinc-800/60 text-zinc-300 px-3 py-2">Incoming</th>
-            <th className="text-right border border-zinc-800 bg-zinc-800/60 text-zinc-300 px-3 py-2">Outgoing</th>
-            <th className="text-right border border-zinc-800 bg-zinc-800/60 text-zinc-300 px-3 py-2">Balance</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r) => (
-            <tr key={r.name}>
-              <td className="text-left border border-zinc-800 text-zinc-200 px-3 py-2">{r.name}</td>
-              <td className="text-right border border-zinc-800 text-zinc-200 px-3 py-2">{formatNum(r.subIncoming) || "0"}</td>
-              <td className="text-right border border-zinc-800 text-zinc-200 px-3 py-2">{formatNum(r.subOutgoing) || "0"}</td>
-              <td className="text-right border border-zinc-800 text-zinc-200 px-3 py-2">{formatNum(r.balance) || "0"}</td>
-            </tr>
-          ))}
-          <tr className="font-bold border-t-2 border-zinc-600">
-            <td className="text-left border border-zinc-800 text-zinc-100 px-3 py-2">Total</td>
-            <td className="text-right border border-zinc-800 text-zinc-100 px-3 py-2">{formatNum(gi) || "0"}</td>
-            <td className="text-right border border-zinc-800 text-zinc-100 px-3 py-2">{formatNum(go) || "0"}</td>
-            <td className="text-right border border-zinc-800 text-zinc-100 px-3 py-2">{formatNum(gi - go) || "0"}</td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function LoansView({ accounts, defaultCutoff }) {
+function LoansView({ accounts, defaultCutoff, embedded = false }) {
   const [kind, setKind] = useState("loan"); // "loan" (taken) | "lended" (given)
   const isLended = kind === "lended";
   const T = isLended
@@ -4464,7 +4322,7 @@ function LoansView({ accounts, defaultCutoff }) {
   const isLive = cutoff >= monthKeyNow();
 
   return (
-    <div className="flex-1 overflow-y-auto px-5 py-5">
+    <div className={embedded ? "pt-2" : "flex-1 overflow-y-auto px-5 py-5"}>
       <div className="flex rounded-lg border border-zinc-800 p-0.5 mb-3 font-mono text-xs">
         {[["loan", "Loans"], ["lended", "Lended"]].map(([k, label]) => (
           <button
