@@ -1,5 +1,5 @@
 import React, { useState, useRef, useMemo, useEffect } from "react";
-import { Undo2, Redo2, Plus, MoreVertical, X, Download, Pencil, Trash2, HelpCircle, Type, AlignJustify, ChevronLeft, ChevronRight, CalendarDays, FileText, Check, SkipForward, Loader2, Paperclip, Cloud, CloudOff, ChevronDown, Settings2 } from "lucide-react";
+import { Undo2, Redo2, Plus, MoreVertical, X, Download, Pencil, Trash2, HelpCircle, Type, AlignJustify, ChevronLeft, ChevronRight, CalendarDays, FileText, Check, SkipForward, Loader2, Paperclip, Cloud, CloudOff, ChevronDown, Settings2, Eraser } from "lucide-react";
 import * as pdfjsLib from "pdfjs-dist";
 // NOTE: requires "pdfjs-dist" added to package.json dependencies (not part of
 // the previously-generated scaffold — see CONTEXT.md's package list, which
@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.22.0";
+const APP_VERSION = "1.23.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -2615,6 +2615,7 @@ export default function LedgerApp() {
   const [showHelp, setShowHelp] = useState(false);
   // Which dropdown group is open in the Menu sheet: null | "display" | "accounts"
   const [menuGroup, setMenuGroup] = useState(null);
+  const [manageAccounts, setManageAccounts] = useState(false); // 1.23.0: edit mode in Accounts sheet
   const [stmtPasswords, setStmtPasswords] = useState(() => {
     try {
       const saved = localStorage.getItem(STORAGE_STMT_PASSWORDS);
@@ -2682,6 +2683,7 @@ export default function LedgerApp() {
 
   const [sheet, setSheet] = useState(null); // null | 'accounts' | 'month' | 'menu' | 'attachments'
   useEffect(() => {
+    if (sheet !== "accounts") setManageAccounts(false);
     if (sheet !== "menu") setMenuGroup(null); // dropdowns start collapsed every time the menu opens
   }, [sheet]);
   const [dialog, setDialog] = useState(null);
@@ -3453,10 +3455,11 @@ export default function LedgerApp() {
     closeMonthNewSheet();
   }
 
-  function renameAccount() {
-    askPrompt("Rename account:", activeAccount, (name) => {
+  function renameAccount(target = activeAccount) {
+    const oldName = target;
+    askPrompt("Rename account:", oldName, (name) => {
       const trimmed = (name || "").trim();
-      if (!trimmed || trimmed === activeAccount) return;
+      if (!trimmed || trimmed === oldName) return;
       if (accounts[trimmed]) {
         showAlert(`An account named "${trimmed}" already exists.`);
         return;
@@ -3464,8 +3467,8 @@ export default function LedgerApp() {
       // Renames the identity — every month's page moves with it.
       setAccounts((prev) => {
         const next = { ...prev };
-        next[trimmed] = next[activeAccount];
-        delete next[activeAccount];
+        next[trimmed] = next[oldName];
+        delete next[oldName];
         return next;
       });
       // The "order entered" tracking is keyed by `${account}::${month}`, so
@@ -3473,7 +3476,7 @@ export default function LedgerApp() {
       // brand-new to the Statement report and re-fall-back to text order.
       setEntryOrder((prev) => {
         const next = { ...prev };
-        const prefix = `${activeAccount}::`;
+        const prefix = `${oldName}::`;
         for (const key of Object.keys(prev)) {
           if (key.startsWith(prefix)) {
             next[`${trimmed}::${key.slice(prefix.length)}`] = prev[key];
@@ -3485,17 +3488,16 @@ export default function LedgerApp() {
       // Attachments are keyed by account name too, so they need to move
       // with the identity the same way entryOrder does above — otherwise
       // they'd silently point at a name that no longer exists.
-      renameAttachmentsAccount(activeAccount, trimmed).catch(() => {});
-      setActiveAccount(trimmed);
-      closeSheet();
+      renameAttachmentsAccount(oldName, trimmed).catch(() => {});
+      if (activeAccount === oldName) setActiveAccount(trimmed);
     });
   }
 
   // Removes the whole account: every month's page, its entry-order tracking,
   // its import dedupe log and its attached PDFs. Needs at least one other
   // account to remain.
-  function removeAccount() {
-    const name = activeAccount;
+  function removeAccount(target = activeAccount) {
+    const name = target;
     const others = Object.keys(accounts).filter((n) => n !== name);
     if (others.length < 1) {
       showAlert("You need at least one account.");
@@ -3521,9 +3523,10 @@ export default function LedgerApp() {
           return next;
         });
         deleteAttachmentsForAccount(name).catch(() => {});
-        setActiveAccount(others.find((n) => accounts[n]?.[activeMonth] !== undefined) || others[0]);
-        setIsEditable(false);
-        closeSheet();
+        if (name === activeAccount) {
+          setActiveAccount(others.find((n) => accounts[n]?.[activeMonth] !== undefined) || others[0]);
+          setIsEditable(false);
+        }
       },
       { danger: true, confirmLabel: "Remove" }
     );
@@ -3533,8 +3536,8 @@ export default function LedgerApp() {
   // itself (each page goes back to its starter line). Statement PDFs stay
   // attached; the import dedupe log is cleared so those statements can be
   // imported again.
-  function deleteAllEntries() {
-    const name = activeAccount;
+  function deleteAllEntries(target = activeAccount) {
+    const name = target;
     askConfirm(
       `Delete ALL entries in "${name}" (every month)? The account stays, but its pages go blank. This can't be undone.`,
       () => {
@@ -3555,7 +3558,6 @@ export default function LedgerApp() {
           delete next[name];
           return next;
         });
-        closeSheet();
       },
       { danger: true, confirmLabel: "Delete all" }
     );
@@ -3661,8 +3663,7 @@ export default function LedgerApp() {
 
       {viewMode === "summary" && <SummaryView parsed={parsed} fontSize={fontSize} account={activeAccount} month={activeMonth} showToast={showToast} accounts={accounts} />}
 
-      {/* Statement (1.22.0): a third view next to Text and Summary instead of a
-          separate full-screen report. It still has its own account/month pickers. */}
+      {/* Statement: third view next to Text and Summary; shows the open account + month. */}
       {viewMode === "statement" && (
         <div className="flex-1 min-h-0 flex flex-col pb-24 bg-black">
           <StatementView
@@ -3671,7 +3672,6 @@ export default function LedgerApp() {
             defaultMonth={activeMonth}
             entryOrder={entryOrder}
             setEntryOrder={setEntryOrder}
-            onOpenAttachment={openAttachmentInImport}
             showToast={showToast}
           />
         </div>
@@ -3728,44 +3728,79 @@ export default function LedgerApp() {
         </div>
       </div>
 
-      {/* accounts sheet (1.17.0): compact 2-column chips + a tidy tools grid */}
-      <BottomSheet open={sheet === "accounts"} onClose={closeSheet} title="Accounts">
-        <div className="grid grid-cols-2 gap-2 mt-1">
+      {/* accounts sheet (1.23.0): account rows with an Edit mode that reveals
+          rename / clear / remove symbols per account; tools + attached statements below */}
+      <BottomSheet open={sheet === "accounts"} onClose={() => { setManageAccounts(false); closeSheet(); }} title="Accounts">
+        <div className="flex justify-end mb-1.5">
+          <button
+            onClick={() => setManageAccounts((v) => !v)}
+            className={"flex items-center gap-1.5 px-2.5 py-1 rounded-lg font-mono text-[11px] border " + (manageAccounts ? "border-teal-700 text-teal-300" : "border-zinc-800 text-zinc-400")}
+          >
+            {manageAccounts ? <Check size={13} /> : <Pencil size={13} />}
+            {manageAccounts ? "Done" : "Edit"}
+          </button>
+        </div>
+        <div className={"grid gap-2 " + (manageAccounts ? "grid-cols-1" : "grid-cols-2")}>
           {Object.keys(accounts)
-            .filter((name) => accounts[name]?.[activeMonth] !== undefined || name === activeAccount)
+            .filter((name) => manageAccounts || accounts[name]?.[activeMonth] !== undefined || name === activeAccount)
             .map((name) => {
               const isActive = name === activeAccount;
               const empty = accounts[name]?.[activeMonth] === undefined;
               return (
-                <button
+                <div
                   key={name}
-                  onClick={() => {
-                    setActiveAccount(name);
-                    closeSheet();
-                  }}
                   className={
-                    "flex items-center gap-2.5 min-w-0 px-2.5 py-2 rounded-xl font-mono text-sm text-left border " +
-                    (isActive ? "bg-zinc-800 border-teal-700 text-white" : "border-zinc-800 text-zinc-300 active:bg-zinc-800/60")
+                    "flex items-center min-w-0 rounded-xl border " +
+                    (isActive ? "bg-zinc-800 border-teal-700" : "border-zinc-800")
                   }
                 >
-                  <span className={"h-7 w-7 shrink-0 rounded-lg flex items-center justify-center text-xs font-bold text-zinc-900 " + avatarColor(name)}>
-                    {name.trim().charAt(0).toUpperCase()}
-                  </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate leading-tight">{name}</span>
-                    {empty && <span className="block text-[10px] text-zinc-500 leading-tight">no entry yet</span>}
-                  </span>
-                  {isActive && <Check size={14} className="shrink-0 text-teal-400" />}
-                </button>
+                  <button
+                    onClick={() => {
+                      if (manageAccounts) return;
+                      setActiveAccount(name);
+                      closeSheet();
+                    }}
+                    className="flex flex-1 items-center gap-2.5 min-w-0 px-2.5 py-2 font-mono text-sm text-left text-zinc-200"
+                  >
+                    <span className={"h-7 w-7 shrink-0 rounded-lg flex items-center justify-center text-xs font-bold text-zinc-900 " + avatarColor(name)}>
+                      {name.trim().charAt(0).toUpperCase()}
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate leading-tight">{name}</span>
+                      {empty && <span className="block text-[10px] text-zinc-500 leading-tight">no entry yet</span>}
+                    </span>
+                    {isActive && !manageAccounts && <Check size={14} className="shrink-0 text-teal-400" />}
+                  </button>
+                  {manageAccounts && (
+                    <div className="flex items-center shrink-0 pr-1">
+                      <button onClick={() => renameAccount(name)} title="Rename" className="p-2 text-zinc-400 active:text-white">
+                        <Pencil size={16} />
+                      </button>
+                      <button onClick={() => deleteAllEntries(name)} title="Delete all entries" className="p-2 text-amber-400/80 active:text-amber-300">
+                        <Eraser size={16} />
+                      </button>
+                      <button onClick={() => removeAccount(name)} title="Remove account" className="p-2 text-rose-400 active:text-rose-300">
+                        <Trash2 size={16} />
+                      </button>
+                    </div>
+                  )}
+                </div>
               );
             })}
-          <button
-            onClick={addAccount}
-            className="flex items-center justify-center gap-2 px-2.5 py-2 rounded-xl border border-dashed border-zinc-700 text-zinc-400 font-mono text-sm active:bg-zinc-800/60"
-          >
-            <Plus size={16} /> New account
-          </button>
+          {!manageAccounts && (
+            <button
+              onClick={addAccount}
+              className="flex items-center justify-center gap-2 px-2.5 py-2 rounded-xl border border-dashed border-zinc-700 text-zinc-400 font-mono text-sm active:bg-zinc-800/60"
+            >
+              <Plus size={16} /> New account
+            </button>
+          )}
         </div>
+        {manageAccounts && (
+          <div className="px-1 pt-2 font-mono text-[10px] text-zinc-500 leading-relaxed">
+            Pencil renames · eraser clears every month's entries (account stays) · bin removes the whole account.
+          </div>
+        )}
 
         <SheetSection>Tools</SheetSection>
         <SheetRow
@@ -3776,6 +3811,12 @@ export default function LedgerApp() {
             setShowingImport(true);
             closeSheet();
           }}
+        />
+        <SheetRow
+          icon={<Paperclip size={17} />}
+          label="Attached statements"
+          hint={attachCount > 0 ? attachCount : ""}
+          onClick={() => setSheet("attachments")}
         />
       </BottomSheet>
 
@@ -3864,11 +3905,9 @@ export default function LedgerApp() {
         />
       </BottomSheet>
 
-      {/* menu sheet (1.22.0): Attached statements · Display settings ▾ · Accounts ▾ · Backup */}
+      {/* menu sheet (1.23.0): Display settings ▾ · Backup (accounts + attached statements moved to the Accounts sheet) */}
       <BottomSheet open={sheet === "menu"} onClose={closeSheet} title="Menu">
         <div className="flex flex-col gap-0.5">
-          <SheetRow icon={<Paperclip size={17} />} label="Attached statements" hint={attachCount > 0 ? attachCount : ""} onClick={() => setSheet("attachments")} />
-
           <DropdownRow
             icon={<Settings2 size={17} />}
             label="Display settings"
@@ -3957,17 +3996,6 @@ export default function LedgerApp() {
                 pointed at any month to see a snapshot as of that point in time, instead of always "right now."
               </div>
             )}
-          </DropdownRow>
-
-          <DropdownRow
-            icon={<Pencil size={17} />}
-            label={`Accounts · ${activeAccount}`}
-            open={menuGroup === "accounts"}
-            onToggle={() => setMenuGroup((g) => (g === "accounts" ? null : "accounts"))}
-          >
-            <SheetRow icon={<Pencil size={17} />} label="Rename account" onClick={renameAccount} />
-            <SheetRow icon={<Trash2 size={17} />} label="Remove account" onClick={removeAccount} danger />
-            <SheetRow icon={<Trash2 size={17} />} label="Delete all entries" onClick={deleteAllEntries} danger />
           </DropdownRow>
 
           <SheetSection>Backup</SheetSection>
@@ -4163,12 +4191,10 @@ function SummaryView({ parsed, fontSize, account, month, showToast, accounts }) 
         </div>
       )}
 
-      {/* Loans / Lended (1.22.0): its own section below the summary. Report-only,
-          computed live across every account; nothing here is written to the ledger. */}
-      <div className="mt-8 pt-4 border-t-2 border-zinc-700">
-        <div className="text-[10px] uppercase tracking-widest text-zinc-400 mb-1">Loans / Lended</div>
-        <LoansView accounts={accounts} defaultCutoff={month} embedded />
-      </div>
+      {/* Loans and Lended (1.23.0): two separate sections for this account + month.
+          Report-only, computed live; nothing here is written to the ledger. */}
+      <LoansSection accounts={accounts} account={account} month={month} kind="loan" />
+      <LoansSection accounts={accounts} account={account} month={month} kind="lended" />
     </div>
   );
 }
@@ -4269,175 +4295,70 @@ async function exportSummaryPdf(account, month, model, sortMode) {
   doc.save(filename);
 }
 
-function LoansView({ accounts, defaultCutoff, embedded = false }) {
-  const [kind, setKind] = useState("loan"); // "loan" (taken) | "lended" (given)
+// Loans / Lended (1.23.0): two separate read-only sections for the account and
+// month being viewed -- "Loans as of <month>" and "Lended as of <month>".
+// No toggle, month stepper or account chips any more; the Summary's own
+// account/month decide what is shown. Engine is unchanged.
+function LoansSection({ accounts, account, month, kind }) {
   const isLended = kind === "lended";
   const T = isLended
-    ? { noun: "lended", none: "Nothing outstanding", settledHead: "Received back", verb: "received", repName: "Lended repayment", intro: "Money you lent out, computed live from every account and matched against that same account's \"Lended repayment\" entries (money received back) — including partial repayments in a later month. " }
-    : { noun: "loans", none: "No outstanding loans", settledHead: "Repaid", verb: "paid", repName: "Loan repayment", intro: "Outstanding loans computed live from every account, cross-checked against that same account's \"Loan repayment\" entries — including partial repayments made in a later month — so remaining balances and repayment history stay accurate. " };
-  const [combined, setCombined] = useState(() => new Set());
-  const [cutoff, setCutoff] = useState(defaultCutoff || monthKeyNow());
+    ? { title: "Lended", none: "Nothing outstanding", settledHead: "Received back", verb: "received" }
+    : { title: "Loans", none: "No outstanding loans", settledHead: "Repaid", verb: "paid" };
 
-  // computeLoanAllocations is the sole engine behind loan tracking — this
-  // report is the only place loan/repayment status is ever shown. It's
-  // computed fresh, read-only, from the raw Loan / Loan repayment entries
-  // across every account AND every month, so this view is always accurate
-  // live, even mid-keystroke on whichever page is currently being typed
-  // in. Passing `cutoff` restricts the snapshot to entries dated on or
-  // before that month.
-  const allLoans = useMemo(() => computeLoanAllocations(accounts, cutoff, kind), [accounts, cutoff, kind]);
-
-  const perAccount = useMemo(() => {
-    return Object.keys(accounts).map((name) => {
-      const loans = allLoans.filter((le) => le.account === name);
-      const outstanding = loans.filter((le) => le.remaining > 0.005);
-      const settled = loans.filter((le) => le.remaining <= 0.005 && le.used.length > 0);
-      return { name, outstanding, settled, total: outstanding.reduce((a, le) => a + le.remaining, 0) };
-    });
-  }, [accounts, allLoans]);
-
-  function toggle(name) {
-    setCombined((prev) => {
-      const next = new Set(prev);
-      if (next.has(name)) next.delete(name);
-      else next.add(name);
-      return next;
-    });
-  }
-
-  const combinedRows = useMemo(() => {
-    if (combined.size < 2) return null;
-    const map = {};
-    for (const acc of perAccount) {
-      if (!combined.has(acc.name)) continue;
-      for (const le of acc.outstanding) {
-        map[le.label] = (map[le.label] || 0) + le.remaining;
-      }
-    }
-    return Object.keys(map)
-      .map((k) => ({ label: k, amount: map[k] }))
-      .sort((a, b) => b.amount - a.amount);
-  }, [combined, perAccount]);
-
-  const isLive = cutoff >= monthKeyNow();
+  const mine = useMemo(
+    () => computeLoanAllocations(accounts, month, kind).filter((le) => le.account === account),
+    [accounts, month, kind, account]
+  );
+  const outstanding = mine.filter((le) => le.remaining > 0.005);
+  const settled = mine.filter((le) => le.remaining <= 0.005 && le.used.length > 0);
+  const total = outstanding.reduce((a, le) => a + le.remaining, 0);
 
   return (
-    <div className={embedded ? "pt-2" : "flex-1 overflow-y-auto px-5 py-5"}>
-      <div className="flex rounded-lg border border-zinc-800 p-0.5 mb-3 font-mono text-xs">
-        {[["loan", "Loans"], ["lended", "Lended"]].map(([k, label]) => (
-          <button
-            key={k}
-            onClick={() => { setKind(k); setCombined(new Set()); }}
-            className={"flex-1 py-1.5 rounded-md " + (kind === k ? "bg-teal-700 text-white" : "text-zinc-400")}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
-
-      <p className="font-mono text-[11px] text-zinc-500 mb-3 leading-relaxed">
-        {T.intro}Tap two or more accounts below to combine them into one summed view.
-      </p>
-
-      <div className="flex items-center justify-center gap-3 mb-4 rounded-lg border border-zinc-800 py-2">
-        <button onClick={() => setCutoff((m) => addMonths(m, -1))} className="p-1 text-zinc-400 hover:text-white">
-          <ChevronLeft size={16} />
-        </button>
-        <span className="font-mono text-xs text-zinc-200 min-w-[7em] text-center">
-          As of {monthLabel(cutoff)}
-          {isLive && <span className="text-teal-500"> (live)</span>}
-        </span>
-        <button onClick={() => setCutoff((m) => addMonths(m, 1))} className="p-1 text-zinc-400 hover:text-white">
-          <ChevronRight size={16} />
-        </button>
-      </div>
-
-      <div className="flex flex-wrap gap-2 mb-4">
-        {perAccount.map((acc) => (
-          <button
-            key={acc.name}
-            onClick={() => toggle(acc.name)}
-            className={
-              "px-3 py-1.5 rounded-full font-mono text-xs border " +
-              (combined.has(acc.name) ? "bg-teal-700 border-teal-600 text-white" : "border-zinc-700 text-zinc-300")
-            }
-          >
-            {acc.name}
-          </button>
-        ))}
-      </div>
-
-      {combinedRows && (
-        <div className="mb-6">
-          <h2 className="font-mono text-[11px] uppercase tracking-widest text-zinc-500 mb-2">Combined — {[...combined].join(" + ")}</h2>
-          {combinedRows.length === 0 ? (
-            <div className="rounded-lg border border-zinc-800 bg-zinc-800/60 px-3 py-2 font-mono text-[11px] text-zinc-400">{T.none}</div>
-          ) : (
-            <table className="w-full border-collapse font-mono text-xs">
-              <tbody>
-                {combinedRows.map((r) => (
-                  <tr key={r.label}>
-                    <td className="border border-zinc-800 text-zinc-200 px-3 py-2">{r.label}</td>
-                    <td className="text-right border border-zinc-800 text-zinc-200 px-3 py-2">{formatNum(r.amount)}</td>
-                  </tr>
-                ))}
-                <tr className="font-bold border-t-2 border-zinc-600">
-                  <td className="border border-zinc-800 text-zinc-100 px-3 py-2">Total</td>
-                  <td className="text-right border border-zinc-800 text-zinc-100 px-3 py-2">{formatNum(combinedRows.reduce((a, r) => a + r.amount, 0))}</td>
-                </tr>
-              </tbody>
-            </table>
-          )}
+    <div className="mt-8 pt-4 border-t-2 border-zinc-700">
+      <div className="flex items-baseline justify-between mb-2 font-mono">
+        <div className="text-[11px] uppercase tracking-widest text-zinc-400">
+          {T.title} as of {monthLabel(month)}
         </div>
-      )}
-
-      <h2 className="font-mono text-[11px] uppercase tracking-widest text-zinc-500 mb-2">By account</h2>
-      <div className="space-y-3">
-        {perAccount.map((acc) => (
-          <div key={acc.name} className="rounded-lg border border-zinc-800 overflow-hidden">
-            <div className="flex items-center justify-between px-3 py-1.5 bg-zinc-800/60 font-mono text-xs">
-              <span className="font-semibold text-zinc-100">{acc.name}</span>
-              <span className="text-zinc-400">{formatNum(acc.total) || "0"}</span>
-            </div>
-            {acc.outstanding.length === 0 ? (
-              <div className="px-3 py-2 font-mono text-[11px] text-zinc-500">{T.none}</div>
-            ) : (
-              <div className="divide-y divide-zinc-800/70">
-                {acc.outstanding.map((le, i) => (
-                  <div key={i} className="px-3 py-1.5 font-mono text-[11px] text-zinc-300">
-                    <div className="flex items-center justify-between">
-                      <span>
-                        {le.label} <span className="text-zinc-600">· {monthLabel(le.month)}</span>
-                      </span>
-                      <span>{formatNum(le.remaining)}</span>
-                    </div>
-                    {le.used.length > 0 && (
-                      <div className="text-zinc-500 mt-0.5">
-                        of {formatNum(le.amount)} — {T.verb} {le.used.map((u) => `${formatNum(u.amount)} (${monthLabel(u.month)})`).join(", ")}
-                      </div>
-                    )}
+        <div className="text-xs text-zinc-300">{formatNum(total) || "0"}</div>
+      </div>
+      <div className="rounded-lg border border-zinc-800 overflow-hidden">
+        {outstanding.length === 0 ? (
+          <div className="px-3 py-2 font-mono text-[11px] text-zinc-500">{T.none}</div>
+        ) : (
+          <div className="divide-y divide-zinc-800/70">
+            {outstanding.map((le, i) => (
+              <div key={i} className="px-3 py-1.5 font-mono text-[11px] text-zinc-300">
+                <div className="flex items-center justify-between">
+                  <span>
+                    {le.label} <span className="text-zinc-600">· {monthLabel(le.month)}</span>
+                  </span>
+                  <span>{formatNum(le.remaining)}</span>
+                </div>
+                {le.used.length > 0 && (
+                  <div className="text-zinc-500 mt-0.5">
+                    of {formatNum(le.amount)} — {T.verb} {le.used.map((u) => `${formatNum(u.amount)} (${monthLabel(u.month)})`).join(", ")}
                   </div>
-                ))}
+                )}
               </div>
-            )}
-            {acc.settled.length > 0 && (
-              <div className="border-t border-zinc-800 divide-y divide-zinc-800/70">
-                <div className="px-3 py-1 font-mono text-[10px] uppercase tracking-widest text-zinc-600">{T.settledHead}</div>
-                {acc.settled.map((le, i) => (
-                  <div key={i} className="px-3 py-1.5 font-mono text-[11px] text-zinc-500">
-                    <div className="flex items-center justify-between">
-                      <span>
-                        {le.label} <span className="text-zinc-700">· {monthLabel(le.month)}</span>
-                      </span>
-                      <span>{formatNum(le.amount)}</span>
-                    </div>
-                    <div className="mt-0.5">{T.verb} {le.used.map((u) => `${formatNum(u.amount)} (${monthLabel(u.month)})`).join(", ")}</div>
-                  </div>
-                ))}
-              </div>
-            )}
+            ))}
           </div>
-        ))}
+        )}
+        {settled.length > 0 && (
+          <div className="border-t border-zinc-800 divide-y divide-zinc-800/70">
+            <div className="px-3 py-1 font-mono text-[10px] uppercase tracking-widest text-zinc-600">{T.settledHead}</div>
+            {settled.map((le, i) => (
+              <div key={i} className="px-3 py-1.5 font-mono text-[11px] text-zinc-500">
+                <div className="flex items-center justify-between">
+                  <span>
+                    {le.label} <span className="text-zinc-700">· {monthLabel(le.month)}</span>
+                  </span>
+                  <span>{formatNum(le.amount)}</span>
+                </div>
+                <div className="mt-0.5">{T.verb} {le.used.map((u) => `${formatNum(u.amount)} (${monthLabel(u.month)})`).join(", ")}</div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -4819,9 +4740,11 @@ async function exportStatementPdf(account, month, statement) {
   doc.save(filename);
 }
 
-function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, setEntryOrder, onOpenAttachment, showToast }) {
-  const [account, setAccount] = useState(defaultAccount);
-  const [month, setMonth] = useState(defaultMonth);
+function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, setEntryOrder, showToast }) {
+  // 1.23.0: no account/month pickers here -- it simply shows the account and
+  // month currently open in the editor (change them from the top bar).
+  const account = defaultAccount;
+  const month = defaultMonth;
 
   const text = accounts[account]?.[month] ?? "";
   const parsed = useMemo(() => parseLedger(text), [text]);
@@ -4846,38 +4769,9 @@ function StatementView({ accounts, defaultAccount, defaultMonth, entryOrder, set
 
   return (
     <div className="flex-1 overflow-y-auto px-5 py-5">
-      <p className="font-mono text-[11px] text-zinc-500 mb-3 leading-relaxed">
-        Every entry for {account} in {monthLabel(month)}, in the order it was actually typed (not just where it sits
-        in the text now), with a running balance. Entries labeled with a bare day number (e.g. "5 - 500") also show
-        that day; everything else is an undated line item.
-      </p>
-
-      <div className="flex flex-wrap gap-2 mb-3">
-        {Object.keys(accounts).map((name) => (
-          <button
-            key={name}
-            onClick={() => setAccount(name)}
-            className={
-              "px-3 py-1.5 rounded-full font-mono text-xs border " +
-              (name === account ? "bg-teal-700 border-teal-600 text-white" : "border-zinc-700 text-zinc-300")
-            }
-          >
-            {name}
-          </button>
-        ))}
+      <div className="mb-4 font-mono text-[11px] uppercase tracking-widest text-zinc-400">
+        {account} · {monthLabel(month)}
       </div>
-
-      <div className="flex items-center justify-center gap-3 mb-4 rounded-lg border border-zinc-800 py-2">
-        <button onClick={() => setMonth((m) => addMonths(m, -1))} className="p-1 text-zinc-400 hover:text-white">
-          <ChevronLeft size={16} />
-        </button>
-        <span className="font-mono text-xs text-zinc-200 min-w-[7em] text-center">{monthLabel(month)}</span>
-        <button onClick={() => setMonth((m) => addMonths(m, 1))} className="p-1 text-zinc-400 hover:text-white">
-          <ChevronRight size={16} />
-        </button>
-      </div>
-
-      <StatementAttachments account={account} month={month} onOpenAttachment={onOpenAttachment} />
 
       {accounts[account]?.[month] !== undefined && (
         <button
