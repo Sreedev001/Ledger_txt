@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.23.0";
+const APP_VERSION = "1.23.1";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -650,6 +650,7 @@ const LOAN_KINDS = {
 
 function computeLoanAllocations(accounts, cutoffMonth = null, kind = "loan") {
   const loanEntries = [];
+  const leftoverPools = []; // [{ account, chunks: [{ month, remaining, name }] }] -- repayment not used up in its own account
   const cfg = LOAN_KINDS[kind] || LOAN_KINDS.loan;
 
   for (const account of Object.keys(accounts)) {
@@ -727,6 +728,30 @@ function computeLoanAllocations(accounts, cutoffMonth = null, kind = "loan") {
     }
 
     loanEntries.push(...acctLoans);
+    const chunks = [];
+    for (const key of Object.keys(poolByName)) for (const c of poolByName[key]) chunks.push({ account, name: key, month: c.month, chunk: c });
+    leftoverPools.push(...chunks);
+  }
+
+  // 3. Fallback (1.23.1): a repayment that still has money left after its OWN
+  //    account's loans were settled (e.g. the lending was entered in another
+  //    account) is applied to the same person's still-open entries in OTHER
+  //    accounts, oldest first. Same-account matching always goes first, so
+  //    nothing that matched before changes.
+  leftoverPools.sort((a, b) => (a.month < b.month ? -1 : a.month > b.month ? 1 : 0));
+  const openOthers = [...loanEntries]
+    .filter((le) => le.remaining > 0.005)
+    .sort((a, b) => (a.month < b.month ? -1 : a.month > b.month ? 1 : a.lineIndex - b.lineIndex));
+  for (const p of leftoverPools) {
+    for (const le of openOthers) {
+      if (p.chunk.remaining <= 0.005) break;
+      if (le.account === p.account || le.remaining <= 0.005 || normLabel(le.label) !== p.name) continue;
+      const take = Math.min(le.remaining, p.chunk.remaining);
+      p.chunk.remaining -= take;
+      le.remaining -= take;
+      le.used.push({ amount: take, month: p.month });
+      le.repaidTotal += take;
+    }
   }
 
   return loanEntries;
@@ -4313,6 +4338,29 @@ function LoansSection({ accounts, account, month, kind }) {
   const settled = mine.filter((le) => le.remaining <= 0.005 && le.used.length > 0);
   const total = outstanding.reduce((a, le) => a + le.remaining, 0);
 
+  // 1.24.0: entries for the same person are merged into one row (summed);
+  // tap a merged row to see the individual entries it is made of.
+  const groups = useMemo(() => {
+    const map = new Map();
+    for (const le of outstanding) {
+      const key = String(le.label).trim().toLowerCase();
+      if (!map.has(key)) map.set(key, { key, label: le.label, items: [], total: 0 });
+      const g = map.get(key);
+      g.items.push(le);
+      g.total += le.remaining;
+    }
+    return [...map.values()];
+  }, [outstanding]);
+  const [expanded, setExpanded] = useState(() => new Set());
+  function toggleGroup(key) {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
   return (
     <div className="mt-8 pt-4 border-t-2 border-zinc-700">
       <div className="flex items-baseline justify-between mb-2 font-mono">
@@ -4326,21 +4374,56 @@ function LoansSection({ accounts, account, month, kind }) {
           <div className="px-3 py-2 font-mono text-[11px] text-zinc-500">{T.none}</div>
         ) : (
           <div className="divide-y divide-zinc-800/70">
-            {outstanding.map((le, i) => (
-              <div key={i} className="px-3 py-1.5 font-mono text-[11px] text-zinc-300">
-                <div className="flex items-center justify-between">
-                  <span>
-                    {le.label} <span className="text-zinc-600">· {monthLabel(le.month)}</span>
-                  </span>
-                  <span>{formatNum(le.remaining)}</span>
+            {groups.map((g) => {
+              const single = g.items.length === 1;
+              const isOpen = expanded.has(g.key);
+              const le0 = g.items[0];
+              return (
+                <div key={g.key} className="font-mono text-[11px] text-zinc-300">
+                  <button
+                    onClick={() => !single && toggleGroup(g.key)}
+                    className={"w-full px-3 py-1.5 text-left " + (single ? "cursor-default" : "active:bg-zinc-800/40")}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="flex items-center gap-1.5 min-w-0">
+                        <span className="truncate">{g.label}</span>
+                        {single ? (
+                          <span className="text-zinc-600 shrink-0">· {monthLabel(le0.month)}</span>
+                        ) : (
+                          <>
+                            <span className="shrink-0 rounded-full bg-zinc-800 px-1.5 text-[10px] text-zinc-400">×{g.items.length}</span>
+                            <ChevronDown size={12} className={"shrink-0 text-zinc-500 transition-transform " + (isOpen ? "rotate-180" : "")} />
+                          </>
+                        )}
+                      </span>
+                      <span className="shrink-0">{formatNum(g.total)}</span>
+                    </div>
+                    {single && le0.used.length > 0 && (
+                      <div className="text-zinc-500 mt-0.5">
+                        of {formatNum(le0.amount)} — {T.verb} {le0.used.map((u) => `${formatNum(u.amount)} (${monthLabel(u.month)})`).join(", ")}
+                      </div>
+                    )}
+                  </button>
+                  {!single && isOpen && (
+                    <div className="ml-3 pl-2 mb-1.5 border-l border-zinc-800">
+                      {g.items.map((le, i) => (
+                        <div key={i} className="px-2 py-1">
+                          <div className="flex items-center justify-between text-zinc-400">
+                            <span>{monthLabel(le.month)}</span>
+                            <span>{formatNum(le.remaining)}</span>
+                          </div>
+                          {le.used.length > 0 && (
+                            <div className="text-zinc-600 mt-0.5">
+                              of {formatNum(le.amount)} — {T.verb} {le.used.map((u) => `${formatNum(u.amount)} (${monthLabel(u.month)})`).join(", ")}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
-                {le.used.length > 0 && (
-                  <div className="text-zinc-500 mt-0.5">
-                    of {formatNum(le.amount)} — {T.verb} {le.used.map((u) => `${formatNum(u.amount)} (${monthLabel(u.month)})`).join(", ")}
-                  </div>
-                )}
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
         {settled.length > 0 && (
