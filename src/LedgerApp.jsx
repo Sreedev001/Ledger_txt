@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.23.1";
+const APP_VERSION = "1.24.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -648,7 +648,12 @@ const LOAN_KINDS = {
   },
 };
 
-function computeLoanAllocations(accounts, cutoffMonth = null, kind = "loan") {
+// `writeOffs` (1.24.0): [{ id, kind, account, name (normLabel), label, amount, month }].
+// A write-off is applied LAST, after all repayments: it clears up to `amount`
+// of that person's still-open balance in that account (oldest entry first,
+// only entries from months <= the write-off's month), and shows up in `used`
+// flagged `writtenOff: true` (with `woId`). Report-only, like everything else.
+function computeLoanAllocations(accounts, cutoffMonth = null, kind = "loan", writeOffs = []) {
   const loanEntries = [];
   const leftoverPools = []; // [{ account, chunks: [{ month, remaining, name }] }] -- repayment not used up in its own account
   const cfg = LOAN_KINDS[kind] || LOAN_KINDS.loan;
@@ -750,6 +755,26 @@ function computeLoanAllocations(accounts, cutoffMonth = null, kind = "loan") {
       p.chunk.remaining -= take;
       le.remaining -= take;
       le.used.push({ amount: take, month: p.month });
+      le.repaidTotal += take;
+    }
+  }
+
+  // 4. Write-offs (1.24.0): clear what is still open for that person in that
+  //    account, oldest entry first, never touching entries newer than the
+  //    month the write-off was made in.
+  for (const w of writeOffs || []) {
+    if (w.kind !== kind) continue;
+    if (cutoffMonth && w.month > cutoffMonth) continue;
+    let left = w.amount;
+    const targets = loanEntries
+      .filter((le) => le.account === w.account && normLabel(le.label) === w.name && le.month <= w.month && le.remaining > 0.005)
+      .sort((a, b) => (a.month < b.month ? -1 : a.month > b.month ? 1 : a.lineIndex - b.lineIndex));
+    for (const le of targets) {
+      if (left <= 0.005) break;
+      const take = Math.min(le.remaining, left);
+      le.remaining -= take;
+      left -= take;
+      le.used.push({ amount: take, month: w.month, writtenOff: true, woId: w.id });
       le.repaidTotal += take;
     }
   }
@@ -2032,6 +2057,8 @@ const STORAGE_ACTIVE_MONTH = "ledger_active_month_v1";
 const STORAGE_FONT_SIZE = "ledger_font_size_v1";
 const STORAGE_LINE_SPACING = "ledger_line_spacing_v1";
 const STORAGE_ENTRY_ORDER = "ledger_entry_order_v1";
+// Loan/Lended write-offs (1.24.0): [{ id, kind, account, name, label, amount, month }]
+const STORAGE_WRITEOFFS = "ledger_writeoffs_v1";
 // Bank-statement-import feature (see the STATEMENT IMPORT section below):
 // STORAGE_STMT_PASSWORDS: [{ label, password }] — every PDF password ever
 //   successfully used, tried in order against any newly-uploaded statement
@@ -2227,7 +2254,7 @@ async function syncAttachmentsToDrive(token, folderId) {
 // stmtPasswords' plaintext... no wait, it does — see the note in
 // restoreBackupPayload for why that's an accepted tradeoff, not an
 // oversight.
-async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, settings, rawAttachments, attachMap }) {
+async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, settings, writeOffs, rawAttachments, attachMap }) {
   const attachments = rawAttachments.map((a) => ({
     id: a.id,
     pageKey: a.pageKey,
@@ -2256,6 +2283,8 @@ async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBan
     stmtImported: stmtImported || {},
     // App settings (1.18.0): text size + line spacing.
     settings: settings || {},
+    // Loan/Lended write-offs (1.24.0)
+    writeOffs: writeOffs || [],
     attachments,
   };
 }
@@ -2271,13 +2300,14 @@ async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBan
 // the bar, but it does mean anyone with access to the backup file (i.e.
 // anyone with access to this Drive folder) can read them. Worth knowing.
 async function restoreBackupPayload(payload, setters, token) {
-  const { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported, setFontSize, setLineSpacing } = setters;
+  const { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported, setFontSize, setLineSpacing, setWriteOffs } = setters;
   if (payload.accounts) setAccounts(payload.accounts);
   if (payload.entryOrder) setEntryOrder(payload.entryOrder);
   if (payload.stmtPasswords) setStmtPasswords(payload.stmtPasswords);
   if (payload.stmtBankMap) setStmtBankMap(payload.stmtBankMap);
   if (payload.stmtCatMap) setStmtCatMap(payload.stmtCatMap);
   if (payload.stmtImported) setStmtImported(payload.stmtImported);
+  if (Array.isArray(payload.writeOffs) && setWriteOffs) setWriteOffs(payload.writeOffs); // older backups have none
   // Settings: older backups have none (leave the device's values alone).
   // Values are clamped so a hand-edited/odd backup can't break the editor.
   const st = payload.settings || {};
@@ -2726,6 +2756,13 @@ export default function LedgerApp() {
     } catch {}
     return {};
   });
+  const [writeOffs, setWriteOffs] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(STORAGE_WRITEOFFS));
+      if (Array.isArray(saved)) return saved;
+    } catch {}
+    return [];
+  });
   const [fontSize, setFontSize] = useState(() => {
     try {
       const saved = parseFloat(localStorage.getItem(STORAGE_FONT_SIZE));
@@ -2865,6 +2902,11 @@ export default function LedgerApp() {
       localStorage.setItem(STORAGE_ENTRY_ORDER, JSON.stringify(entryOrder));
     } catch {}
   }, [entryOrder]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_WRITEOFFS, JSON.stringify(writeOffs));
+    } catch {}
+  }, [writeOffs]);
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_STMT_PASSWORDS, JSON.stringify(stmtPasswords));
@@ -3205,7 +3247,7 @@ export default function LedgerApp() {
       // any save that isn't a fresh statement import, so this stays fast
       // no matter how many statements have piled up over time.
       const { rawAttachments, attachMap } = await syncAttachmentsToDrive(token, folderId);
-      const payload = await buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, settings: { fontSize, lineSpacing }, rawAttachments, attachMap });
+      const payload = await buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, settings: { fontSize, lineSpacing }, writeOffs, rawAttachments, attachMap });
       await uploadBackupToDrive(token, JSON.stringify(payload));
       setLastBackupAt(new Date().toISOString());
       setBackupStatus("idle");
@@ -3238,7 +3280,7 @@ export default function LedgerApp() {
         showAlert("No backup found in Google Drive yet — nothing to restore.");
         return;
       }
-      await restoreBackupPayload(payload, { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported, setFontSize, setLineSpacing }, token);
+      await restoreBackupPayload(payload, { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported, setFontSize, setLineSpacing, setWriteOffs }, token);
       setBackupStatus("idle");
       showToast("Restored from Google Drive", { tone: "success", autoHideMs: 2000 });
     } catch (err) {
@@ -3319,7 +3361,7 @@ export default function LedgerApp() {
     }, 3000);
     return () => clearTimeout(backupDebounceRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, fontSize, lineSpacing, attachmentsRev, googleConnected]);
+  }, [accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, writeOffs, fontSize, lineSpacing, attachmentsRev, googleConnected]);
 
   useEffect(() => {
     if (!googleConnected) return undefined;
@@ -3514,6 +3556,7 @@ export default function LedgerApp() {
       // with the identity the same way entryOrder does above — otherwise
       // they'd silently point at a name that no longer exists.
       renameAttachmentsAccount(oldName, trimmed).catch(() => {});
+      setWriteOffs((prev) => prev.map((w) => (w.account === oldName ? { ...w, account: trimmed } : w)));
       if (activeAccount === oldName) setActiveAccount(trimmed);
     });
   }
@@ -3548,6 +3591,7 @@ export default function LedgerApp() {
           return next;
         });
         deleteAttachmentsForAccount(name).catch(() => {});
+        setWriteOffs((prev) => prev.filter((w) => w.account !== name));
         if (name === activeAccount) {
           setActiveAccount(others.find((n) => accounts[n]?.[activeMonth] !== undefined) || others[0]);
           setIsEditable(false);
@@ -3583,9 +3627,19 @@ export default function LedgerApp() {
           delete next[name];
           return next;
         });
+        setWriteOffs((prev) => prev.filter((w) => w.account !== name));
       },
       { danger: true, confirmLabel: "Delete all" }
     );
+  }
+
+  // Loan/Lended write-offs (1.24.0): a note kept by the app only; the ledger
+  // text is never touched. See computeLoanAllocations step 4.
+  function addWriteOff(w) {
+    setWriteOffs((prev) => [...prev, { ...w, id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}` }]);
+  }
+  function removeWriteOff(id) {
+    setWriteOffs((prev) => prev.filter((w) => w.id !== id));
   }
 
   function adjustFontSize(delta) {
@@ -3686,7 +3740,7 @@ export default function LedgerApp() {
       {/* status pill: backup notifier + restore lock message (feature #41) */}
       <StatusToastPill toast={toast} toastVisible={toastVisible} />
 
-      {viewMode === "summary" && <SummaryView parsed={parsed} fontSize={fontSize} account={activeAccount} month={activeMonth} showToast={showToast} accounts={accounts} />}
+      {viewMode === "summary" && <SummaryView parsed={parsed} fontSize={fontSize} account={activeAccount} month={activeMonth} showToast={showToast} accounts={accounts} writeOffs={writeOffs} onWriteOff={addWriteOff} onUndoWriteOff={removeWriteOff} askConfirm={askConfirm} />}
 
       {/* Statement: third view next to Text and Summary; shows the open account + month. */}
       {viewMode === "statement" && (
@@ -4013,6 +4067,12 @@ export default function LedgerApp() {
                 Sub outgoing / Sub incoming as usual); who still owes you what appears in Summary → Loans / Lended → Lended. <code>Lent</code> / <code>Lent repayment</code> also work as category names.
                 <br />
                 <br />
+                <strong>Write off:</strong> in Summary → Loans or Lended, tap <em>Write off</em> beside a person to stop counting what is
+                still outstanding for them — e.g. a debt that was forgiven, or money you'll never get back. It is a note kept
+                by the app only: your ledger lines and totals are not changed. Undo it from the "Written off" list under that
+                section.
+                <br />
+                <br />
                 <strong>Months:</strong> every account is now a set of monthly pages — switch months with the ◀ / ▶ arrows
                 or the month pill in the top bar. An account doesn't need a page in every month; a blank one is created the
                 moment you type in it. Loans are the
@@ -4121,7 +4181,7 @@ function buildSummaryModel(parsed, mode) {
   };
 }
 
-function SummaryView({ parsed, fontSize, account, month, showToast, accounts }) {
+function SummaryView({ parsed, fontSize, account, month, showToast, accounts, writeOffs, onWriteOff, onUndoWriteOff, askConfirm }) {
   const [sortMode, setSortMode] = useState("typed");
   const [exporting, setExporting] = useState(false);
   const model = useMemo(() => buildSummaryModel(parsed, sortMode), [parsed, sortMode]);
@@ -4218,8 +4278,8 @@ function SummaryView({ parsed, fontSize, account, month, showToast, accounts }) 
 
       {/* Loans and Lended (1.23.0): two separate sections for this account + month.
           Report-only, computed live; nothing here is written to the ledger. */}
-      <LoansSection accounts={accounts} account={account} month={month} kind="loan" />
-      <LoansSection accounts={accounts} account={account} month={month} kind="lended" />
+      <LoansSection accounts={accounts} account={account} month={month} kind="loan" writeOffs={writeOffs} onWriteOff={onWriteOff} onUndoWriteOff={onUndoWriteOff} askConfirm={askConfirm} />
+      <LoansSection accounts={accounts} account={account} month={month} kind="lended" writeOffs={writeOffs} onWriteOff={onWriteOff} onUndoWriteOff={onUndoWriteOff} askConfirm={askConfirm} />
     </div>
   );
 }
@@ -4324,16 +4384,36 @@ async function exportSummaryPdf(account, month, model, sortMode) {
 // month being viewed -- "Loans as of <month>" and "Lended as of <month>".
 // No toggle, month stepper or account chips any more; the Summary's own
 // account/month decide what is shown. Engine is unchanged.
-function LoansSection({ accounts, account, month, kind }) {
+function LoansSection({ accounts, account, month, kind, writeOffs = [], onWriteOff, onUndoWriteOff, askConfirm }) {
   const isLended = kind === "lended";
   const T = isLended
     ? { title: "Lended", none: "Nothing outstanding", settledHead: "Received back", verb: "received" }
     : { title: "Loans", none: "No outstanding loans", settledHead: "Repaid", verb: "paid" };
 
   const mine = useMemo(
-    () => computeLoanAllocations(accounts, month, kind).filter((le) => le.account === account),
-    [accounts, month, kind, account]
+    () => computeLoanAllocations(accounts, month, kind, writeOffs).filter((le) => le.account === account),
+    [accounts, month, kind, account, writeOffs]
   );
+  const myWriteOffs = writeOffs.filter((w) => w.kind === kind && w.account === account && w.month <= month);
+  const usedText = (used) => {
+    const fmt = (u) => `${formatNum(u.amount)} (${monthLabel(u.month)})`;
+    const paid = used.filter((u) => !u.writtenOff).map(fmt).join(", ");
+    const wo = used.filter((u) => u.writtenOff).map(fmt).join(", ");
+    return [paid && `${T.verb} ${paid}`, wo && `written off ${wo}`].filter(Boolean).join(" · ");
+  };
+  function confirmWriteOff(g) {
+    if (!askConfirm || !onWriteOff) return;
+    const amount = Math.round(g.total * 100) / 100;
+    askConfirm(
+      `Write off ${formatNum(amount)} for ${g.label}? It will stop showing as outstanding. Your ledger entries are not changed, and you can undo it from the Written off list.`,
+      () => onWriteOff({ kind, account, name: normLabel(g.label), label: g.label, amount, month }),
+      { danger: true, confirmLabel: "Write off" }
+    );
+  }
+  function confirmUndo(w) {
+    if (!askConfirm || !onUndoWriteOff) return;
+    askConfirm(`Undo the write-off of ${formatNum(w.amount)} for ${w.label}? It will show as outstanding again.`, () => onUndoWriteOff(w.id), { confirmLabel: "Undo" });
+  }
   const outstanding = mine.filter((le) => le.remaining > 0.005);
   const settled = mine.filter((le) => le.remaining <= 0.005 && le.used.length > 0);
   const total = outstanding.reduce((a, le) => a + le.remaining, 0);
@@ -4380,9 +4460,10 @@ function LoansSection({ accounts, account, month, kind }) {
               const le0 = g.items[0];
               return (
                 <div key={g.key} className="font-mono text-[11px] text-zinc-300">
+                  <div className="flex items-start">
                   <button
                     onClick={() => !single && toggleGroup(g.key)}
-                    className={"w-full px-3 py-1.5 text-left " + (single ? "cursor-default" : "active:bg-zinc-800/40")}
+                    className={"flex-1 min-w-0 px-3 py-1.5 text-left " + (single ? "cursor-default" : "active:bg-zinc-800/40")}
                   >
                     <div className="flex items-center justify-between gap-2">
                       <span className="flex items-center gap-1.5 min-w-0">
@@ -4400,10 +4481,18 @@ function LoansSection({ accounts, account, month, kind }) {
                     </div>
                     {single && le0.used.length > 0 && (
                       <div className="text-zinc-500 mt-0.5">
-                        of {formatNum(le0.amount)} — {T.verb} {le0.used.map((u) => `${formatNum(u.amount)} (${monthLabel(u.month)})`).join(", ")}
+                        of {formatNum(le0.amount)} — {usedText(le0.used)}
                       </div>
                     )}
                   </button>
+                  <button
+                    onClick={() => confirmWriteOff(g)}
+                    title="Stop counting this as outstanding"
+                    className="shrink-0 mr-2 mt-1.5 px-2 py-0.5 rounded border border-zinc-700 text-[10px] text-zinc-400 active:text-amber-300 active:border-amber-700"
+                  >
+                    Write off
+                  </button>
+                  </div>
                   {!single && isOpen && (
                     <div className="ml-3 pl-2 mb-1.5 border-l border-zinc-800">
                       {g.items.map((le, i) => (
@@ -4414,7 +4503,7 @@ function LoansSection({ accounts, account, month, kind }) {
                           </div>
                           {le.used.length > 0 && (
                             <div className="text-zinc-600 mt-0.5">
-                              of {formatNum(le.amount)} — {T.verb} {le.used.map((u) => `${formatNum(u.amount)} (${monthLabel(u.month)})`).join(", ")}
+                              of {formatNum(le.amount)} — {usedText(le.used)}
                             </div>
                           )}
                         </div>
@@ -4437,7 +4526,25 @@ function LoansSection({ accounts, account, month, kind }) {
                   </span>
                   <span>{formatNum(le.amount)}</span>
                 </div>
-                <div className="mt-0.5">{T.verb} {le.used.map((u) => `${formatNum(u.amount)} (${monthLabel(u.month)})`).join(", ")}</div>
+                <div className="mt-0.5">{usedText(le.used)}</div>
+              </div>
+            ))}
+          </div>
+        )}
+        {myWriteOffs.length > 0 && (
+          <div className="border-t border-zinc-800 divide-y divide-zinc-800/70">
+            <div className="px-3 py-1 font-mono text-[10px] uppercase tracking-widest text-zinc-600">Written off</div>
+            {myWriteOffs.map((w) => (
+              <div key={w.id} className="flex items-center justify-between gap-2 px-3 py-1.5 font-mono text-[11px] text-zinc-500">
+                <span className="min-w-0 truncate">
+                  {w.label} <span className="text-zinc-700">· {monthLabel(w.month)}</span>
+                </span>
+                <span className="flex items-center gap-3 shrink-0">
+                  <span>{formatNum(w.amount)}</span>
+                  <button onClick={() => confirmUndo(w)} className="text-teal-400 underline">
+                    Undo
+                  </button>
+                </span>
               </div>
             ))}
           </div>
