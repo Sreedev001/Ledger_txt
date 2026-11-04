@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.25.0";
+const APP_VERSION = "1.26.1";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -4152,6 +4152,12 @@ export default function LedgerApp() {
                 statement. Untick any that should be handled separately.
                 <br />
                 <br />
+                <strong>Remembered categories (bank-statement import):</strong> every time you save an imported entry the app
+                remembers which category and subcategory you chose for that payee (separately for money in and money out).
+                On later statements, similar payments open with Category and Subcategory already selected. It is only a
+                suggestion — change it freely, and nothing is written until you tap Save.
+                <br />
+                <br />
                 <strong>Months:</strong> every account is now a set of monthly pages — switch months with the ◀ / ▶ arrows
                 or the month pill in the top bar. An account doesn't need a page in every month; a blank one is created the
                 moment you type in it. Loans are the
@@ -5249,6 +5255,12 @@ function ImportStatementView({
   // Similar-payments panel (1.25.0): queue indexes the user UNticked (all
   // detected ones start ticked). Reset whenever the open row changes.
   const [simOff, setSimOff] = useState([]);
+  // Scroll back to the top whenever a different row (or step) opens, so after
+  // Save the next row's form is what you see, not the bottom of a tall form.
+  const scrollRef = useRef(null);
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = 0;
+  }, [qIndex, step]);
   // Remembered choices (1.26.0). `eHint` = what the menus were pre-filled with
   // (drives the "Pre-filled" note); hintsRef always holds the latest hints so a
   // choice learned a moment ago is already usable by the very next row.
@@ -5788,7 +5800,39 @@ function ImportStatementView({
     }
     setResults(newResults);
     rebuildLedgerFromResults(newResults);
+    const base = { type: eType, category: eCategory.trim(), sub: eSub.trim(), pass: ePass };
+    learnHints([
+      ...[...new Set([queue[qIndex].description, eDesc].filter(Boolean))].map((d) => ({ desc: d, ...base })),
+      ...similarTicked.map((s) => ({ desc: s.t.description, ...base })),
+    ]);
     goToNextUndecided(newResults);
+  }
+
+  // Remembers "this kind of payment goes under this category" for this
+  // account (1.26.0). Overwrites an older choice for the same description, and
+  // skips empty/generic descriptions ("UPI transaction"), which say nothing
+  // about who was paid.
+  function learnHints(entries) {
+    const acct = targetAccount;
+    const cur = hintsRef.current || {};
+    const mine = { ...(cur[acct] || {}) };
+    let changed = false;
+    for (const it of entries) {
+      if (isGenericDesc(it.desc) || !(it.category || "").trim()) continue;
+      mine[`${it.type}|${normalizeDesc(it.desc)}`] = {
+        desc: it.desc,
+        type: it.type,
+        category: it.category,
+        sub: it.sub || "",
+        pass: !!it.pass,
+        at: Date.now(),
+      };
+      changed = true;
+    }
+    if (!changed) return;
+    const next = { ...cur, [acct]: mine };
+    hintsRef.current = next;
+    setStmtHints(next);
   }
 
   function skipCurrent() {
@@ -6084,7 +6128,7 @@ function ImportStatementView({
   const similarTicked = similar.filter((s) => !simOff.includes(s.i));
 
   return (
-    <div className="flex-1 overflow-y-auto">
+    <div ref={scrollRef} className="flex-1 overflow-y-auto">
       {step === "pick" && (
         <div className="p-4 flex flex-col gap-3">
           <p className="font-mono text-xs text-zinc-400 leading-relaxed">
@@ -6415,6 +6459,9 @@ function ImportStatementView({
               <div className="font-mono text-[11px] text-zinc-400 mt-1">
                 Not your income or expense — goes under a (=) category and is left out of Sub incoming/outgoing, Balance and reports.
               </div>
+            )}
+            {eHint && results[qIndex]?.status !== "saved" && eCategory === eHint.category && eSub === eHint.sub && ePass === eHint.pass && (
+              <div className="font-mono text-[10px] text-teal-400 mt-2">Pre-filled from your earlier entry — change it if it's wrong.</div>
             )}
             <label className={stmtLabelCls}>Category</label>
             <select
