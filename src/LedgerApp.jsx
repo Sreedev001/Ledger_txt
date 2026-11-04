@@ -847,11 +847,33 @@ function normalizeDesc(s) {
 // payee"? Equal after normalising, or sharing most of their name words
 // (e.g. "Aromal A" ~ "Aromal"). Generic fallbacks like "UPI transaction" or
 // "(no description)" never match, since they say nothing about who was paid.
+function isGenericDesc(s) {
+  const n = normalizeDesc(s);
+  return !n || / transaction$/.test(n) || n === "no description";
+}
+
+// Remembered category choices ("hints", 1.26.0). `hintMap` is one account's
+// { "<type>|<normalized description>": { desc, type, category, sub, pass, at } }.
+// Looks up the best earlier choice for a statement row: exact normalised
+// description first, otherwise the most recent hint of the SAME direction whose
+// description is similar (descSimilar). Never used for generic descriptions.
+function findHint(hintMap, desc, type) {
+  if (!hintMap || !type || isGenericDesc(desc)) return null;
+  const exact = hintMap[`${type}|${normalizeDesc(desc)}`];
+  if (exact) return exact;
+  let best = null;
+  for (const h of Object.values(hintMap)) {
+    if (h.type !== type || !descSimilar(desc, h.desc)) continue;
+    if (!best || (h.at || 0) > (best.at || 0)) best = h;
+  }
+  return best;
+}
+
 function descSimilar(a, b) {
   const na = normalizeDesc(a);
   const nb = normalizeDesc(b);
   if (!na || !nb) return false;
-  if (/ transaction$/.test(na) || /^no description$/.test(na)) return false;
+  if (isGenericDesc(a)) return false;
   if (na === nb) return true;
   const tok = (s) => s.split(" ").filter((w) => w.length >= 3 && !/^\d+$/.test(w));
   const ta = tok(na);
@@ -2101,6 +2123,10 @@ const STORAGE_STMT_PASSWORDS = "ledger_stmt_passwords_v1";
 const STORAGE_STMT_BANKMAP = "ledger_stmt_bankmap_v1";
 const STORAGE_STMT_CATMAP = "ledger_stmt_catmap_v1";
 const STORAGE_STMT_IMPORTED = "ledger_stmt_imported_v1";
+// STORAGE_STMT_HINTS (1.26.0): { [account]: { "<type>|<normalized description>": {desc, type,
+//   category, sub, pass, at} } } — every normal Save in the import review teaches
+//   this; later imports only PRE-FILL the menus from it (nothing is auto-written).
+const STORAGE_STMT_HINTS = "ledger_stmt_hints_v1";
 // Google Drive backup (feature #40, see the BACKUP section below):
 // STORAGE_GOOGLE_ACCOUNT: { email, displayName } | null — just enough to
 //   show "Backing up to you@gmail.com" in the Menu sheet. Never stores the
@@ -2273,7 +2299,7 @@ async function syncAttachmentsToDrive(token, folderId) {
 // stmtPasswords' plaintext... no wait, it does — see the note in
 // restoreBackupPayload for why that's an accepted tradeoff, not an
 // oversight.
-async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, settings, writeOffs, rawAttachments, attachMap }) {
+async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, stmtHints, settings, writeOffs, rawAttachments, attachMap }) {
   const attachments = rawAttachments.map((a) => ({
     id: a.id,
     pageKey: a.pageKey,
@@ -2304,6 +2330,8 @@ async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBan
     settings: settings || {},
     // Loan/Lended write-offs (1.24.0)
     writeOffs: writeOffs || [],
+    // Remembered category choices for the import review (1.26.0)
+    stmtHints: stmtHints || {},
     attachments,
   };
 }
@@ -2319,7 +2347,7 @@ async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBan
 // the bar, but it does mean anyone with access to the backup file (i.e.
 // anyone with access to this Drive folder) can read them. Worth knowing.
 async function restoreBackupPayload(payload, setters, token) {
-  const { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported, setFontSize, setLineSpacing, setWriteOffs } = setters;
+  const { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported, setFontSize, setLineSpacing, setWriteOffs, setStmtHints } = setters;
   if (payload.accounts) setAccounts(payload.accounts);
   if (payload.entryOrder) setEntryOrder(payload.entryOrder);
   if (payload.stmtPasswords) setStmtPasswords(payload.stmtPasswords);
@@ -2327,6 +2355,7 @@ async function restoreBackupPayload(payload, setters, token) {
   if (payload.stmtCatMap) setStmtCatMap(payload.stmtCatMap);
   if (payload.stmtImported) setStmtImported(payload.stmtImported);
   if (Array.isArray(payload.writeOffs) && setWriteOffs) setWriteOffs(payload.writeOffs); // older backups have none
+  if (payload.stmtHints && setStmtHints) setStmtHints(payload.stmtHints); // older backups have none
   // Settings: older backups have none (leave the device's values alone).
   // Values are clamped so a hand-edited/odd backup can't break the editor.
   const st = payload.settings || {};
@@ -2718,6 +2747,13 @@ export default function LedgerApp() {
     } catch {}
     return {};
   });
+  const [stmtHints, setStmtHints] = useState(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_STMT_HINTS);
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return {};
+  });
   // Google Drive backup (feature #40). `googleAccount` and `lastBackupAt`
   // are the only pieces of this that persist to localStorage (see the
   // effects below) — the access token itself is deliberately kept only in
@@ -2946,6 +2982,11 @@ export default function LedgerApp() {
       localStorage.setItem(STORAGE_STMT_IMPORTED, JSON.stringify(stmtImported));
     } catch {}
   }, [stmtImported]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_STMT_HINTS, JSON.stringify(stmtHints));
+    } catch {}
+  }, [stmtHints]);
   useEffect(() => {
     try {
       if (googleAccount) localStorage.setItem(STORAGE_GOOGLE_ACCOUNT, JSON.stringify(googleAccount));
@@ -3266,7 +3307,7 @@ export default function LedgerApp() {
       // any save that isn't a fresh statement import, so this stays fast
       // no matter how many statements have piled up over time.
       const { rawAttachments, attachMap } = await syncAttachmentsToDrive(token, folderId);
-      const payload = await buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, settings: { fontSize, lineSpacing }, writeOffs, rawAttachments, attachMap });
+      const payload = await buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, stmtHints, settings: { fontSize, lineSpacing }, writeOffs, rawAttachments, attachMap });
       await uploadBackupToDrive(token, JSON.stringify(payload));
       setLastBackupAt(new Date().toISOString());
       setBackupStatus("idle");
@@ -3299,7 +3340,7 @@ export default function LedgerApp() {
         showAlert("No backup found in Google Drive yet — nothing to restore.");
         return;
       }
-      await restoreBackupPayload(payload, { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported, setFontSize, setLineSpacing, setWriteOffs }, token);
+      await restoreBackupPayload(payload, { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported, setFontSize, setLineSpacing, setWriteOffs, setStmtHints }, token);
       setBackupStatus("idle");
       showToast("Restored from Google Drive", { tone: "success", autoHideMs: 2000 });
     } catch (err) {
@@ -3380,7 +3421,7 @@ export default function LedgerApp() {
     }, 3000);
     return () => clearTimeout(backupDebounceRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, writeOffs, fontSize, lineSpacing, attachmentsRev, googleConnected]);
+  }, [accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, stmtHints, writeOffs, fontSize, lineSpacing, attachmentsRev, googleConnected]);
 
   useEffect(() => {
     if (!googleConnected) return undefined;
@@ -3576,6 +3617,12 @@ export default function LedgerApp() {
       // they'd silently point at a name that no longer exists.
       renameAttachmentsAccount(oldName, trimmed).catch(() => {});
       setWriteOffs((prev) => prev.map((w) => (w.account === oldName ? { ...w, account: trimmed } : w)));
+      setStmtHints((prev) => {
+        if (!prev[oldName]) return prev;
+        const next = { ...prev, [trimmed]: prev[oldName] };
+        delete next[oldName];
+        return next;
+      });
       if (activeAccount === oldName) setActiveAccount(trimmed);
     });
   }
@@ -3611,6 +3658,11 @@ export default function LedgerApp() {
         });
         deleteAttachmentsForAccount(name).catch(() => {});
         setWriteOffs((prev) => prev.filter((w) => w.account !== name));
+        setStmtHints((prev) => {
+          const next = { ...prev };
+          delete next[name];
+          return next;
+        });
         if (name === activeAccount) {
           setActiveAccount(others.find((n) => accounts[n]?.[activeMonth] !== undefined) || others[0]);
           setIsEditable(false);
@@ -3691,6 +3743,8 @@ export default function LedgerApp() {
           setStmtCatMap={setStmtCatMap}
           stmtImported={stmtImported}
           setStmtImported={setStmtImported}
+          stmtHints={stmtHints}
+          setStmtHints={setStmtHints}
           askPrompt={askPrompt}
           askConfirm={askConfirm}
           showAlert={showAlert}
@@ -5099,6 +5153,8 @@ function ImportStatementView({
   setStmtCatMap,
   stmtImported,
   setStmtImported,
+  stmtHints,
+  setStmtHints,
   askPrompt,
   askConfirm,
   showAlert,
@@ -5193,6 +5249,12 @@ function ImportStatementView({
   // Similar-payments panel (1.25.0): queue indexes the user UNticked (all
   // detected ones start ticked). Reset whenever the open row changes.
   const [simOff, setSimOff] = useState([]);
+  // Remembered choices (1.26.0). `eHint` = what the menus were pre-filled with
+  // (drives the "Pre-filled" note); hintsRef always holds the latest hints so a
+  // choice learned a moment ago is already usable by the very next row.
+  const [eHint, setEHint] = useState(null);
+  const hintsRef = useRef(stmtHints);
+  hintsRef.current = stmtHints;
   useEffect(() => {
     setSimOff([]);
   }, [qIndex]);
@@ -5306,6 +5368,19 @@ function ImportStatementView({
     setESplit(false);
     setESplits([]);
     setECombo(null);
+    // Pre-fill category/subcategory/pass-through from an earlier choice for a
+    // similar payee. Only when the row's direction is known; nothing is
+    // written to the ledger until the user taps Save.
+    const hType = t.guessedType === "credit" ? "credit" : t.guessedType === "debit" ? "debit" : null;
+    const h = hType ? findHint((hintsRef.current || {})[targetAccount], t.description, hType) : null;
+    if (h) {
+      setEPass(!!h.pass);
+      setECategory(h.category);
+      setESub(h.sub || "");
+      setEHint({ category: h.category, sub: h.sub || "", pass: !!h.pass });
+    } else {
+      setEHint(null);
+    }
   }
 
   // Populates the editor for a given queue index — from that row's stored
@@ -5332,6 +5407,7 @@ function ImportStatementView({
       setESplit(!!r.split);
       setESplits(r.splits || []);
       setECombo(r.combo || null);
+      setEHint(null);
     } else {
       loadIntoEditor(queue[i]);
     }
@@ -5669,6 +5745,10 @@ function ImportStatementView({
           [normalizeDesc(t.description)]: { category: snapshot.eCategory, sign: entrySign, sub: snapshot.eSub },
         },
       }));
+    }
+    if (!eSplit && !eCombo) {
+      const descs = [...new Set([t.description, eDesc].filter(Boolean))];
+      learnHints(descs.map((d) => ({ desc: d, type: eType, category: snapshot.eCategory, sub: snapshot.eSub, pass: ePass })));
     }
     goToNextUndecided(newResults);
   }
