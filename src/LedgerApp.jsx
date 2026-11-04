@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.24.0";
+const APP_VERSION = "1.25.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -841,6 +841,25 @@ function normalizeDesc(s) {
     .replace(/[^a-z0-9 ]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+// Similar-payment detection (1.25.0): are two statement descriptions "the same
+// payee"? Equal after normalising, or sharing most of their name words
+// (e.g. "Aromal A" ~ "Aromal"). Generic fallbacks like "UPI transaction" or
+// "(no description)" never match, since they say nothing about who was paid.
+function descSimilar(a, b) {
+  const na = normalizeDesc(a);
+  const nb = normalizeDesc(b);
+  if (!na || !nb) return false;
+  if (/ transaction$/.test(na) || /^no description$/.test(na)) return false;
+  if (na === nb) return true;
+  const tok = (s) => s.split(" ").filter((w) => w.length >= 3 && !/^\d+$/.test(w));
+  const ta = tok(na);
+  const tb = tok(nb);
+  if (!ta.length || !tb.length) return false;
+  const sb = new Set(tb);
+  const common = ta.filter((w) => sb.has(w)).length;
+  return common / Math.max(ta.length, tb.length) >= 0.6;
 }
 
 // A transaction's identity for dedup purposes, deliberately excluding
@@ -4073,6 +4092,12 @@ export default function LedgerApp() {
                 section.
                 <br />
                 <br />
+                <strong>Similar payments (bank-statement import):</strong> when other rows of the same statement pay the same
+                payee in the same direction, the review form lists them with checkboxes. Pick a category and tap{" "}
+                <em>Save this + N ticked</em> to file them all at once; each keeps its own date, amount and its position in the
+                statement. Untick any that should be handled separately.
+                <br />
+                <br />
                 <strong>Months:</strong> every account is now a set of monthly pages — switch months with the ◀ / ▶ arrows
                 or the month pill in the top bar. An account doesn't need a page in every month; a blank one is created the
                 moment you type in it. Loans are the
@@ -5165,6 +5190,12 @@ function ImportStatementView({
   const [eCombo, setECombo] = useState(null);
   const [combine, setCombine] = useState(null);
   const [eCheck, setECheck] = useState(false);
+  // Similar-payments panel (1.25.0): queue indexes the user UNticked (all
+  // detected ones start ticked). Reset whenever the open row changes.
+  const [simOff, setSimOff] = useState([]);
+  useEffect(() => {
+    setSimOff([]);
+  }, [qIndex]);
 
   const passwordAttemptedOnce = useRef(false);
 
@@ -5642,6 +5673,44 @@ function ImportStatementView({
     goToNextUndecided(newResults);
   }
 
+  // Saves the open row AND every ticked similar row in one go, all under the
+  // same category / subcategory / pass-through / remark. Each keeps its own
+  // date and amount. Slots are untouched by design: the ledger is rebuilt from
+  // `results` in queue order and each line claims the slot reserved for its
+  // own statement row, so nothing moves.
+  function saveCurrentAndSimilar() {
+    const amt = parseFloat(eAmount);
+    if (isNaN(amt) || amt <= 0) {
+      showAlert("Enter a valid amount.");
+      return;
+    }
+    if (!eCategory.trim()) {
+      showAlert("Pick or create a category first.");
+      return;
+    }
+    const newResults = [...results];
+    newResults[qIndex] = makeSnapshot("saved");
+    for (const s of similarTicked) {
+      newResults[s.i] = {
+        status: "saved",
+        eDate: s.date || "",
+        eDesc: s.desc,
+        eAmount: String(s.amount),
+        eType,
+        eCategory: eCategory.trim(),
+        eSub: eSub.trim(),
+        ePass,
+        eRemark,
+        split: false,
+        splits: [],
+        combo: null,
+      };
+    }
+    setResults(newResults);
+    rebuildLedgerFromResults(newResults);
+    goToNextUndecided(newResults);
+  }
+
   function skipCurrent() {
     const newResults = [...results];
     newResults[qIndex] = makeSnapshot("skipped");
@@ -5907,6 +5976,32 @@ function ImportStatementView({
     };
   }
   const canCombine = !eCombo && step === "review" && !combine && nextCombineCandidate(qIndex, results) !== -1;
+
+  // SIMILAR PAYMENTS (1.25.0): other rows of this statement, not yet decided
+  // (or skipped and left open), going the same direction and paying the same
+  // payee as the row being edited. Never rows already saved or folded into a
+  // combine, and never rows whose direction is unknown.
+  const similar =
+    step === "review" && !combine && !eSplit && !eCombo && queue[qIndex] && results[qIndex]?.status !== "combined"
+      ? queue
+          .map((t, i) => ({ t, i, r: results[i] }))
+          .filter(({ t, i, r }) => {
+            if (i === qIndex) return false;
+            if (r && !(r.status === "skipped" && !r.combo)) return false;
+            if (!r && t.guessedType === "unknown") return false;
+            if (effectiveType(i, results) !== eType) return false;
+            return descSimilar(eDesc || queue[qIndex].description, r ? r.eDesc : t.description);
+          })
+          .map(({ t, i, r }) => ({
+            i,
+            t,
+            r,
+            date: r ? r.eDate : t.dateISO,
+            desc: r ? r.eDesc : t.description,
+            amount: parseFloat(r ? r.eAmount : t.amount) || 0,
+          }))
+      : [];
+  const similarTicked = similar.filter((s) => !simOff.includes(s.i));
 
   return (
     <div className="flex-1 overflow-y-auto">
@@ -6284,6 +6379,41 @@ function ImportStatementView({
               <option value="__new__">+ New subcategory…</option>
             </select>
             </>
+          )}
+
+          {similar.length > 0 && (
+            <div className="mt-3 rounded-lg border border-teal-800 bg-teal-950/30 p-2.5 flex flex-col gap-1">
+              <div className="font-mono text-[11px] text-teal-200">
+                {similar.length} similar payment{similar.length > 1 ? "s" : ""} later in this statement
+              </div>
+              {similar.map((s) => {
+                const on = !simOff.includes(s.i);
+                return (
+                  <label key={s.i} className="flex items-center gap-2.5 font-mono text-xs text-zinc-200 py-0.5">
+                    <input
+                      type="checkbox"
+                      checked={on}
+                      onChange={() => setSimOff((p) => (on ? [...p, s.i] : p.filter((x) => x !== s.i)))}
+                      className="w-5 h-5 accent-teal-500 shrink-0"
+                    />
+                    <span className="flex-1 min-w-0 truncate">
+                      <span className="text-zinc-500">{s.i + 1}.</span> {s.date || "?"} · {s.desc || "entry"}
+                    </span>
+                    <span className="shrink-0">{formatNum(s.amount)}</span>
+                  </label>
+                );
+              })}
+              <div className="font-mono text-[10px] text-zinc-500 leading-relaxed">
+                Ticked ones get this category, subcategory and remark. Each keeps its own date, amount and place in the statement.
+              </div>
+              <button
+                onClick={saveCurrentAndSimilar}
+                disabled={similarTicked.length === 0}
+                className="mt-1 py-2.5 rounded-lg bg-teal-700 hover:bg-teal-600 disabled:bg-zinc-800 disabled:text-zinc-600 font-mono text-xs text-white"
+              >
+                Save this + {similarTicked.length} ticked
+              </button>
+            </div>
           )}
 
           {eSplit && (
