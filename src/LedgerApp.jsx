@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.26.1";
+const APP_VERSION = "1.26.3";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -1212,14 +1212,29 @@ function extractCounterpartyName(text) {
   const starParts = text.split("*").map((p) => p.trim()).filter(Boolean);
   const source = starParts.length >= 3 ? starParts[starParts.length - 1] : text;
 
-  const vpaMatch = source.match(/[\w.\-]+@[\w]+/);
+  // UPI narrations are slash-delimited: PRODUCT/RRN/DR|CR/NAME/IFSC/VPA (some
+  // banks put the RRN after DR|CR). When the DR|CR field is there, the payee is
+  // the first field after it that has letters and isn't a bare digit run --
+  // far more reliable than stripping noise out of the whole line (which let a
+  // statement ref like "Y42630292" or a cut-off VPA leak into the name).
+  const up = source.split("/").map((x) => x.trim());
+  const di = up.findIndex((x, i) => i > 0 && i <= 4 && /^(cr|dr)$/i.test(x));
+  if (di > 0) {
+    const cand = up.slice(di + 1).find((x) => /[A-Za-z]/.test(x) && !/^\d+$/.test(x));
+    if (cand && !BARE_BANK_CODE_RE.test(cand.replace(/\s+/g, "")) && !/@/.test(cand)) {
+      const nm = cand.replace(/\b\d+\b/g, " ").replace(/\s+/g, " ").trim(); // keep digits inside a name ("Ss3 Seem")
+      if (nm && /[A-Za-z]/.test(nm)) return titleCaseWords(nm.split(" ").slice(0, 3).join(" "));
+    }
+  }
+
+  const vpaMatch = source.match(/[\w.\-]+@[\w]*/);
   let cleaned = source
     .replace(NARRATION_STOPWORD_RE, " ")
     .replace(BANK_CODE_RE, " ")
-    .replace(/[\w.\-]+@[\w]+/g, " ") // strip VPA
-    .replace(/\b[A-Za-z]{2,6}\d{4,}\b/g, " ") // strip bank-code+digits UTR tokens, e.g. SBIN0001234
+    .replace(/[\w.\-]+@[\w]*/g, " ") // strip VPA (incl. one cut off right after the "@")
+    .replace(/\b[A-Za-z]{1,6}\d{4,}\b/g, " ") // strip bank-code+digits UTR tokens, e.g. SBIN0001234
     .replace(/\b\d{5,}\b/g, " ") // strip RRN/UTR/account-number/pincode-length runs
-    .replace(/[\/|\-*]+/g, " ") // slash/pipe/hyphen/asterisk are field delimiters, not part of a name
+    .replace(/[\/|\-*:]+/g, " ") // slash/pipe/hyphen/asterisk/colon are field delimiters, not part of a name
     .replace(/\s+/g, " ")
     .trim();
   cleaned = cleaned.replace(/\d+/g, "").replace(/\s+/g, " ").trim(); // drop remaining stray short digits
@@ -1251,7 +1266,10 @@ function extractRemark(text, channel) {
   if (parts.length < 5) return null; // too few fields for a genuine trailing remark to exist
   const last = parts[parts.length - 1];
   if (!last || !/[A-Za-z]/.test(last)) return null; // pure digits/punctuation, not a remark
-  if (/[\w.\-]+@[\w]+/.test(last)) return null; // a VPA, not a remark
+  // Field right after the bank code is the payee's VPA/account (even a bare
+  // handle with no "@", e.g. "YESB/paytmqr6fjwwjk"), never a remark.
+  if (BARE_BANK_CODE_RE.test((parts[parts.length - 2] || "").replace(/\s+/g, ""))) return null;
+  if (/[\w.\-]+@[\w]*/.test(last)) return null; // a VPA (possibly cut off after the "@"), not a remark
   if (BARE_BANK_CODE_RE.test(last.replace(/\s+/g, ""))) return null;
   if (/^[A-Za-z]{2,6}\d{4,}$/.test(last.replace(/\s+/g, ""))) return null; // bank-code+digits UTR token
   if (REMARK_STOPWORD_RE.test(last.trim())) return null;
@@ -1313,7 +1331,7 @@ function parseTransactionRow(row) {
 
   // Strip percentage and rate tokens (e.g. "18.00%", "@ 18.00") before matching amounts
   const cleanedRest = rest.replace(/(\d+(?:\.\d{1,2})?)\s*%/g, " ")
-                          .replace(/@\s*\d+(?:\.\d{1,2})?/g, " ");
+                          .replace(/(^|\s)@\s*\d+(?:\.\d{1,2})?/g, "$1 "); // only a free-standing "@ 18.00" rate; NOT the "@" ending a cut-off VPA like "bruewell59020@ 1770.00(Dr)"
 
   let amountMatches = [...cleanedRest.matchAll(DECIMAL_AMOUNT_RE)];
   if (amountMatches.length === 0) amountMatches = [...cleanedRest.matchAll(AMOUNT_TOKEN_RE)];
