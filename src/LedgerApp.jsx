@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.26.3";
+const APP_VERSION = "1.26.4";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -869,13 +869,24 @@ function findHint(hintMap, desc, type) {
   return best;
 }
 
+const GENERIC_NAME_WORDS = new Set([
+  "savings", "saving", "account", "acct", "bank", "current", "payment", "payments",
+  "transfer", "upi", "neft", "imps", "rtgs", "ltd", "limited", "pvt", "private",
+  "the", "and", "for", "via", "self", "own", "personal",
+]);
+
 function descSimilar(a, b) {
   const na = normalizeDesc(a);
   const nb = normalizeDesc(b);
   if (!na || !nb) return false;
   if (isGenericDesc(a)) return false;
   if (na === nb) return true;
-  const tok = (s) => s.split(" ").filter((w) => w.length >= 3 && !/^\d+$/.test(w));
+  // Generic words ("savings account", "bank", "ltd"...) say nothing about WHO
+  // was paid, so they never count toward a match (1.26.4): "Bruewell Savings
+  // Account" must not match "Cnb. Savings Account" just because 2 of 3 words
+  // are the same.
+  const tok = (s) =>
+    s.split(" ").filter((w) => w.length >= 3 && !/^\d+$/.test(w) && !GENERIC_NAME_WORDS.has(w));
   const ta = tok(na);
   const tb = tok(nb);
   if (!ta.length || !tb.length) return false;
