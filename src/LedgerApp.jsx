@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.26.5";
+const APP_VERSION = "1.27.0";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -905,7 +905,7 @@ function txnSignature(dateISO, amount, description, refNumber) {
   // re-worded on re-parse, so it's the preferred key when we have one.
   // Falls back to the old date+amount+description key for rows with no
   // extractable reference (cash, cheque, generic bank fees, etc.).
-  if (refNumber) return `ref:${refNumber}`;
+  if (refNumber) return `ref2:${refNumber}`;
   return `${dateISO || "?"}|${formatNum(amount)}|${normalizeDesc(description)}`;
 }
 
@@ -921,11 +921,31 @@ function dedupeTransactions(candidates, importedSignatures) {
   const fresh = [];
   const skipped = [];
   const candidateCounts = {};
+  const legacyCounts = {};
 
   for (const c of candidates) {
+    // 1.26.7: what versions before 1.26.6 would have logged for this row (their
+    // reference, or for a row with none their date|amount|description#n key,
+    // both built from the old, shifted narration). A hit means "entered before".
+    let legacyHit = false;
+    if (c.legacyRef !== undefined) {
+      if (c.legacyRef) {
+        legacyHit = !!seenCounts[`ref:${c.legacyRef}`];
+      } else {
+        const lb = `${c.dateISO || "?"}|${formatNum(c.amount)}|${normalizeDesc(c.legacyDesc ?? c.description)}`;
+        legacyCounts[lb] = (legacyCounts[lb] || 0) + 1;
+        legacyHit = !!seenCounts[`${lb}#${legacyCounts[lb]}`];
+      }
+    }
     if (c.refNumber) {
-      const sig = `ref:${c.refNumber}`;
-      if (seenCounts[sig]) skipped.push(c);
+      // 1.26.7: new entries are logged as "ref2:<ref>" (the reference is now
+      // always the row's OWN one). Entries logged by older versions are plain
+      // "ref:<ref>" and, on statements whose narration is split around the date
+      // line, hold the reference of the row BELOW (the old parser's shift), so
+      // they are matched through `legacyRef` — never through the new reference,
+      // which would wrongly skip a row that was never entered.
+      const sig = `ref2:${c.refNumber}`;
+      if (seenCounts[sig] || legacyHit) skipped.push(c);
       else fresh.push({ ...c, signature: sig });
     } else {
       const baseSig = `${c.dateISO || "?"}|${formatNum(c.amount)}|${normalizeDesc(c.description)}`;
@@ -940,7 +960,7 @@ function dedupeTransactions(candidates, importedSignatures) {
       // stored), so every ref-less transaction -- i.e. every non-UPI row
       // with no extractable reference number -- was always treated as
       // fresh and re-inserted on every re-import, duplicating it.
-      if (seenCounts[indexedSig]) {
+      if (seenCounts[indexedSig] || legacyHit) {
         skipped.push(c);
       } else {
         fresh.push({ ...c, signature: indexedSig });
@@ -948,6 +968,144 @@ function dedupeTransactions(candidates, importedSignatures) {
     }
   }
   return { fresh, skipped };
+}
+
+/* ===== GOOGLE PAY STATEMENT (1.27.0) =====================================
+   The Google Pay "Transaction statement" PDF lists, per payment: date, time,
+   "Paid to <payee>" / "Received from <payer>" / "Self transfer to <bank>", the
+   amount, the 12-digit UPI Transaction ID (= the bank's UPI reference/RRN) and
+   which bank account paid. The ID lets a bank row be matched exactly, so the
+   payee heading, date and time come from Google Pay instead of the bank's
+   truncated narration. Pure functions over the PDF text lines.                */
+function looksLikeGpay(fullText) {
+  return /Transaction statement/i.test(fullText) && /UPI Transaction ID/i.test(fullText) && /Google Pay/i.test(fullText);
+}
+const GPAY_DATE_ROW_RE = /^(\d{1,2})\s+([A-Za-z]{3,9}),\s*(\d{4})\s+(.+?)\s*₹\s*([\d,]+(?:\.\d{1,2})?)\s*$/;
+const GPAY_TIME_RE = /^(\d{1,2}:\d{2}\s?[AP]M)\b\s*(.*)$/i;
+const GPAY_BANK_RE = /^(?:paid by|paid to|paid using|received in|credited to|debited from)\s+(.+)$/i;
+function parseGpayStatement(lines) {
+  const out = [];
+  let cur = null;
+  const flush = () => {
+    if (cur && cur.ref && cur.name) out.push(cur);
+    cur = null;
+  };
+  for (const raw of lines) {
+    const line = (raw || "").trim();
+    if (!line) continue;
+    const dm = line.match(GPAY_DATE_ROW_RE);
+    if (dm) {
+      flush();
+      const mi = monthIdxFromName(dm[2]);
+      if (mi === null) continue;
+      let name = dm[4].trim();
+      let kind = "paid";
+      if (/^received from\s+/i.test(name)) {
+        kind = "received";
+        name = name.replace(/^received from\s+/i, "");
+      } else if (/^paid to\s+/i.test(name)) {
+        name = name.replace(/^paid to\s+/i, "");
+      } else if (/^self transfer/i.test(name)) {
+        kind = "self";
+      }
+      cur = {
+        dateISO: `${dm[3]}-${pad2(mi + 1)}-${pad2(parseInt(dm[1], 10))}`,
+        name,
+        kind,
+        amount: parseFloat(dm[5].replace(/,/g, "")),
+        time: "",
+        ref: null,
+        bank: "",
+      };
+      continue;
+    }
+    if (!cur) continue;
+    const tm = line.match(GPAY_TIME_RE);
+    let rest = line;
+    if (tm) {
+      cur.time = tm[1].toUpperCase().replace(/\s?([AP]M)/, " $1");
+      rest = tm[2] || "";
+    }
+    const im = rest.match(/UPI Transaction ID:?\s*(\d{8,})/i);
+    if (im) {
+      cur.ref = im[1];
+      continue;
+    }
+    if (tm) continue;
+    const bm = line.match(GPAY_BANK_RE);
+    if (bm && (cur.time || cur.ref)) {
+      cur.bank = bm[1].trim();
+      continue;
+    }
+    // A long payee name can wrap onto a second line before the time line.
+    if (!cur.time && !cur.ref && !/^(note\s*:|page\s+\d|date\s*&)/i.test(line)) cur.name += " " + line;
+  }
+  flush();
+  return out;
+}
+
+// Merges parsed entries into the stored index (later statements overwrite the
+// same id). Returns the new index plus how many entries and the date range.
+function mergeGpayEntries(prev, entries) {
+  const next = { ...(prev || {}) };
+  let min = "";
+  let max = "";
+  for (const e of entries) {
+    next[e.ref] = { n: e.name, d: e.dateISO, t: e.time, k: e.kind, a: e.amount, b: e.bank };
+    if (!min || e.dateISO < min) min = e.dateISO;
+    if (!max || e.dateISO > max) max = e.dateISO;
+  }
+  return { index: next, count: entries.length, min, max };
+}
+function gpayRange(index) {
+  let min = "";
+  let max = "";
+  let count = 0;
+  for (const g of Object.values(index || {})) {
+    count++;
+    if (!min || g.d < min) min = g.d;
+    if (!max || g.d > max) max = g.d;
+  }
+  return { count, min, max };
+}
+function gpayDisplayName(g) {
+  const n = (g.n || "").replace(/\s+/g, " ").trim();
+  return n && n === n.toUpperCase() ? titleCaseWords(n) : n;
+}
+function formatDateLong(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || "");
+  return m ? `${parseInt(m[3], 10)} ${MONTHS_SHORT[parseInt(m[2], 10) - 1]} ${m[1]}` : iso || "";
+}
+// Names, dates and times from Google Pay for every bank row whose UPI reference
+// is in the index. A row is only matched when the amount agrees and the
+// direction does not contradict (paid <-> debit, received <-> credit); anything
+// else is counted as a mismatch and left exactly as the bank printed it.
+function applyGpayToTxns(txns, index) {
+  const stats = { upi: 0, matched: 0, mismatched: 0 };
+  const has = index && Object.keys(index).length > 0;
+  const out = txns.map((t) => {
+    if (t.channel === "UPI") stats.upi++;
+    if (!has || !t.refNumber) return t;
+    const g = index[t.refNumber];
+    if (!g) return t;
+    const sameAmt = Math.abs((g.a || 0) - (t.amount || 0)) < 0.005;
+    const dirBad = (g.k === "paid" && t.guessedType === "credit") || (g.k === "received" && t.guessedType === "debit");
+    if (!sameAmt || dirBad) {
+      stats.mismatched++;
+      return t;
+    }
+    stats.matched++;
+    const name = gpayDisplayName(g);
+    // Drop a bank "remark" that is just a piece of the payee name; keep real ones.
+    let remark = t.remark;
+    if (remark) {
+      const words = (x) => normalizeDesc(x).split(" ").filter(Boolean);
+      const known = new Set([...words(name), ...words(t.description)]);
+      if (words(remark).every((w) => known.has(w))) remark = null;
+    }
+    return { ...t, gpay: g, bankDescription: t.description, description: name, channel: "GPay", time: g.t || t.time, remark };
+  });
+  return { txns: out, stats };
 }
 
 function isHeaderMetadataLine(line) {
@@ -1128,18 +1286,76 @@ const DECIMAL_AMOUNT_RE = /\d{1,3}(?:,\d{3})+\.\d{1,2}(?!\d)|\d+\.\d{1,2}(?!\d)/
 // boilerplate (page footers, IFSC/branch blurbs, etc.), and capped at a few
 // lines so a page's trailing disclaimer paragraph can't get vacuumed in.
 const STATEMENT_BOUNDARY_RE = /^\s*(page \d|statement of|generated on|this is a computer|ifsc|micr|branch|nomination|customer id|toll[- ]free|for any query|note\s*:|disclaimer|terms? (and|&) conditions)/i;
-function groupStatementLines(lines) {
-  const groups = [];
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line) continue;
+// 1.26.6: where a narration's FIRST line sits ABOVE its date line.
+// Some statements (e.g. Union Bank) centre the row vertically: the narration
+// cell is two lines, "UPIAR/<ref>/DR/NAME" printed ~6pt above the date/amount
+// line and "/UTIB/gpay-123" ~6pt below it. Gluing every non-date line to the
+// previous date line gave each row only the SECOND narration line (-> the name
+// "Gpay" for every Gpay payment) and pushed the real payee name onto the row
+// above. When `ys` (one vertical position per line, increasing downwards) is
+// supplied, a line that starts a narration (UPIAR/..., NEFT/..., IMPS/...) is
+// given to the NEXT date line instead when it is clearly nearer to it, that row
+// has no narration of its own yet, and the previous row already has one. Anything
+// else keeps the old rule, so top-aligned statements behave as before.
+const NARR_START_WORDS = "UPI[A-Z]{0,4}|NEFT|IMPS|RTGS|NACH|ECS|ATM|POS|ECOM|MMT|BIL|INF|CMS|IFT|TPT";
+const NARR_START_LINE_RE = new RegExp(`^(?:${NARR_START_WORDS})\\b\\s*[\\/:*]`, "i");
+const NARR_START_ANY_RE = new RegExp(`\\b(?:${NARR_START_WORDS})\\b\\s*[\\/:*]`, "i");
+const NARR_ABOVE_MAX_GAP = 12; // points; line pitch inside a row is ~6
+const NARR_SAME_PAGE_GAP = 50000; // getPdfLines puts pages 100000 apart
+function groupStatementLines(lines, ys) {
+  const useY = Array.isArray(ys) && ys.length === lines.length;
+  const isHead = (line) => {
     const dateM = line.match(DATE_TOKEN_RE);
-    if (dateM && dateM.index <= 6) {
-      groups.push({ head: line, cont: [] });
+    return !!(dateM && dateM.index <= 6);
+  };
+  if (!useY) {
+    const groups = [];
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line) continue;
+      if (isHead(line)) {
+        groups.push({ head: line, cont: [] });
+        continue;
+      }
+      const g = groups[groups.length - 1];
+      if (g && g.cont.length < 5 && !STATEMENT_BOUNDARY_RE.test(line)) g.cont.push(line);
+    }
+    return groups.map((g) => ({ head: g.head, extra: g.cont.join(" ") }));
+  }
+
+  const trimmed = lines.map((l) => (l || "").trim());
+  const headIdx = [];
+  trimmed.forEach((l, i) => {
+    if (l && isHead(l)) headIdx.push(i);
+  });
+  const groups = headIdx.map((i) => ({ head: trimmed[i], cont: [] }));
+  const hasStart = (g) => NARR_START_ANY_RE.test(g.head) || g.cont.some((c) => NARR_START_ANY_RE.test(c));
+  let k = -1; // index in headIdx of the last head before line i
+  for (let i = 0; i < trimmed.length; i++) {
+    const line = trimmed[i];
+    if (!line) continue;
+    if (k + 1 < headIdx.length && headIdx[k + 1] === i) {
+      k++;
       continue;
     }
-    const g = groups[groups.length - 1];
-    if (g && g.cont.length < 5 && !STATEMENT_BOUNDARY_RE.test(line)) g.cont.push(line);
+    if (STATEMENT_BOUNDARY_RE.test(line)) continue;
+    const prev = k >= 0 ? k : -1;
+    const next = k + 1 < headIdx.length ? k + 1 : -1;
+    const dPrev = prev >= 0 ? ys[i] - ys[headIdx[prev]] : Infinity;
+    const dNext = next >= 0 ? ys[headIdx[next]] - ys[i] : Infinity;
+    const prevSamePage = dPrev < NARR_SAME_PAGE_GAP;
+    let target = prev;
+    if (
+      next >= 0 &&
+      dNext <= NARR_ABOVE_MAX_GAP &&
+      (prevSamePage ? dNext < dPrev : true) &&
+      NARR_START_LINE_RE.test(line) &&
+      !hasStart(groups[next]) &&
+      (prev < 0 || hasStart(groups[prev]))
+    ) {
+      target = next;
+    }
+    if (target >= 0 && groups[target].cont.length < 5) groups[target].cont.push(line);
   }
   return groups.map((g) => ({ head: g.head, extra: g.cont.join(" ") }));
 }
@@ -1430,12 +1646,25 @@ function parseTransactionRow(row) {
 // Groups the reconstructed PDF lines (joining wrapped narration onto its
 // row) and runs parseTransactionRow over each group, keeping only the ones
 // that parsed as a plausible transaction.
-function parseTransactions(lines) {
+function parseTransactions(lines, ys) {
   const out = [];
-  for (const g of groupStatementLines(lines)) {
+  const groups = groupStatementLines(lines, ys);
+  // 1.26.7: also group the OLD way (every non-date line onto the row above) so
+  // each row knows the reference number versions before 1.26.6 would have
+  // logged for it (`legacyRef`). Only used by dedupeTransactions, so statements
+  // already entered under the old (shifted) references are still recognised.
+  const oldGroups = Array.isArray(ys) ? groupStatementLines(lines) : groups;
+  const aligned = oldGroups.length === groups.length;
+  groups.forEach((g, gi) => {
     const t = parseTransactionRow(g);
-    if (t) out.push(t);
-  }
+    if (!t) return;
+    const og = aligned ? oldGroups[gi] : null;
+    const ot = og && og !== g ? parseTransactionRow(og) : t;
+    t.legacyRef = ot ? ot.refNumber || null : null;
+    t.legacyDesc = ot ? ot.description : t.description;
+    t.narrMoved = !!(og && og.extra !== g.extra);
+    out.push(t);
+  });
   return out;
 }
 
@@ -1778,6 +2007,10 @@ function passBalances(autoItems, resultsArr) {
 // per-glyph-run item list back into the row structure a statement table
 // actually has on the page.
 function reconstructLines(items) {
+  return reconstructLinesY(items).map((r) => r.text);
+}
+// Same, but keeps each line's baseline y (PDF.js units, increasing UPWARDS).
+function reconstructLinesY(items) {
   const rows = [];
   for (const it of items) {
     const x = it.transform[4];
@@ -1790,7 +2023,9 @@ function reconstructLines(items) {
     row.parts.push({ x, str: it.str });
   }
   rows.sort((a, b) => b.y - a.y);
-  return rows.map((r) => r.parts.sort((a, b) => a.x - b.x).map((p) => p.str).join(" ").replace(/\s+/g, " ").trim()).filter(Boolean);
+  return rows
+    .map((r) => ({ y: r.y, text: r.parts.sort((a, b) => a.x - b.x).map((p) => p.str).join(" ").replace(/\s+/g, " ").trim() }))
+    .filter((r) => r.text);
 }
 
 async function tryOpenPdf(arrayBuffer, password) {
@@ -1829,15 +2064,19 @@ async function openStatementPdf(arrayBuffer, storedPasswords, requestPassword) {
 
 async function getPdfLines(doc) {
   const allLines = [];
+  const allYs = []; // vertical position per line, increasing downwards, pages 100000 apart
   const fullTextParts = [];
   for (let p = 1; p <= doc.numPages; p++) {
     const page = await doc.getPage(p);
     const content = await page.getTextContent();
-    const lines = reconstructLines(content.items);
-    allLines.push(...lines);
-    fullTextParts.push(lines.join("\n"));
+    const rows = reconstructLinesY(content.items);
+    for (const r of rows) {
+      allLines.push(r.text);
+      allYs.push(p * 100000 - r.y);
+    }
+    fullTextParts.push(rows.map((r) => r.text).join("\n"));
   }
-  return { lines: allLines, fullText: fullTextParts.join("\n") };
+  return { lines: allLines, ys: allYs, fullText: fullTextParts.join("\n") };
 }
 
 /* =========================================================================
@@ -2156,6 +2395,11 @@ const STORAGE_STMT_IMPORTED = "ledger_stmt_imported_v1";
 //   category, sub, pass, at} } } — every normal Save in the import review teaches
 //   this; later imports only PRE-FILL the menus from it (nothing is auto-written).
 const STORAGE_STMT_HINTS = "ledger_stmt_hints_v1";
+// STORAGE_GPAY (1.27.0): { [UPI transaction id]: { n: payee heading, d: "YYYY-MM-DD",
+//   t: "08:24 AM" | "", k: "paid"|"received"|"self", a: amount, b: bank text } } — every
+//   Google Pay statement the user loaded, merged. Used only to name/date/time bank rows
+//   whose UPI reference matches; never writes to the ledger by itself.
+const STORAGE_GPAY = "ledger_gpay_v1";
 // Google Drive backup (feature #40, see the BACKUP section below):
 // STORAGE_GOOGLE_ACCOUNT: { email, displayName } | null — just enough to
 //   show "Backing up to you@gmail.com" in the Menu sheet. Never stores the
@@ -2390,7 +2634,7 @@ async function syncAttachmentsToDrive(token, folderId) {
 // stmtPasswords' plaintext... no wait, it does — see the note in
 // restoreBackupPayload for why that's an accepted tradeoff, not an
 // oversight.
-async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, stmtHints, settings, writeOffs, rawAttachments, attachMap }) {
+async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, stmtHints, gpayIndex, settings, writeOffs, rawAttachments, attachMap }) {
   const attachments = rawAttachments.map((a) => ({
     id: a.id,
     pageKey: a.pageKey,
@@ -2423,6 +2667,8 @@ async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBan
     writeOffs: writeOffs || [],
     // Remembered category choices for the import review (1.26.0)
     stmtHints: stmtHints || {},
+    // Loaded Google Pay transactions (1.27.0)
+    gpayIndex: gpayIndex || {},
     attachments,
   };
 }
@@ -2438,7 +2684,7 @@ async function buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBan
 // the bar, but it does mean anyone with access to the backup file (i.e.
 // anyone with access to this Drive folder) can read them. Worth knowing.
 async function restoreBackupPayload(payload, setters, token) {
-  const { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported, setFontSize, setLineSpacing, setWriteOffs, setStmtHints } = setters;
+  const { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported, setFontSize, setLineSpacing, setWriteOffs, setStmtHints, setGpayIndex } = setters;
   if (payload.accounts) setAccounts(payload.accounts);
   if (payload.entryOrder) setEntryOrder(payload.entryOrder);
   if (payload.stmtPasswords) setStmtPasswords(payload.stmtPasswords);
@@ -2447,6 +2693,7 @@ async function restoreBackupPayload(payload, setters, token) {
   if (payload.stmtImported) setStmtImported(payload.stmtImported);
   if (Array.isArray(payload.writeOffs) && setWriteOffs) setWriteOffs(payload.writeOffs); // older backups have none
   if (payload.stmtHints && setStmtHints) setStmtHints(payload.stmtHints); // older backups have none
+  if (payload.gpayIndex && setGpayIndex) setGpayIndex(payload.gpayIndex); // older backups have none
   // Settings: older backups have none (leave the device's values alone).
   // Values are clamped so a hand-edited/odd backup can't break the editor.
   const st = payload.settings || {};
@@ -2845,6 +3092,13 @@ export default function LedgerApp() {
     } catch {}
     return {};
   });
+  const [gpayIndex, setGpayIndex] = useState(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_GPAY);
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return {};
+  });
   // Google Drive backup (feature #40). `googleAccount` and `lastBackupAt`
   // are the only pieces of this that persist to localStorage (see the
   // effects below) — the access token itself is deliberately kept only in
@@ -3086,6 +3340,11 @@ export default function LedgerApp() {
       localStorage.setItem(STORAGE_STMT_HINTS, JSON.stringify(stmtHints));
     } catch {}
   }, [stmtHints]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_GPAY, JSON.stringify(gpayIndex));
+    } catch {}
+  }, [gpayIndex]);
   useEffect(() => {
     try {
       if (googleAccount) localStorage.setItem(STORAGE_GOOGLE_ACCOUNT, JSON.stringify(googleAccount));
@@ -3441,7 +3700,7 @@ export default function LedgerApp() {
       // any save that isn't a fresh statement import, so this stays fast
       // no matter how many statements have piled up over time.
       const { rawAttachments, attachMap } = await syncAttachmentsToDrive(token, folderId);
-      const payload = await buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, stmtHints, settings: { fontSize, lineSpacing }, writeOffs, rawAttachments, attachMap });
+      const payload = await buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, stmtHints, gpayIndex, settings: { fontSize, lineSpacing }, writeOffs, rawAttachments, attachMap });
       await uploadBackupToDrive(token, JSON.stringify(payload));
       setLastBackupAt(new Date().toISOString());
       gdiag("backup OK");
@@ -3476,7 +3735,7 @@ export default function LedgerApp() {
         showAlert("No backup found in Google Drive yet — nothing to restore.");
         return;
       }
-      await restoreBackupPayload(payload, { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported, setFontSize, setLineSpacing, setWriteOffs, setStmtHints }, token);
+      await restoreBackupPayload(payload, { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported, setFontSize, setLineSpacing, setWriteOffs, setStmtHints, setGpayIndex }, token);
       setBackupStatus("idle");
       showToast("Restored from Google Drive", { tone: "success", autoHideMs: 2000 });
     } catch (err) {
@@ -3558,7 +3817,7 @@ export default function LedgerApp() {
     }, 3000);
     return () => clearTimeout(backupDebounceRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, stmtHints, writeOffs, fontSize, lineSpacing, attachmentsRev, googleConnected]);
+  }, [accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, stmtHints, gpayIndex, writeOffs, fontSize, lineSpacing, attachmentsRev, googleConnected]);
 
   useEffect(() => {
     if (!googleConnected) return undefined;
@@ -3882,6 +4141,8 @@ export default function LedgerApp() {
           setStmtImported={setStmtImported}
           stmtHints={stmtHints}
           setStmtHints={setStmtHints}
+          gpayIndex={gpayIndex}
+          setGpayIndex={setGpayIndex}
           askPrompt={askPrompt}
           askConfirm={askConfirm}
           showAlert={showAlert}
@@ -5333,6 +5594,8 @@ function ImportStatementView({
   setStmtImported,
   stmtHints,
   setStmtHints,
+  gpayIndex,
+  setGpayIndex,
   askPrompt,
   askConfirm,
   showAlert,
@@ -5353,6 +5616,7 @@ function ImportStatementView({
   const pendingFileRef = useRef(null);
   const [attachStatus, setAttachStatus] = useState(null); // null | "saved" | "failed"
 
+  const [gpayNotice, setGpayNotice] = useState("");
   const [meta, setMeta] = useState(null);
   const [targetAccount, setTargetAccount] = useState(activeAccount);
   const [targetMonth, setTargetMonth] = useState(activeMonth);
@@ -5463,6 +5727,7 @@ function ImportStatementView({
   async function handleFile(file) {
     setStep("opening");
     setErrorMsg("");
+    setGpayNotice("");
     setAttachStatus(null);
     passwordAttemptedOnce.current = false;
     pendingFileRef.current = file;
@@ -5474,10 +5739,27 @@ function ImportStatementView({
         return;
       }
       const { doc, newPassword } = opened;
-      const { lines, fullText } = await getPdfLines(doc);
+      const { lines, ys: lineYs, fullText } = await getPdfLines(doc);
+      // A Google Pay "Transaction statement" is not a bank statement: load it
+      // into the lookup (matched to bank rows by UPI reference) and stay here.
+      if (looksLikeGpay(fullText)) {
+        const entries = parseGpayStatement(lines);
+        pendingFileRef.current = null;
+        if (!entries.length) {
+          setErrorMsg("This looks like a Google Pay statement, but no transactions with a UPI Transaction ID could be read from it.");
+          setStep("pick");
+          return;
+        }
+        const merged = mergeGpayEntries(gpayIndex, entries);
+        setGpayIndex(merged.index);
+        setGpayNotice(`Loaded ${merged.count} Google Pay transactions (${formatDateLong(merged.min)} – ${formatDateLong(merged.max)}). Now choose your bank statement.`);
+        setStep("pick");
+        return;
+      }
       const bankName = guessBankName(fullText);
       const tail = guessAccountTail(fullText);
-      const rawTxns = resolveTransactionSigns(parseTransactions(lines));
+      const gpayApplied = applyGpayToTxns(parseTransactions(lines, lineYs), gpayIndex);
+      const rawTxns = resolveTransactionSigns(gpayApplied.txns);
       const holderName = guessAccountHolderName(fullText);
       const period = guessStatementPeriod(rawTxns);
       const detectedMonth = period?.monthKeys?.[0] || guessStatementMonth(fullText, rawTxns) || activeMonth;
@@ -5509,7 +5791,7 @@ function ImportStatementView({
       // or create the right account explicitly.
       const defaultAccount = holderMatch && accounts[holderMatch] ? holderMatch : "";
 
-      setMeta({ bankName, tail, rawTxns, bkey, holderName, period });
+      setMeta({ bankName, tail, rawTxns, bkey, holderName, period, gpayStats: gpayApplied.stats });
       setTargetAccount(defaultAccount);
       setTargetMonth(detectedMonth);
       setStep("account");
@@ -6307,7 +6589,30 @@ function ImportStatementView({
             Upload a bank statement PDF (password-protected is fine). This is a best-effort generic reader — every
             bank formats statements differently, so you'll confirm or fix each transaction before it's added.
           </p>
+          <p className="font-mono text-xs text-zinc-400 leading-relaxed">
+            Tip: pick your <span className="text-teal-300">Google Pay transaction statement</span> first (same button). Its
+            payee names, dates and times are then matched to the bank rows by UPI reference, so you see real names
+            instead of the bank's shortened ones. The bank statement still decides the rows, amounts and order.
+          </p>
           {errorMsg && <div className="font-mono text-xs text-rose-400">{errorMsg}</div>}
+          {gpayNotice && <div className="font-mono text-xs text-teal-300 leading-relaxed">{gpayNotice}</div>}
+          {(() => {
+            const r = gpayRange(gpayIndex);
+            if (!r.count) return null;
+            return (
+              <div className="flex items-center gap-2 font-mono text-[11px] text-zinc-400 px-3 py-2 rounded-lg bg-zinc-900/70 border border-zinc-800">
+                <div className="flex-1">
+                  Google Pay data loaded: {r.count} transactions, {formatDateLong(r.min)} – {formatDateLong(r.max)}
+                </div>
+                <button
+                  onClick={() => askConfirm("Remove all loaded Google Pay data from this device? Your ledger is not affected.", () => setGpayIndex({}), { danger: true, confirmLabel: "Remove" })}
+                  className="text-rose-400 underline"
+                >
+                  Clear
+                </button>
+              </div>
+            );
+          })()}
           <input
             ref={fileInputRef}
             type="file"
@@ -6323,7 +6628,7 @@ function ImportStatementView({
             onClick={() => fileInputRef.current.click()}
             className="flex items-center justify-center gap-2 py-3 rounded-lg bg-teal-700 hover:bg-teal-600 font-mono text-sm text-white"
           >
-            <FileText size={16} /> Choose PDF statement
+            <FileText size={16} /> Choose PDF statement (bank or Google Pay)
           </button>
         </div>
       )}
@@ -6361,6 +6666,35 @@ function ImportStatementView({
               Period: <span className="text-zinc-200">{meta.period.startISO}</span> to <span className="text-zinc-200">{meta.period.endISO}</span>
             </div>
           )}
+          {(() => {
+            const gs = meta.gpayStats;
+            const r = gpayRange(gpayIndex);
+            if (!gs) return null;
+            if (!r.count) {
+              return (
+                <div className="font-mono text-[11px] text-zinc-500 leading-relaxed mb-2">
+                  No Google Pay statement loaded — UPI names come from the bank's (often shortened) narration. To use Google Pay
+                  names, tap Back, choose the Google Pay statement first, then this bank statement again.
+                </div>
+              );
+            }
+            const uncovered = meta.period && (meta.period.startISO < r.min || meta.period.endISO > r.max);
+            return (
+              <div className="mb-2">
+                <div className="font-mono text-xs text-zinc-400 leading-relaxed">
+                  Google Pay: matched <span className="text-teal-300">{gs.matched}</span> of {gs.upi} UPI rows
+                  {gs.mismatched > 0 && <span className="text-amber-300"> · {gs.mismatched} had a different amount/direction (left as the bank printed)</span>}
+                </div>
+                {uncovered && gs.matched < gs.upi && (
+                  <div className="font-mono text-[11px] text-amber-300 leading-relaxed mt-1">
+                    Your Google Pay data covers {formatDateLong(r.min)} – {formatDateLong(r.max)}, but this bank statement runs{" "}
+                    {formatDateLong(meta.period.startISO)} – {formatDateLong(meta.period.endISO)}. Tap Back, add the Google Pay
+                    statement for the missing dates, then choose this bank statement again.
+                  </div>
+                )}
+              </div>
+            );
+          })()}
           {accountMissingForPeriod && (
             <div className="mb-2 p-2.5 rounded-lg bg-amber-900/30 border border-amber-800/50">
               <div className="font-mono text-[11px] text-amber-300 leading-relaxed">
@@ -6513,13 +6847,52 @@ function ImportStatementView({
             {autoCount > 0 && <> · {autoCount} auto-categorized</>}
             {dupCount > 0 && <> · {dupCount} already entered</>}
           </div>
-          {(queue[qIndex].channel || queue[qIndex].time || queue[qIndex].refNumber) && (
-            <div className="font-mono text-[10px] text-teal-500 mb-1 flex flex-wrap gap-x-2">
-              {queue[qIndex].channel && <span>{queue[qIndex].channel}</span>}
-              {queue[qIndex].time && <span>· {queue[qIndex].time}</span>}
-              {queue[qIndex].refNumber && <span>· ref {queue[qIndex].refNumber}</span>}
-            </div>
-          )}
+          {(() => {
+            const t = queue[qIndex];
+            const g = t.gpay;
+            const showDate = g?.d || t.dateISO;
+            const showTime = g?.t || t.time;
+            const hasGpay = Object.keys(gpayIndex || {}).length > 0;
+            const known = t.guessedType !== "unknown";
+            const isDebit = known && eType === "debit";
+            const isCredit = known && eType === "credit";
+            return (
+              <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-3 mb-2">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[10px]">
+                  <span className={`px-1.5 py-0.5 rounded ${g ? "bg-teal-900/70 text-teal-200" : "bg-zinc-800 text-zinc-300"}`}>
+                    {g ? "Google Pay" : t.channel || "Bank"}
+                  </span>
+                  <span className="text-zinc-400">
+                    {formatDateLong(showDate)}
+                    {showTime ? ` · ${showTime}` : ""}
+                  </span>
+                  {g && t.dateISO && g.d !== t.dateISO && <span className="text-zinc-600">(bank: {formatDateLong(t.dateISO)})</span>}
+                </div>
+                <div className="mt-1.5 text-[15px] leading-snug text-zinc-100 break-words">{g ? g.n : t.description}</div>
+                <div className={`mt-0.5 font-mono text-sm ${isDebit ? "text-rose-400" : isCredit ? "text-emerald-400" : "text-zinc-300"}`}>
+                  {isDebit ? "− " : isCredit ? "+ " : ""}₹{formatNum(t.amount)}
+                  {g && g.b && (
+                    <span className="ml-2 text-[10px] text-zinc-500">
+                      {g.k === "received" ? "to" : "from"} {g.b}
+                    </span>
+                  )}
+                </div>
+                {!g && hasGpay && t.channel === "UPI" && (
+                  <div className="mt-1 font-mono text-[10px] text-amber-400">Not found in the loaded Google Pay data (other app, or that period isn't loaded).</div>
+                )}
+                <div className="mt-2 pt-1.5 border-t border-zinc-800 font-mono text-[10px] text-zinc-600 break-all">
+                  <div className="truncate">{t.raw}</div>
+                  {t.rawNarration && (
+                    <div style={{ display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+                      Bank: {t.narrMoved ? "↑ " : ""}
+                      {t.rawNarration}
+                    </div>
+                  )}
+                  {t.refNumber && <div>ref {t.refNumber}</div>}
+                </div>
+              </div>
+            );
+          })()}
           {queue[qIndex].remark && (
             <div className="font-mono text-[10px] text-amber-300 mb-1 truncate">
               Remark: <span className="text-amber-100">{queue[qIndex].remark}</span>
@@ -6530,8 +6903,6 @@ function ImportStatementView({
               ⚠ Couldn't tell money in vs money out from this row — please check before saving.
             </div>
           )}
-          <div className="font-mono text-[11px] text-zinc-600 truncate mb-2">{queue[qIndex].raw}</div>
-
           <label className={stmtLabelCls}>Date</label>
           <input type="date" value={eDate} onChange={(e) => setEDate(e.target.value)} className={stmtInputCls} />
 
