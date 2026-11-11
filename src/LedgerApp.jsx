@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.26.4";
+const APP_VERSION = "1.26.5";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -2208,6 +2208,68 @@ function saveCachedGoogleToken(token) {
   } catch {}
 }
 
+// Google connection log (1.26.5): a small persistent trail of what each Google
+// step returned (initialize, saved token, isLoggedIn, refresh, login, backup
+// errors), shown in Menu -> Backup -> "Connection log" with a Copy button, so
+// a "tap Reconnect" failure the next day can be diagnosed from the real values.
+// NEVER stores tokens: gdiagShape() replaces any token-like string by its length.
+const STORAGE_GOOGLE_DIAG = "ledger_google_diag_v1";
+const GDIAG_MAX_LINES = 80;
+function readGdiag() {
+  try {
+    const a = JSON.parse(localStorage.getItem(STORAGE_GOOGLE_DIAG) || "[]");
+    return Array.isArray(a) ? a : [];
+  } catch {
+    return [];
+  }
+}
+function gdiag(msg) {
+  try {
+    let t;
+    try {
+      t = new Date().toLocaleString("sv-SE");
+    } catch {
+      t = new Date().toISOString();
+    }
+    const arr = readGdiag();
+    arr.push(`${t}  ${msg}`);
+    localStorage.setItem(STORAGE_GOOGLE_DIAG, JSON.stringify(arr.slice(-GDIAG_MAX_LINES)));
+  } catch {}
+  try {
+    window.dispatchEvent(new Event("ledger-gdiag"));
+  } catch {}
+}
+function gdiagShape(o) {
+  try {
+    const out = JSON.stringify(
+      o,
+      (k, v) => (typeof v === "string" && /token|idtoken|code|secret/i.test(k) ? `<${k} len ${v.length}>` : v)
+    );
+    if (out === undefined) return String(o);
+    return out.length > 400 ? out.slice(0, 400) + "…" : out;
+  } catch {
+    return String(o);
+  }
+}
+function gdiagErr(e) {
+  try {
+    const parts = [e?.name, e?.code, e?.message || (typeof e === "string" ? e : "")].filter(Boolean);
+    return parts.length ? parts.join(" | ") : gdiagShape(e);
+  } catch {
+    return String(e);
+  }
+}
+function gdiagCacheState() {
+  try {
+    const t = JSON.parse(localStorage.getItem(STORAGE_GOOGLE_TOKEN) || "null");
+    if (!t || !t.token) return "none saved";
+    const m = Math.round((t.exp - Date.now()) / 60000);
+    return m > 0 ? `valid, ${m} min left` : `expired ${Math.abs(m)} min ago`;
+  } catch {
+    return "unreadable";
+  }
+}
+
 /* =========================================================================
    GOOGLE DRIVE BACKUP (feature #40, user-requested)
    ========================================================================= 
@@ -2816,6 +2878,14 @@ export default function LedgerApp() {
   });
   const [backupStatus, setBackupStatus] = useState("idle"); // idle | working | error
   const [backupError, setBackupError] = useState("");
+  // Connection log panel (1.26.5)
+  const [diagOpen, setDiagOpen] = useState(false);
+  const [, setDiagRev] = useState(0);
+  useEffect(() => {
+    const h = () => setDiagRev((n) => n + 1);
+    window.addEventListener("ledger-gdiag", h);
+    return () => window.removeEventListener("ledger-gdiag", h);
+  }, []);
   const accessTokenRef = useRef(null);
   const backupDebounceRef = useRef(null);
   const googleInitedRef = useRef(false);
@@ -3165,11 +3235,14 @@ export default function LedgerApp() {
   useEffect(() => {
     if (googleInitedRef.current) return;
     googleInitedRef.current = true;
+    gdiag(`app start v${APP_VERSION}; connected=${googleConnected}; freshInstall=${!!isFreshInstallRef.current}; saved token: ${gdiagCacheState()}`);
     SocialLogin.initialize({ google: { webClientId: GOOGLE_WEB_CLIENT_ID } })
       .then(() => {
+        gdiag("SocialLogin.initialize OK");
         autoConnectGoogle();
       })
       .catch((err) => {
+        gdiag(`SocialLogin.initialize FAILED: ${gdiagErr(err)}`);
         console.warn("Google Sign-In init failed (is GOOGLE_WEB_CLIENT_ID set up? see CONTEXT.md):", err);
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3184,10 +3257,10 @@ export default function LedgerApp() {
   // so tapping "Disconnect" is respected instead of being silently undone
   // on the next launch.
   async function autoConnectGoogle() {
-    if (isFreshInstallRef.current) return;
-    if (googleConnected) return;
+    if (isFreshInstallRef.current) return gdiag("autoConnect skipped: fresh install");
+    if (googleConnected) return gdiag("autoConnect skipped: already marked connected");
     try {
-      if (localStorage.getItem(STORAGE_GOOGLE_DECLINED) === "1") return;
+      if (localStorage.getItem(STORAGE_GOOGLE_DECLINED) === "1") return gdiag("autoConnect skipped: user disconnected earlier");
     } catch {}
     try {
       await getGoogleAccessToken(true); // first-ever connection only (googleConnected is false here)
@@ -3199,16 +3272,39 @@ export default function LedgerApp() {
       // actually pick an account there. Nothing more to do automatically;
       // the "Back up to Google Drive" row stays available as a manual
       // fallback, and this is retried on the next app open.
+      gdiag(`autoConnect did not complete: ${gdiagErr(err)}`);
       console.warn("Automatic Google Drive connect didn't complete:", err);
+    }
+  }
+
+  async function copyGdiag() {
+    const text = readGdiag().join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast("Log copied", { tone: "success", autoHideMs: 1500 });
+      return;
+    } catch {}
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      showToast(ok ? "Log copied" : "Couldn't copy — long-press the log to select it", { tone: ok ? "success" : "error", autoHideMs: 2000 });
+    } catch {
+      showToast("Couldn't copy — long-press the log to select it", { tone: "error", autoHideMs: 2500 });
     }
   }
 
   async function signInToGoogle() {
     try {
+      gdiag("signIn (Reconnect / manual): calling SocialLogin.login");
       const res = await SocialLogin.login({
         provider: "google",
         options: { scopes: ["email", "profile", GOOGLE_DRIVE_SCOPE] },
       });
+      gdiag(`signIn result: ${gdiagShape(res)}`);
       const token = res.result.accessToken?.token;
       accessTokenRef.current = token;
       saveCachedGoogleToken(token);
@@ -3219,6 +3315,7 @@ export default function LedgerApp() {
       } catch {}
       await backupNow(token);
     } catch (err) {
+      gdiag(`signIn FAILED: ${gdiagErr(err)}`);
       console.warn("Google sign-in failed:", err);
       showAlert("Couldn't sign in with Google. Please try again.");
     }
@@ -3244,16 +3341,21 @@ export default function LedgerApp() {
   async function getGoogleAccessToken(interactive = false) {
     if (accessTokenRef.current) return accessTokenRef.current;
     const cached = loadCachedGoogleToken();
+    gdiag(`token needed (interactive=${interactive}); in memory: no; saved token: ${gdiagCacheState()}`);
     if (cached) {
+      gdiag("using saved token");
       accessTokenRef.current = cached;
       setGoogleConnected(true);
       return cached;
     }
     try {
       const status = await SocialLogin.isLoggedIn({ provider: "google" });
+      gdiag(`isLoggedIn -> ${gdiagShape(status)}`);
       if (status?.isLoggedIn) {
         const res = await SocialLogin.refresh({ provider: "google" });
+        gdiag(`refresh -> ${gdiagShape(res)}`);
         const token = res?.result?.accessToken?.token || res?.accessToken?.token;
+        gdiag(`refresh gave a token: ${token ? "yes" : "NO"}`);
         if (token) {
           accessTokenRef.current = token;
           saveCachedGoogleToken(token);
@@ -3267,11 +3369,14 @@ export default function LedgerApp() {
         }
       }
     } catch (err) {
+      gdiag(`silent refresh THREW: ${gdiagErr(err)}`);
       console.warn("Silent Google token refresh failed, falling back to interactive sign-in:", err);
     }
     if (!interactive) {
+      gdiag("silent path failed, not interactive -> asking user to Reconnect");
       throw new Error("Google session expired — tap Reconnect in the Menu");
     }
+    gdiag("silent path failed -> calling SocialLogin.login (interactive)");
     // Silent path didn't yield a token — last resort, may show UI. This is
     // also the path a brand-new device/account takes, since there's no
     // prior session to silently refresh — reaching it doesn't require the
@@ -3339,9 +3444,11 @@ export default function LedgerApp() {
       const payload = await buildBackupPayload({ accounts, entryOrder, stmtPasswords, stmtBankMap, stmtCatMap, stmtImported, stmtHints, settings: { fontSize, lineSpacing }, writeOffs, rawAttachments, attachMap });
       await uploadBackupToDrive(token, JSON.stringify(payload));
       setLastBackupAt(new Date().toISOString());
+      gdiag("backup OK");
       setBackupStatus("idle");
       showToast("Saved to Google Drive", { tone: "success", autoHideMs: 1500 });
     } catch (err) {
+      gdiag(`backup FAILED: ${gdiagErr(err)}`);
       console.warn("Google Drive backup failed:", err);
       accessTokenRef.current = null; // force a fresh token next attempt — covers an expired-token 401
       saveCachedGoogleToken(null);
@@ -3373,6 +3480,7 @@ export default function LedgerApp() {
       setBackupStatus("idle");
       showToast("Restored from Google Drive", { tone: "success", autoHideMs: 2000 });
     } catch (err) {
+      gdiag(`restore FAILED: ${gdiagErr(err)}`);
       console.warn("Google Drive restore failed:", err);
       setBackupStatus("error");
       setBackupError(String(err.message || err));
@@ -4243,6 +4351,41 @@ export default function LedgerApp() {
           ) : (
             <SheetRow icon={<CloudOff size={17} />} label="Back up to Google Drive" onClick={signInToGoogle} />
           )}
+          <div className="mt-2">
+            <button
+              onClick={() => setDiagOpen((v) => !v)}
+              className="w-full text-left px-3 py-2 rounded-xl bg-zinc-800/30 font-mono text-xs text-zinc-400 hover:bg-zinc-800/60"
+            >
+              Google connection log {diagOpen ? "▲" : "▼"}
+            </button>
+            {diagOpen && (
+              <div className="mt-1.5 px-3 py-2 rounded-xl bg-zinc-900/70 font-mono">
+                <textarea
+                  readOnly
+                  value={readGdiag().join("\n") || "(empty — nothing logged yet)"}
+                  rows={10}
+                  className="w-full bg-transparent text-[10px] leading-snug text-zinc-300 resize-none outline-none select-text"
+                />
+                <div className="flex gap-2 mt-1.5">
+                  <button onClick={copyGdiag} className="flex-1 px-2 py-1.5 rounded-md bg-teal-800 text-white text-xs hover:bg-teal-700">
+                    Copy log
+                  </button>
+                  <button
+                    onClick={() => {
+                      try {
+                        localStorage.removeItem(STORAGE_GOOGLE_DIAG);
+                      } catch {}
+                      setDiagRev((n) => n + 1);
+                    }}
+                    className="px-2 py-1.5 rounded-md bg-zinc-800 text-zinc-300 text-xs hover:bg-zinc-700"
+                  >
+                    Clear
+                  </button>
+                </div>
+                <div className="text-[10px] text-zinc-600 mt-1">No tokens or passwords are stored in this log.</div>
+              </div>
+            )}
+          </div>
           <div className="mt-2 pb-1 text-center font-mono text-[10px] text-zinc-600">LedgerApp v{APP_VERSION}</div>
         </div>
       </BottomSheet>
