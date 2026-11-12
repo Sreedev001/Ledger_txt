@@ -38,7 +38,7 @@ import { App as CapApp } from "@capacitor/app";
 // down) and tracked in CONTEXT.md. Bump this — and CONTEXT.md's matching
 // "Version" line — on every successful change from now on, per the user's
 // request, so the two always agree on what's currently shipped.
-const APP_VERSION = "1.27.0";
+const APP_VERSION = "1.27.1";
 
 /* =========================================================================
    PARSING ENGINE (unchanged from the original — plain-text ledger format)
@@ -2438,6 +2438,26 @@ const STORAGE_GOOGLE_DECLINED = "ledger_google_declined_v1";
 // restart reuses it instead of going back through Google at all.
 const STORAGE_GOOGLE_TOKEN = "ledger_google_token_v1";
 const GOOGLE_TOKEN_TTL_MS = 50 * 60 * 1000;
+// 1.27.1: set the moment a fresh install is detected, cleared only once the
+// restore finished (or Drive confirmed there is no backup). While it is set,
+// NOTHING may upload to Drive — the on-device data is just the blank starter
+// ledger, and uploading it would overwrite the real backup. It also makes the
+// next launch retry the restore if this one was interrupted (picker dismissed,
+// offline, app killed), instead of treating the blank starter as real data.
+const STORAGE_RESTORE_PENDING = "ledger_restore_pending_v1";
+function isRestorePending() {
+  try {
+    return localStorage.getItem(STORAGE_RESTORE_PENDING) === "1";
+  } catch {
+    return false;
+  }
+}
+function setRestorePending(on) {
+  try {
+    if (on) localStorage.setItem(STORAGE_RESTORE_PENDING, "1");
+    else localStorage.removeItem(STORAGE_RESTORE_PENDING);
+  } catch {}
+}
 function loadCachedGoogleToken() {
   try {
     const t = JSON.parse(localStorage.getItem(STORAGE_GOOGLE_TOKEN) || "null");
@@ -3255,6 +3275,11 @@ export default function LedgerApp() {
   // manual "Restore latest"), so a payload landing mid-typing can't
   // silently clobber something just entered — see performRestore().
   const [restoreInProgress, setRestoreInProgress] = useState(false);
+  // 1.27.1: the state above is stale inside timers/listeners created in an
+  // earlier render, so the backup guard reads this ref instead (set
+  // synchronously, before performRestore's first await).
+  const restoreInProgressRef = useRef(false);
+  const googleInitPromiseRef = useRef(null);
 
   const pageKey = `${activeAccount}::${activeMonth}`;
   const text = accounts[activeAccount]?.[activeMonth] ?? "";
@@ -3495,7 +3520,8 @@ export default function LedgerApp() {
     if (googleInitedRef.current) return;
     googleInitedRef.current = true;
     gdiag(`app start v${APP_VERSION}; connected=${googleConnected}; freshInstall=${!!isFreshInstallRef.current}; saved token: ${gdiagCacheState()}`);
-    SocialLogin.initialize({ google: { webClientId: GOOGLE_WEB_CLIENT_ID } })
+    googleInitPromiseRef.current = SocialLogin.initialize({ google: { webClientId: GOOGLE_WEB_CLIENT_ID } });
+    googleInitPromiseRef.current
       .then(() => {
         gdiag("SocialLogin.initialize OK");
         autoConnectGoogle();
@@ -3677,8 +3703,13 @@ export default function LedgerApp() {
   // one; otherwise gets a fresh one via getGoogleAccessToken(), which stays
   // silent (no picker/UI) as long as the Credential Manager session is
   // still valid.
-  async function backupNow(tokenOverride) {
+  async function backupNow(tokenOverride, opts = {}) {
     if (!googleConnected && !tokenOverride) return;
+    // 1.27.1: never upload while a restore is running OR still owed (fresh
+    // install whose restore hasn't completed). Checked through refs / the
+    // persisted flag, so a timer created in an older render can't slip past.
+    if (restoreInProgressRef.current) return gdiag("backup skipped: restore in progress");
+    if (!opts.force && isRestorePending()) return gdiag("backup skipped: restore still pending (fresh install)");
     // Never let a backup run while a restore is in flight. Without this,
     // performRestore()'s call to getGoogleAccessToken() flips
     // googleConnected to true *before* it has downloaded anything, which
@@ -3722,20 +3753,28 @@ export default function LedgerApp() {
   // its own confirm, below) and by the fresh-install prompt (which already
   // got its own confirmation from the user before calling this).
   async function performRestore(interactive = false) {
+    restoreInProgressRef.current = true; // synchronous: before any await
     setRestoreInProgress(true);
     setBackupStatus("working");
     setBackupError("");
     showToast("Restoring your data…", { autoHideMs: 0 });
     try {
+      // Wait for SocialLogin.initialize (started in an earlier effect), so
+      // isLoggedIn()/login() are not called before the plugin is ready.
+      try {
+        await googleInitPromiseRef.current;
+      } catch {}
       let token = await getGoogleAccessToken(interactive);
       const payload = await downloadBackupFromDrive(token);
       if (!payload) {
+        setRestorePending(false); // Drive confirmed: nothing to overwrite
         setBackupStatus("idle");
         showToast("No backup found yet", { tone: "error", autoHideMs: 2500 });
         showAlert("No backup found in Google Drive yet — nothing to restore.");
         return;
       }
       await restoreBackupPayload(payload, { setAccounts, setEntryOrder, setStmtPasswords, setStmtBankMap, setStmtCatMap, setStmtImported, setFontSize, setLineSpacing, setWriteOffs, setStmtHints, setGpayIndex }, token);
+      setRestorePending(false); // restore fully landed: backups may resume
       setBackupStatus("idle");
       showToast("Restored from Google Drive", { tone: "success", autoHideMs: 2000 });
     } catch (err) {
@@ -3745,6 +3784,7 @@ export default function LedgerApp() {
       setBackupError(String(err.message || err));
       showToast("Restore failed", { tone: "error", autoHideMs: 2500 });
     } finally {
+      restoreInProgressRef.current = false;
       setRestoreInProgress(false);
     }
   }
@@ -3772,7 +3812,10 @@ export default function LedgerApp() {
   const isFreshInstallRef = useRef(
     (() => {
       try {
-        return localStorage.getItem(STORAGE_ACCOUNTS) === null;
+        // Fresh = no data at all, OR an earlier restore never completed
+        // (the blank starter ledger gets written to storage on first launch,
+        // so "no data" alone would be false on the second launch).
+        return localStorage.getItem(STORAGE_ACCOUNTS) === null || localStorage.getItem(STORAGE_RESTORE_PENDING) === "1";
       } catch {
         return false;
       }
@@ -3780,6 +3823,7 @@ export default function LedgerApp() {
   );
   useEffect(() => {
     if (!isFreshInstallRef.current) return;
+    setRestorePending(true);
     performRestore(true); // fresh install: the one place the picker is expected
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -4586,7 +4630,15 @@ export default function LedgerApp() {
               </div>
               <div className="flex gap-2 mt-2">
                 <button
-                  onClick={() => backupNow()}
+                  onClick={() =>
+                    isRestorePending()
+                      ? askConfirm(
+                          "This device has not restored your backup yet. Backing up now would replace the backup in Google Drive with this empty ledger. Use \"Restore latest\" first, unless you really want to start over.",
+                          () => backupNow(undefined, { force: true }),
+                          { danger: true, confirmLabel: "Overwrite backup" }
+                        )
+                      : backupNow()
+                  }
                   disabled={backupStatus === "working"}
                   className="flex-1 px-2 py-1.5 rounded-md bg-zinc-800 text-zinc-200 text-xs hover:bg-zinc-700 disabled:opacity-50"
                 >
